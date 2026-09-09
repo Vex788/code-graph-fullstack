@@ -1245,13 +1245,74 @@ class EmbeddingStore:
         return embedded
 
     def search(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
-        """Search for nodes by semantic similarity."""
+        """Search for nodes by semantic similarity.
+
+        Uses a vectorised (numpy) ranking pass when numpy is importable,
+        falling back to the pure-Python loop otherwise. Both paths produce
+        the same ranking (up to float tolerance). A zero-norm query vector
+        returns an empty list rather than a list of meaningless ties; a
+        stored zero-norm row always scores 0.0 and never wins the ranking.
+        """
         if not self.provider:
             return []
 
         provider_name = self.provider.name
         query_vec = self.provider.embed_query(query)
+        query_norm = sum(x * x for x in query_vec) ** 0.5
+        if query_norm == 0.0:
+            return []
 
+        try:
+            import numpy as np
+        except ImportError:
+            np = None  # numpy is part of the optional [embeddings] extra
+
+        if np is not None:
+            return self._search_vectorized(np, query_vec, query_norm, provider_name, limit)
+        return self._search_pure_python(query_vec, provider_name, limit)
+
+    def _search_vectorized(
+        self, np: Any, query_vec: list[float], query_norm: float,
+        provider_name: str, limit: int,
+    ) -> list[tuple[str, float]]:
+        """Rank stored vectors against ``query_vec`` using numpy.
+
+        ``query_norm`` must already be known non-zero (checked by ``search``).
+        A stored zero-norm row is left unnormalized (all zeros), so its dot
+        product with the query is 0.0 rather than a division-by-zero/NaN.
+        """
+        q = np.asarray(query_vec, dtype=np.float32) / query_norm
+
+        names: list[str] = []
+        chunks: list[bytes] = []
+        cursor = self._conn.execute(
+            "SELECT qualified_name, vector FROM embeddings WHERE provider = ?",
+            (provider_name,),
+        )
+        while True:
+            rows = cursor.fetchmany(20000)
+            if not rows:
+                break
+            names.extend(row["qualified_name"] for row in rows)
+            chunks.extend(row["vector"] for row in rows)
+
+        if not names:
+            return []
+
+        raw = b"".join(chunks)
+        dim = len(raw) // (4 * len(names))
+        mat = np.frombuffer(raw, dtype=np.float32).reshape(len(names), dim).copy()
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        safe_rows = norms[:, 0] > 0
+        mat[safe_rows] = mat[safe_rows] / norms[safe_rows]
+        sims = mat @ q
+        top = np.argsort(sims)[::-1][:limit]
+        return [(names[i], float(sims[i])) for i in top]
+
+    def _search_pure_python(
+        self, query_vec: list[float], provider_name: str, limit: int,
+    ) -> list[tuple[str, float]]:
+        """Rank stored vectors against ``query_vec`` without numpy."""
         # Process in chunks, only matching current provider
         scored: list[tuple[str, float]] = []
         cursor = self._conn.execute(

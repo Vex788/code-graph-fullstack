@@ -33,11 +33,13 @@ def _lock() -> dict:
 def test_all_extra_covers_every_optional_group():
     """[all] must reference every optional group except dev, per README's
     "All optional dependencies" claim (issue #534)."""
-    optional = _pyproject()["project"]["optional-dependencies"]
+    project = _pyproject()["project"]
+    optional = project["optional-dependencies"]
+    self_ref = f"{project['name']}["
     referenced = {
         req.split("[", 1)[1].rstrip("]")
         for req in optional["all"]
-        if req.startswith("code-review-graph[")
+        if req.startswith(self_ref)
     }
     expected = set(optional) - {"all", "dev"}
     assert referenced == expected
@@ -46,9 +48,11 @@ def test_all_extra_covers_every_optional_group():
 def test_all_extra_contains_only_self_referential_extras():
     """Every entry in [all] must be a self-referential extra so pip/uv
     resolve it against this same distribution."""
-    optional = _pyproject()["project"]["optional-dependencies"]
+    project = _pyproject()["project"]
+    optional = project["optional-dependencies"]
+    self_ref = f"{project['name']}["
     for req in optional["all"]:
-        assert req.startswith("code-review-graph["), req
+        assert req.startswith(self_ref), req
         assert req.endswith("]"), req
 
 
@@ -94,7 +98,7 @@ def test_lock_requires_dist_matches_pyproject():
     crg = next(
         pkg
         for pkg in lock["package"]
-        if pkg["name"] == "code-review-graph"
+        if pkg["name"] == "code-graph-fullstack"
     )
     requires = crg["metadata"]["requires-dist"]
     google = [r for r in requires if r["name"] == "google-genai"]
@@ -105,7 +109,7 @@ def test_lock_requires_dist_matches_pyproject():
     all_extras = [
         r["extras"]
         for r in requires
-        if r["name"] == "code-review-graph" and r.get("marker") == "extra == 'all'"
+        if r["name"] == "code-graph-fullstack" and r.get("marker") == "extra == 'all'"
     ]
     assert ["google-embeddings"] in all_extras
 

@@ -62,6 +62,7 @@ from .tools import (
     traverse_graph_func,
     with_provenance,
 )
+from .tools.navigation import common_callers_of, orient, shortest_path_between
 
 logger = logging.getLogger(__name__)
 
@@ -1053,6 +1054,72 @@ def cross_repo_search_tool(
     return cross_repo_search_func(
         query=query, kind=kind, limit=limit, max_results=max_results,
     )
+
+
+@mcp.tool()
+def orient_tool(query: str, repo_root: Optional[str] = None) -> dict:
+    """One-call codebase mini-map for a task string.
+
+    Returns top functions/classes (hybrid FTS+vector), top files,
+    matching communities and 1-line stats. Use FIRST for orientation
+    instead of 3-4 separate search calls.
+
+    Args:
+        query: Natural-language or symbol-ish task description.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(orient(query=query, repo_root=root), root)
+
+
+@mcp.tool()
+def shortest_path_between_tool(
+    symbol_a: str,
+    symbol_b: str,
+    mode: str = "call",
+    max_depth: int = 6,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """BFS shortest paths between two symbols over CALLS/IMPORTS_FROM edges.
+
+    mode: "call" (A calls ... B), "import", "both". Returns up to 3
+    paths as repo-relative qualified-name chains. Hub helpers
+    (toString/equals/Logger/...) are skipped as intermediates.
+
+    Args:
+        symbol_a: Start symbol (bare or qualified name).
+        symbol_b: End symbol (bare or qualified name).
+        mode: "call", "import", or "both". Default: call.
+        max_depth: Maximum hops to search. Default: 6.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(shortest_path_between(
+        symbol_a=symbol_a, symbol_b=symbol_b, mode=mode,
+        max_depth=max_depth, repo_root=root,
+    ), root)
+
+
+@mcp.tool()
+def common_callers_of_tool(
+    symbol_a: str,
+    symbol_b: str,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Callers shared by both symbols (intersection of callers).
+
+    Accepts bare names (resolved via an anchored name-boundary match)
+    or qualified names.
+
+    Args:
+        symbol_a: First symbol (bare or qualified name).
+        symbol_b: Second symbol (bare or qualified name).
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    root = _resolve_repo_root(repo_root)
+    return with_provenance(common_callers_of(
+        symbol_a=symbol_a, symbol_b=symbol_b, repo_root=root,
+    ), root)
 
 
 @mcp.prompt()

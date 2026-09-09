@@ -24,6 +24,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from .graph import GraphStore
 from .parser import CodeParser, normalize_file_path
+from .resolvers import RESOLVERS, run_resolver
 
 _MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
 
@@ -79,80 +80,37 @@ CPP_IDENTITY_VERSION = "1"
 _CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
 
 
-def _run_python_resolver(store: GraphStore) -> Optional[dict]:
-    """Run repository-wide Python import resolution without failing a build."""
-    try:
-        from .python_resolver import resolve_python_imports
-        return resolve_python_imports(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
-        logger.warning("Python import resolver failed: %s", exc)
-        return None
+# Extension -> language tag, matching the RESOLVERS frozensets in
+# code_review_graph/resolvers/__init__.py. Turns a set of changed file paths
+# into the set of languages that changed, for incremental resolver gating.
+_EXTENSION_LANGUAGES: dict[str, str] = {
+    ".py": "python",
+    ".res": "rescript",
+    ".resi": "rescript",
+    ".java": "java",
+    ".tf": "hcl",
+    ".hcl": "hcl",
+    ".php": "php",
+    ".rs": "rust",
+    ".cs": "csharp",
+}
 
 
-def _run_rescript_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the ReScript cross-module resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
-    """
-    try:
-        from .rescript_resolver import resolve_rescript_cross_module
-        return resolve_rescript_cross_module(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
-        logger.warning("ReScript cross-module resolver failed: %s", exc)
-        return None
+def _changed_languages(paths) -> frozenset[str]:
+    """Map changed file paths to the resolver-trigger language tags."""
+    return frozenset(
+        lang
+        for path in paths
+        for ext, lang in _EXTENSION_LANGUAGES.items()
+        if path.endswith(ext)
+    )
 
 
-def _run_spring_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Spring DI call resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
-    """
-    try:
-        from .spring_resolver import resolve_spring_di_calls
-        return resolve_spring_di_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
-        logger.warning("Spring DI resolver failed: %s", exc)
-        return None
-
-
-def _run_spring_event_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Spring application-event resolver without failing a build."""
-    try:
-        from .event_resolver import resolve_spring_events
-        return resolve_spring_events(store)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Spring event resolver failed: %s", exc)
-        return None
-
-
-def _run_temporal_resolver(store: GraphStore) -> Optional[dict]:
-    """Run the Temporal workflow/activity call resolver, swallowing any failure so
-    build never fails because of it. Returns stats or None on error.
-    """
-    try:
-        from .temporal_resolver import resolve_temporal_calls
-        return resolve_temporal_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
-        logger.warning("Temporal resolver failed: %s", exc)
-        return None
-
-
-def _run_hcl_resolver(store: GraphStore) -> Optional[dict]:
-    """Run Terraform module-scope resolution without failing a build."""
-    try:
-        from .hcl_resolver import resolve_hcl_module_references
-        return resolve_hcl_module_references(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
-        logger.warning("Terraform/HCL resolver failed: %s", exc)
-        return None
-
-
-def _run_scoped_resolver(store: GraphStore) -> Optional[dict]:
-    """Resolve static/scoped ``Class::method`` calls without failing a build."""
-    try:
-        from .scoped_resolver import resolve_scoped_calls
-        return resolve_scoped_calls(store)
-    except Exception as exc:  # noqa: BLE001 - best-effort post-pass
-        logger.warning("Scoped call resolver failed: %s", exc)
-        return None
+# Resolvers that must also re-run on a deletion-only change (a stale or
+# missing path, not just a freshly changed one), because they maintain
+# derived/virtual graph state (e.g. Spring Event nodes — issue #474). Every
+# other resolver only looks at newly changed files, as before this refactor.
+_RECONCILE_ON_DELETE = frozenset({"python", "spring", "spring_event", "temporal"})
 
 
 # Default ignore patterns (in addition to .gitignore).
@@ -177,7 +135,10 @@ DEFAULT_IGNORE_PATTERNS = [
     "/target/**",
     "/bin/**",
     "/obj/**",
-    # PHP / Laravel / Composer
+    # PHP / Laravel / Composer. Deliberately depth-matching: in a PHP monorepo a
+    # Composer vendor/ dir legitimately sits under each package (issue #91). A source
+    # package literally named `vendor` is a per-repository quirk and belongs in that
+    # repository's own ignore configuration, not in a weakened default.
     "**/vendor/**",
     "/storage/**",
     "/bootstrap/cache/**",
@@ -1337,13 +1298,7 @@ def full_build(
     _store_vcs_metadata(repo_root, store)
     store.commit()
 
-    python_stats = _run_python_resolver(store)
-    rescript_stats = _run_rescript_resolver(store)
-    spring_stats = _run_spring_resolver(store)
-    spring_event_stats = _run_spring_event_resolver(store)
-    temporal_stats = _run_temporal_resolver(store)
-    hcl_stats = _run_hcl_resolver(store)
-    scoped_stats = _run_scoped_resolver(store)
+    resolver_results = {name: run_resolver(name, store, repo_root) for name in RESOLVERS}
 
     return {
         "files_parsed": len(files),
@@ -1351,13 +1306,14 @@ def full_build(
         "total_nodes": total_nodes,
         "total_edges": total_edges,
         "errors": errors,
-        "python_resolution": python_stats,
-        "rescript_resolution": rescript_stats,
-        "spring_resolution": spring_stats,
-        "event_resolution": spring_event_stats,
-        "temporal_resolution": temporal_stats,
-        "hcl_resolution": hcl_stats,
-        "scoped_resolution": scoped_stats,
+        "python_resolution": resolver_results["python"],
+        "rescript_resolution": resolver_results["rescript"],
+        "spring_resolution": resolver_results["spring"],
+        "event_resolution": resolver_results["spring_event"],
+        "temporal_resolution": resolver_results["temporal"],
+        "jsp_resolution": resolver_results["jsp"],
+        "hcl_resolution": resolver_results["hcl"],
+        "scoped_resolution": resolver_results["scoped"],
     }
 
 
@@ -1396,6 +1352,7 @@ def incremental_update(
             "spring_resolution": rebuilt["spring_resolution"],
             "event_resolution": rebuilt["event_resolution"],
             "temporal_resolution": rebuilt["temporal_resolution"],
+            "jsp_resolution": rebuilt["jsp_resolution"],
             "hcl_resolution": rebuilt["hcl_resolution"],
         }
 
@@ -1511,36 +1468,25 @@ def incremental_update(
         _store_vcs_metadata(repo_root, store)
         store.commit()
 
-    # Only re-run language-specific resolvers when the relevant files changed.
-    python_changed = any(
-        path.endswith(".py")
-        for path in set(all_files) | set(stale_files) | missing_paths
+    # Only re-run a resolver when a file in one of its declared languages
+    # changed. python/spring/spring_event/temporal are in _RECONCILE_ON_DELETE
+    # and also look at stale/missing paths, so a deletion that only surfaces
+    # through reconciliation still clears derived state (e.g. virtual Spring
+    # Event nodes — issue #474); every other resolver only looks at newly
+    # changed files, same as before this refactor.
+    reconciled_languages = _changed_languages(
+        set(all_files) | set(stale_files) | missing_paths
     )
-    python_stats = _run_python_resolver(store) if python_changed else None
+    changed_languages = _changed_languages(all_files)
 
-    rescript_changed = any(
-        rp.endswith((".res", ".resi")) for rp in all_files
-    )
-    rescript_stats = (
-        _run_rescript_resolver(store) if rescript_changed else None
-    )
-
-    # Like python_changed above, include stale/missing paths so a deletion
-    # that only surfaces through reconciliation still clears derived state
-    # (e.g. virtual Spring Event nodes — issue #474).
-    spring_changed = any(
-        path.endswith(".java")
-        for path in set(all_files) | set(stale_files) | missing_paths
-    )
-    spring_stats = _run_spring_resolver(store) if spring_changed else None
-    spring_event_stats = (
-        _run_spring_event_resolver(store) if spring_changed else None
-    )
-    temporal_stats = _run_temporal_resolver(store) if spring_changed else None
-    hcl_changed = any(rp.endswith((".tf", ".hcl")) for rp in all_files)
-    hcl_stats = _run_hcl_resolver(store) if hcl_changed else None
-    scoped_changed = any(rp.endswith((".php", ".rs", ".cs")) for rp in all_files)
-    scoped_stats = _run_scoped_resolver(store) if scoped_changed else None
+    resolver_results: dict[str, Optional[dict]] = {}
+    for name, (_resolver, _label, languages) in RESOLVERS.items():
+        active_languages = (
+            reconciled_languages if name in _RECONCILE_ON_DELETE else changed_languages
+        )
+        resolver_results[name] = (
+            run_resolver(name, store, repo_root) if languages & active_languages else None
+        )
 
     return {
         "files_updated": files_updated,
@@ -1550,13 +1496,14 @@ def incremental_update(
         "dependent_files": list(dependent_files),
         "stale_files_removed": len(stale_files),
         "errors": errors,
-        "python_resolution": python_stats,
-        "rescript_resolution": rescript_stats,
-        "spring_resolution": spring_stats,
-        "event_resolution": spring_event_stats,
-        "temporal_resolution": temporal_stats,
-        "hcl_resolution": hcl_stats,
-        "scoped_resolution": scoped_stats,
+        "python_resolution": resolver_results["python"],
+        "rescript_resolution": resolver_results["rescript"],
+        "spring_resolution": resolver_results["spring"],
+        "event_resolution": resolver_results["spring_event"],
+        "temporal_resolution": resolver_results["temporal"],
+        "jsp_resolution": resolver_results["jsp"],
+        "hcl_resolution": resolver_results["hcl"],
+        "scoped_resolution": resolver_results["scoped"],
     }
 
 

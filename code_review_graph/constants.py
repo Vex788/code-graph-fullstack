@@ -63,6 +63,12 @@ IMPACT_EDGE_WEIGHTS: dict[str, float] = {
     "REFERENCES": 0.6,
     "DEPENDS_ON": 0.6,
     "IMPORTS_FROM": 0.5,
+    # Presentation layer. RENDERS names one class deliberately, like an explicit
+    # reference; REQUESTS matches a URL against a route contract and is commonly
+    # many-to-one; INCLUDES is file-granular, like an import.
+    "RENDERS": 0.6,
+    "REQUESTS": 0.5,
+    "INCLUDES": 0.5,
     "CONTAINS": 0.3,
 }
 IMPACT_DEFAULT_EDGE_WEIGHT = 0.5
@@ -84,6 +90,10 @@ IMPACT_EDGE_DIRECTIONS: dict[str, str] = {
     "REFERENCES": IMPACT_DIRECTION_INCOMING,
     "DEPENDS_ON": IMPACT_DIRECTION_INCOMING,
     "IMPORTS_FROM": IMPACT_DIRECTION_INCOMING,
+    # The page depends on what it renders, requests and includes.
+    "RENDERS": IMPACT_DIRECTION_INCOMING,
+    "REQUESTS": IMPACT_DIRECTION_INCOMING,
+    "INCLUDES": IMPACT_DIRECTION_INCOMING,
     "CONTAINS": IMPACT_DIRECTION_NONE,
 }
 # Unknown relationships conservatively follow the dominant graph convention:

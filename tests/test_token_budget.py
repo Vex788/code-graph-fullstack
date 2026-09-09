@@ -230,6 +230,25 @@ BUDGETS: dict[str, dict[str, Any]] = {
         "default_max": 1_500,
         "worst_max": 1_500,
     },
+    "orient_tool": {
+        "default": {"query": "helper_0_0_0"},
+        "worst": {"query": "helper"},
+        "default_max": 400,
+        "worst_max": 400,
+    },
+    "shortest_path_between_tool": {
+        "default": {"symbol_a": "helper_0_0_0", "symbol_b": "helper_1_0_0"},
+        "worst": {"symbol_a": "helper_0_0_0", "symbol_b": "helper_1_0_0",
+                  "mode": "both", "max_depth": 20},
+        "default_max": 1_200,
+        "worst_max": 1_200,
+    },
+    "common_callers_of_tool": {
+        "default": {"symbol_a": "helper_0_0_0", "symbol_b": "helper_0_1_0"},
+        "worst": {"symbol_a": "helper_0_0_0", "symbol_b": "helper_0_1_0"},
+        "default_max": 400,
+        "worst_max": 400,
+    },
     "get_minimal_context_tool": {
         "default": {},
         "worst": {"task": "review the pull request", "changed_files": "ALL"},

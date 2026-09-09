@@ -11,9 +11,13 @@ except ImportError:  # pragma: no cover - Python 3.10
 ROOT = Path(__file__).parents[1]
 
 
-def _optional_dependencies() -> dict[str, list[str]]:
+def _project() -> dict:
     with (ROOT / "pyproject.toml").open("rb") as pyproject:
-        return tomllib.load(pyproject)["project"]["optional-dependencies"]
+        return tomllib.load(pyproject)["project"]
+
+
+def _optional_dependencies() -> dict[str, list[str]]:
+    return _project()["optional-dependencies"]
 
 
 def test_google_embeddings_extra_installs_current_google_sdk():
@@ -23,4 +27,5 @@ def test_google_embeddings_extra_installs_current_google_sdk():
 
 def test_all_extra_includes_google_embeddings():
     optional = _optional_dependencies()
-    assert "code-review-graph[google-embeddings]" in optional["all"]
+    name = _project()["name"]
+    assert f"{name}[google-embeddings]" in optional["all"]

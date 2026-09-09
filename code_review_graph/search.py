@@ -467,4 +467,22 @@ def hybrid_search(
             "score": round(final_score, 6),
         })
 
-    return results
+    # Pin exact-name matches ahead of fuzzy neighbours. When the FTS lane is
+    # crowded with same-prefix symbols (e.g. a class full of getters), a node
+    # whose simple name exactly equals a query token can rank below fuzzy
+    # neighbours despite being the obvious match. Reordering is stable: the
+    # relative order within each group is unchanged. Short tokens are
+    # excluded so common words don't pin half the result set.
+    query_tokens = {
+        tok.lower() for tok in re.split(r"[^A-Za-z0-9]+", query) if len(tok) >= 6
+    }
+    if not query_tokens:
+        return results
+
+    def _is_exact_name_match(node: dict[str, Any]) -> bool:
+        simple_name = (node.get("name") or "").split("(", 1)[0]
+        return len(simple_name) >= 6 and simple_name.lower() in query_tokens
+
+    exact = [n for n in results if _is_exact_name_match(n)]
+    rest = [n for n in results if not _is_exact_name_match(n)]
+    return exact + rest

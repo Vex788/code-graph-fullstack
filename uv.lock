@@ -435,8 +435,8 @@ wheels = [
 ]
 
 [[package]]
-name = "code-review-graph"
-version = "2.3.8"
+name = "code-graph-fullstack"
+version = "2.3.8+fs.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
@@ -504,12 +504,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "code-review-graph", extras = ["communities"], marker = "extra == 'all'" },
-    { name = "code-review-graph", extras = ["embeddings"], marker = "extra == 'all'" },
-    { name = "code-review-graph", extras = ["enrichment"], marker = "extra == 'all'" },
-    { name = "code-review-graph", extras = ["eval"], marker = "extra == 'all'" },
-    { name = "code-review-graph", extras = ["google-embeddings"], marker = "extra == 'all'" },
-    { name = "code-review-graph", extras = ["wiki"], marker = "extra == 'all'" },
+    { name = "code-graph-fullstack", extras = ["communities"], marker = "extra == 'all'" },
+    { name = "code-graph-fullstack", extras = ["embeddings"], marker = "extra == 'all'" },
+    { name = "code-graph-fullstack", extras = ["enrichment"], marker = "extra == 'all'" },
+    { name = "code-graph-fullstack", extras = ["eval"], marker = "extra == 'all'" },
+    { name = "code-graph-fullstack", extras = ["google-embeddings"], marker = "extra == 'all'" },
+    { name = "code-graph-fullstack", extras = ["wiki"], marker = "extra == 'all'" },
     { name = "fastmcp", specifier = ">=3.2.4,<4" },
     { name = "google-genai", marker = "extra == 'google-embeddings'", specifier = ">=1.0.0,<3" },
     { name = "igraph", marker = "extra == 'communities'", specifier = ">=0.11.0" },

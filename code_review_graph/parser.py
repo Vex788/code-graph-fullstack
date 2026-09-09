@@ -782,6 +782,16 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".properties": "properties",
     ".yml": "yaml",
     ".yaml": "yaml",
+    # Presentation and configuration layers. Their grammars already ship in the
+    # bundled language pack, so indexing them costs nothing extra, and without
+    # them a change to a template or a deployment descriptor is invisible to the
+    # graph: the file is neither a node nor covered.
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".sass": "scss",
+    ".xml": "xml",
 }
 
 # ``.h`` is shared by C and C++. Keep C as the extension default, then promote
@@ -897,6 +907,8 @@ _TASK_META_KEYS: frozenset[str] = frozenset({
 
 # Tree-sitter node type mappings per language
 # Maps (language) -> dict of semantic role -> list of TS node types
+_CSS_SELECTOR_TYPES = ["class_name", "id_name", "keyframes_name"]
+
 _CLASS_TYPES: dict[str, list[str]] = {
     "python": ["class_definition"],
     "javascript": ["class_declaration", "class"],
@@ -979,6 +991,8 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # HCL/Terraform: all constructs are blocks; dispatched via
     # _extract_hcl_constructs.
     "hcl": [],
+    "css": _CSS_SELECTOR_TYPES,
+    "scss": _CSS_SELECTOR_TYPES,
 }
 
 # TS/TSX heritage clauses. Classes wrap theirs in class_heritage; interfaces use
@@ -14777,6 +14791,16 @@ class CodeParser:
             for child in node.children:
                 if child.type == "type_spec":
                     return self._get_name(child, language, kind)
+        # A registered node type that is itself a leaf carries its own name: there is
+        # no identifier child to find because the whole node IS the identifier. Without
+        # this, a language configured through node types alone silently yields nodes for
+        # the shapes that happen to wrap an identifier and nothing for the ones that do
+        # not - e.g. CSS class_name (wraps identifier) lands while id_name and
+        # keyframes_name (bare leaves) vanish, with no error to say so.
+        if not node.children:
+            text = node.text.decode("utf-8", errors="replace").strip()
+            if text and "\n" not in text:
+                return text
         return None
 
     def _get_go_receiver_type(self, node) -> Optional[str]:
