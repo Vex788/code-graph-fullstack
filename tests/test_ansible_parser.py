@@ -14,7 +14,11 @@ def _qualified(node: NodeInfo) -> str:
     return f"{node.file_path}::{node.name}"
 
 
-def test_ordinary_yaml_in_tasks_directory_is_not_treated_as_ansible() -> None:
+def test_ordinary_yaml_in_tasks_directory_yields_only_the_file_marker() -> None:
+    # Path-promoted but content-rejected: docker-compose-style YAML inside an
+    # Ansible directory contract keeps exactly its File marker (language
+    # "ansible") — visible to inventory and coverage, with zero invented
+    # task structure.
     parser = CodeParser()
     source = b"""\
 - name: frontend
@@ -28,8 +32,47 @@ def test_ordinary_yaml_in_tasks_directory_is_not_treated_as_ansible() -> None:
         source,
     )
 
-    assert nodes == []
+    assert len(nodes) == 1
+    marker = nodes[0]
+    assert marker.kind == "File"
+    assert marker.language == "ansible"
+    assert marker.name == "roles/example/tasks/application.yaml"
+    assert marker.line_start == 1
+    assert marker.line_end == source.count(b"\n") + 1
     assert edges == []
+
+
+def test_empty_yaml_at_ansible_path_yields_only_the_file_marker() -> None:
+    parser = CodeParser()
+    for source in (b"", b"\n", b"# only a comment\n"):
+        nodes, edges = parser.parse_bytes(Path("playbooks/site.yml"), source)
+
+        assert len(nodes) == 1
+        assert nodes[0].kind == "File"
+        assert nodes[0].language == "ansible"
+        assert edges == []
+
+
+def test_real_playbook_at_promoted_path_still_extracts_tasks() -> None:
+    # The content-rejection guard must not swallow real playbooks: hosts +
+    # tasks still extract full ansible structure with resolved edges.
+    parser = CodeParser()
+    source = b"""\
+- name: Deploy application
+  hosts: all
+  tasks:
+    - name: Say hello
+      ansible.builtin.debug:
+        msg: hi
+"""
+
+    nodes, edges = parser.parse_bytes(Path("playbooks/deploy.yml"), source)
+
+    tasks = [node for node in nodes if node.extra.get("ansible_kind") == "task"]
+    assert len(tasks) == 1
+    assert tasks[0].language == "ansible"
+    assert any(node.kind == "File" for node in nodes)
+    assert edges
 
 
 def test_ansible_relationships_reference_real_unique_nodes(tmp_path: Path) -> None:

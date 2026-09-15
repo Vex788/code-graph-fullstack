@@ -224,6 +224,14 @@ BUDGETS: dict[str, dict[str, Any]] = {
         "default_max": 1_500,
         "worst_max": 1_500,
     },
+    "coverage_report_tool": {
+        # Read-only small JSON report; lists capped at 50 samples per reason
+        # and the tool has no verbosity knobs, so worst case == default.
+        "default": {},
+        "worst": {},
+        "default_max": 1_500,
+        "worst_max": 1_500,
+    },
     "run_postprocess_tool": {
         "default": {},
         "worst": {},

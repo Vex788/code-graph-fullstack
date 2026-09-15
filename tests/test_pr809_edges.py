@@ -254,9 +254,15 @@ def test_detect_changes_no_graph_real_git_repo_with_commit(
         ["git", "-C", str(repo), "add", "-A"],
         check=True, capture_output=True, timeout=30,
     )
+    # ``core.hookspath=`` disables developer-wide git hooks: a machine with
+    # the code-review-graph git integration runs ``code-review-graph update``
+    # from a global pre-commit hook, which materializes
+    # ``.code-review-graph/graph.db`` in the fixture repo mid-test and turns
+    # the expected "No graph found" into a silent "No changes detected."
     subprocess.run(
         [
             "git", "-C", str(repo),
+            "-c", "core.hookspath=",
             "-c", "user.email=t@example.com", "-c", "user.name=t",
             "commit", "-q", "-m", "init",
         ],

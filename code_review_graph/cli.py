@@ -557,6 +557,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "wiki",
     "detect-changes",
     "dead-code",
+    "coverage",
     "serve",
     "mcp",
     *_GRAPH_TOOL_COMMANDS,
@@ -940,6 +941,30 @@ def main() -> None:
         "--data-dir",
         default=None,
         help="External directory to store graph database (useful for network shares)"
+    )
+
+    # coverage
+    coverage_cmd = sub.add_parser(
+        "coverage",
+        help="Disk-vs-graph completeness report (missing, stale, excluded files)",
+    )
+    coverage_cmd.add_argument(
+        "repo",
+        nargs="?",
+        default=None,
+        help="Repository root (default: auto-detected)",
+    )
+    coverage_cmd.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output one machine-readable JSON object",
+    )
+    coverage_cmd.add_argument(
+        "--no-fail",
+        action="store_true",
+        dest="no_fail",
+        help="Exit 0 even when inventory files are missing from the graph",
     )
 
     # forget
@@ -1692,6 +1717,7 @@ def main() -> None:
         "visualize",
         "wiki",
         "watch",
+        "coverage",
     })
     explicit_data_dir = bool(getattr(args, "data_dir", None))
     read_only_explicit_data_dir = (
@@ -1935,6 +1961,17 @@ def main() -> None:
                         print(f"SVN branch: {stored_svn_branch}")
                     if stored_rev:
                         print(f"SVN revision at build: {stored_rev}")
+
+        elif args.command == "coverage":
+            from .tools.coverage import coverage_report, format_coverage_text
+
+            report = coverage_report(str(repo_root), store=store)
+            if args.json_output:
+                print(json.dumps(report, indent=2, default=str))
+            else:
+                print(format_coverage_text(report))
+            if report.get("missing_from_graph_total") and not args.no_fail:
+                sys.exit(1)
 
         elif args.command == "forget":
             stored_files = store.get_all_files()

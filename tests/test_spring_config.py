@@ -50,7 +50,14 @@ def test_only_conventional_spring_files_are_classified(tmp_path: Path) -> None:
     assert parser.detect_language(tmp_path / "app.properties") is None
     assert parser.detect_language(tmp_path / "workflow.yml") == "yaml"
 
-    assert parser.parse_bytes(tmp_path / "workflow.yml", YAML_SOURCE) == ([], [])
+    # Generic YAML indexes as a bare File marker; plain .properties files
+    # map to no language at all and produce nothing.
+    workflow_nodes, workflow_edges = parser.parse_bytes(
+        tmp_path / "workflow.yml", YAML_SOURCE,
+    )
+    assert [node.kind for node in workflow_nodes] == ["File"]
+    assert workflow_nodes[0].language == "yaml"
+    assert workflow_edges == []
     assert parser.parse_bytes(tmp_path / "app.properties", PROPERTIES_SOURCE) == ([], [])
 
 
@@ -65,13 +72,37 @@ def test_confirmed_ansible_path_keeps_ansible_precedence(tmp_path: Path) -> None
     assert not any(node.kind == "ConfigProperty" for node in nodes)
 
 
-def test_non_spring_application_yaml_is_not_indexed_as_config(tmp_path: Path) -> None:
+def test_non_spring_application_yaml_yields_only_the_file_marker(
+    tmp_path: Path,
+) -> None:
     parser = CodeParser()
     github_actions = b"name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n"
     kubernetes = b"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n"
 
-    assert parser.parse_bytes(tmp_path / "application.yml", github_actions) == ([], [])
-    assert parser.parse_bytes(tmp_path / "application.yaml", kubernetes) == ([], [])
+    for name, manifest in (
+        ("application.yml", github_actions),
+        ("application.yaml", kubernetes),
+    ):
+        nodes, edges = parser.parse_bytes(tmp_path / name, manifest)
+
+        assert [node.kind for node in nodes] == ["File"], name
+        marker = nodes[0]
+        assert marker.language == "yaml", name
+        assert marker.line_end == manifest.count(b"\n") + 1, name
+        assert marker.extra["config_format"] == name.rsplit(".", 1)[-1], name
+        assert edges == [], name
+
+
+def test_malformed_spring_yaml_yields_only_the_file_marker(tmp_path: Path) -> None:
+    parser = CodeParser()
+    source = b"spring:\n  datasource: [unclosed-flow\n"
+
+    nodes, edges = parser.parse_bytes(tmp_path / "application.yml", source)
+
+    assert [node.kind for node in nodes] == ["File"]
+    assert nodes[0].language == "yaml"
+    assert nodes[0].extra["config_format"] == "yml"
+    assert edges == []
 
 
 def test_ansible_content_wins_even_without_ansible_path(tmp_path: Path) -> None:

@@ -32,6 +32,7 @@ from .prompts import (
 from .tools import (
     apply_refactor_func,
     build_or_update_graph,
+    coverage_report,
     cross_repo_search_func,
     detect_changes_func,
     embed_graph,
@@ -145,6 +146,35 @@ async def build_or_update_graph_tool(
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
         ), root)
+
+    return await asyncio.to_thread(_run)
+
+
+@mcp.tool()
+async def coverage_report_tool(repo_root: Optional[str] = None) -> dict:
+    """Disk-vs-graph completeness report for the code knowledge graph.
+
+    Compares the repository's parseable inventory (collect_all_files) with
+    the File nodes stored in the graph:
+
+    * ``missing_from_graph`` — inventory files with no File node (exit-relevant
+      signal; the MCP response always reports them, it never fails the call),
+    * ``stale_in_graph`` — File nodes whose path no longer exists on disk,
+    * ``excluded`` — files outside the inventory classified as ignored /
+      binary / no_language / untracked, with counts and capped samples,
+    * ``by_language`` / ``inventory_by_language`` — File-node and disk-side
+      language counts.
+
+    Read-only: never builds, migrates, or writes the graph. Runs in a thread
+    via ``asyncio.to_thread`` so the stdio event loop stays responsive.
+
+    Args:
+        repo_root: Repository root path. Auto-detected from current directory if omitted.
+    """
+    root = _resolve_repo_root(repo_root)
+
+    def _run() -> dict:
+        return with_provenance(coverage_report(root), root)
 
     return await asyncio.to_thread(_run)
 

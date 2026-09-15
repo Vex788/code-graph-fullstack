@@ -329,6 +329,22 @@ class TestLongRunningToolsAreAsync:
                     )
 
 
+def test_coverage_report_tool_is_registered_and_async():
+    """The disk-vs-graph coverage report must be reachable over MCP, and it
+    must be a coroutine offloading to a thread like the other blocking
+    tools (see #46/#136)."""
+    tool = getattr(crg_main, "coverage_report_tool", None)
+    assert tool is not None, "coverage_report_tool missing from code_review_graph.main"
+    underlying = getattr(tool, "fn", None) or tool
+    assert inspect.iscoroutinefunction(underlying)
+    assert "asyncio.to_thread" in inspect.getsource(underlying)
+
+    # Registration on the server object, via the stable async list_tools API
+    # (the same surface TestApplyToolFilter._restore_tools relies on).
+    names = {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
+    assert "coverage_report_tool" in names
+
+
 class TestGraphBackedToolProvenanceCoverage:
     """Every single-repository graph tool must expose freshness metadata."""
 

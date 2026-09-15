@@ -74,6 +74,9 @@ from .community_tools import (
 # -- context ----------------------------------------------------------------
 from .context import get_minimal_context
 
+# -- coverage ---------------------------------------------------------------
+from .coverage import coverage_report, format_coverage_text
+
 # -- docs -------------------------------------------------------------------
 from .docs import embed_graph, generate_wiki_func, get_docs_section, get_wiki_page_func
 
@@ -114,6 +117,9 @@ __all__ = [
     "run_postprocess",
     # context
     "get_minimal_context",
+    # coverage
+    "coverage_report",
+    "format_coverage_text",
     # community_tools
     "get_architecture_overview_func",
     "get_community_func",

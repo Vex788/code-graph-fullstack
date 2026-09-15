@@ -792,6 +792,12 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".scss": "scss",
     ".sass": "scss",
     ".xml": "xml",
+    # JSP family. File-node-only indexing: the bundled language pack ships no
+    # JSP grammar (probed: LookupError), and the post-build resolver owns all
+    # cross-file edges, so the parser emits the File marker and zero symbols.
+    ".jsp": "jsp",
+    ".jspf": "jsp",
+    ".tag": "jsp",
 }
 
 # ``.h`` is shared by C and C++. Keep C as the extension default, then promote
@@ -2679,6 +2685,13 @@ class CodeParser:
         if language == "rescript":
             return self._parse_rescript(path, source)
 
+        # JSP family: File-node-only by contract. The bundled pack has no
+        # grammar and the resolver owns every cross-file edge, so there is
+        # nothing to extract; the File marker alone makes templates visible
+        # to inventory, impact, and reconciliation.
+        if language == "jsp":
+            return self._file_only_result(path, source, "jsp")
+
         # SQL: dedicated parser — tree-sitter for tables/views/functions +
         # regex fallback for CREATE PROCEDURE (unsupported by the grammar).
         if language == "sql":
@@ -2687,33 +2700,38 @@ class CodeParser:
         # Ansible YAML: path heuristic promoted to "ansible".
         if language == "ansible":
             if _yaml is None:
-                return [], []
+                return self._file_only_result(path, source, "ansible")
             file_type = _ansible_file_type(path)
             # Variable and role-metadata files are identified by Ansible's
             # directory contract. Task/handler paths are not sufficient on
             # their own: generic YAML repositories commonly contain those
             # directory names, so require Ansible content evidence there.
+            # Either way the accepted file keeps at least its File marker.
             if file_type in ("vars", "meta") or _is_ansible_content(source):
                 return self._parse_ansible(path, source)
-            return [], []
+            return self._file_only_result(path, source, "ansible")
 
         # Spring configuration: only conventional application files reach
         # this branch. Generic YAML and arbitrary .properties files stay out.
         if language == "spring_config":
             if _yaml is None:
-                return [], []
+                return self._file_only_result(path, source, "spring_config")
             if path.suffix.lower() in (".yaml", ".yml") and _is_ansible_content(source):
                 return self._parse_ansible(path, source)
             return self._parse_spring_config(path, source)
 
-        # Generic YAML: no tree-sitter grammar bundled; skip.
+        # Generic YAML: no grammar and no structural extraction — File marker
+        # only, so workflows and configs stay visible to the graph.
         if language == "yaml":
-            return [], []
+            return self._file_only_result(path, source, "yaml")
 
         if parser is None:
             parser = self._get_parser(language)
         if not parser:
-            return [], []
+            # Grammar unavailable (probe failed or custom language without a
+            # bundled grammar): index the file with zero symbols rather than
+            # dropping it from the graph while it stays in the inventory.
+            return self._file_only_result(path, source, language)
 
         if tree is None:
             tree = parser.parse(parse_source)
@@ -2803,6 +2821,31 @@ class CodeParser:
                     ))
 
         return nodes, edges
+
+    @staticmethod
+    def _file_only_result(
+        path: Path, source: bytes, language: str,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """File-node-only result: an accepted file with nothing to extract.
+
+        Inventory invariant: ``detect_language`` accepting a file implies the
+        parse emits at least its File marker (zero symbols), so coverage never
+        reports an accepted file as missing from the graph. Used when no
+        grammar exists, a dependency is unavailable, or content checks reject
+        deeper extraction.
+        """
+        file_path_str = normalize_file_path(path)
+        return [
+            NodeInfo(
+                kind="File",
+                name=file_path_str,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=source.count(b"\n") + 1,
+                language=language,
+                is_test=_is_test_file(file_path_str),
+            )
+        ], []
 
     @staticmethod
     def _has_cpp_header_evidence(root) -> bool:
@@ -2989,7 +3032,7 @@ class CodeParser:
         """Parse a Vue SFC by extracting <script> blocks and delegating to JS/TS."""
         vue_parser = self._get_parser("vue")
         if not vue_parser:
-            return [], []
+            return self._file_only_result(path, source, "vue")
 
         tree = vue_parser.parse(source)
         file_path_str = normalize_file_path(path)
@@ -3111,7 +3154,7 @@ class CodeParser:
         if not svelte_parser:
             svelte_parser = self._get_parser("vue")
         if not svelte_parser:
-            return [], []
+            return self._file_only_result(path, source, "svelte")
 
         tree = svelte_parser.parse(source)
         file_path_str = normalize_file_path(path)
@@ -3231,7 +3274,7 @@ class CodeParser:
         try:
             nb = json.loads(source)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return [], []
+            return self._file_only_result(path, source, "notebook")
 
         # Determine kernel language
         kernel_lang = (
@@ -3243,7 +3286,7 @@ class CodeParser:
         # Only parse supported languages
         supported = {"python", "r"}
         if kernel_lang not in supported:
-            return [], []
+            return self._file_only_result(path, source, "notebook")
 
         # Build CellInfo list from code cells
         cells: list[CellInfo] = []
@@ -5619,10 +5662,10 @@ class CodeParser:
             documents = list(_yaml.compose_all(source.decode("utf-8", errors="replace")))
         except _yaml.YAMLError as exc:
             logger.debug("Spring YAML parse error in %s: %s", path, exc)
-            return [], []
+            return [self._spring_config_file_node(path, source, "yaml")], []
 
         if self._is_non_spring_yaml(documents):
-            return [], []
+            return [self._spring_config_file_node(path, source, "yaml")], []
 
         file_path = normalize_file_path(path)
         nodes = [self._spring_config_file_node(path, source, "yaml")]
@@ -5800,9 +5843,9 @@ class CodeParser:
             root = _yaml.compose(source.decode("utf-8", errors="replace"))
         except _yaml.YAMLError as exc:
             logger.debug("Ansible YAML parse error in %s: %s", path, exc)
-            return [], []
+            return self._file_only_result(path, source, "ansible")
         if root is None:
-            return [], []
+            return self._file_only_result(path, source, "ansible")
 
         file_path_str = normalize_file_path(path)
         line_count = source.count(b"\n") + 1

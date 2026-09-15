@@ -23,8 +23,57 @@ def test_presentation_extensions_are_mapped():
         (".html", "html"), (".htm", "html"),
         (".css", "css"), (".scss", "scss"), (".sass", "scss"),
         (".xml", "xml"),
+        (".jsp", "jsp"), (".jspf", "jsp"), (".tag", "jsp"),
     ):
         assert EXTENSION_TO_LANGUAGE.get(suffix) == language, suffix
+
+
+def test_jsp_family_yields_exactly_one_file_node_and_nothing_else(tmp_path: Path):
+    # Fullstack-fork contract: the bundled language pack has no JSP grammar,
+    # so .jsp/.jspf/.tag index as a bare File marker. The JSP link resolver
+    # owns every cross-file edge; symbol extraction here would only invent
+    # structure no grammar vouches for.
+    source = (
+        b"<html>\n"
+        b'<%@ include file="footer.jspf" %>\n'
+        b'<div beanclass="com.example.HomeBean"><a href="/home">go</a></div>\n'
+        b"</html>\n"
+    )
+    for name in ("index.jsp", "footer.jspf", "grid.tag"):
+        path = tmp_path / name
+        path.write_bytes(source)
+
+        assert CodeParser().detect_language(path) == "jsp", name
+        nodes, edges = CodeParser().parse_bytes(path, source)
+
+        assert len(nodes) == 1, f"{name}: expected exactly one File node"
+        node = nodes[0]
+        assert node.kind == "File"
+        assert node.language == "jsp"
+        assert node.name == node.file_path
+        assert node.line_start == 1
+        assert node.line_end == source.count(b"\n") + 1  # newline count, not line count
+        assert edges == [], f"{name}: File-only contract forbids edges"
+
+    # No trailing newline: a one-line file still spans exactly one line.
+    single = tmp_path / "one.jsp"
+    single.write_bytes(b"<div>x</div>")
+    nodes, _ = CodeParser().parse_bytes(single, b"<div>x</div>")
+    assert len(nodes) == 1 and nodes[0].line_end == 1
+
+
+def test_html_file_node_regression_is_unaffected_by_the_jsp_branch(tmp_path: Path):
+    # The JSP special-case must not leak into .html: that file type keeps its
+    # grammar-driven File node (language "html"), which the JSP resolver
+    # discovers as a page.
+    path = tmp_path / "index.html"
+    source = b"<html><body><p>x</p></body></html>\n"
+    path.write_bytes(source)
+
+    nodes, edges = CodeParser().parse_bytes(path, source)
+    file_nodes = [node for node in nodes if node.kind == "File"]
+    assert len(file_nodes) == 1
+    assert file_nodes[0].language == "html"
 
 
 def test_css_selector_kinds_all_produce_nodes(tmp_path: Path):
@@ -64,3 +113,44 @@ def test_leaf_fallback_does_not_invent_names_for_container_nodes(tmp_path: Path)
         assert "\n" not in node.name
         assert len(node.name) < 80, node.name
     assert {"App", "render"} <= {node.name for node in nodes}
+
+
+def test_generic_yaml_yields_exactly_one_file_node_and_nothing_else(tmp_path: Path):
+    # Fullstack-fork contract: generic .yml/.yaml has no grammar and no
+    # structural extractor, so it indexes as a bare File marker — CI
+    # workflows and docker-compose files stay visible to inventory,
+    # coverage, and reconciliation instead of vanishing from the graph.
+    source = (
+        b"name: CI\n"
+        b"on: [push]\n"
+        b"jobs:\n"
+        b"  test:\n"
+        b"    runs-on: ubuntu-latest\n"
+    )
+    for name in ("ci.yml", "compose.yaml"):
+        path = tmp_path / name
+        path.write_bytes(source)
+
+        assert CodeParser().detect_language(path) == "yaml", name
+        nodes, edges = CodeParser().parse_bytes(path, source)
+
+        assert len(nodes) == 1, f"{name}: expected exactly one File node"
+        node = nodes[0]
+        assert node.kind == "File"
+        assert node.language == "yaml"
+        assert node.name == node.file_path
+        assert node.line_start == 1
+        assert node.line_end == source.count(b"\n") + 1  # newline count, not line count
+        assert edges == [], f"{name}: File-only contract forbids edges"
+
+    # No trailing newline: a one-line file still spans exactly one line.
+    single = tmp_path / "one.yaml"
+    single.write_bytes(b"key: value")
+    nodes, _ = CodeParser().parse_bytes(single, b"key: value")
+    assert len(nodes) == 1 and nodes[0].line_end == 1
+
+    # Plain .properties files stay out of the graph entirely: outside the
+    # spring-config convention they map to no language at all.
+    props = tmp_path / "build.properties"
+    assert CodeParser().detect_language(props, b"key=value\n") is None
+    assert CodeParser().parse_bytes(props, b"key=value\n") == ([], [])

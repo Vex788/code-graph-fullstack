@@ -97,7 +97,13 @@ class TestNotebookParsing:
         nodes, edges = self.parser.parse_bytes(
             Path("scala_notebook.ipynb"), source,
         )
-        assert nodes == []
+        # Unsupported kernel: the notebook keeps its File marker (language
+        # "notebook") so it stays visible to coverage and reconciliation.
+        assert len(nodes) == 1
+        marker = nodes[0]
+        assert marker.kind == "File"
+        assert marker.language == "notebook"
+        assert marker.name == "scala_notebook.ipynb"
         assert edges == []
 
     def test_malformed_json(self):
@@ -105,7 +111,13 @@ class TestNotebookParsing:
         nodes, edges = self.parser.parse_bytes(
             Path("bad.ipynb"), source,
         )
-        assert nodes == []
+        # Corrupt JSON: same File-marker floor — never a silent drop.
+        assert len(nodes) == 1
+        marker = nodes[0]
+        assert marker.kind == "File"
+        assert marker.language == "notebook"
+        assert marker.name == "bad.ipynb"
+        assert marker.line_end == 1
         assert edges == []
 
 

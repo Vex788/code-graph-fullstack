@@ -129,6 +129,64 @@ General dependency relationship (used for non-specific dependencies).
 ### REFERENCES
 A value-level reference to another symbol, often used for function-as-value patterns such as callback maps, arrays, or assignment.
 
+The JSP/HTML resolver also emits `REFERENCES` edges from page File nodes (`.jsp`/`.jspf`/`.tag`/`.html`) to the frontend assets they load, with `extra.asset` distinguishing the flavour:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| source | string | Page File node (absolute path) |
+| target | string | Asset File node (absolute path: js/css/jsp/html) |
+| file_path | string | Same as source |
+| line | int | Line of the `script src` / `link href` / `a href` / `form action` |
+| extra.asset | string | `script`, `stylesheet`, or `page` |
+| extra.href | string | The raw href as written in the page |
+
+Targets resolve against the graph's own File nodes: relative to the referencing page's directory first, then under the configured `web_root`, then with any configured servlet context path (`context_paths`) stripped. Unresolvable hrefs (external URLs, EL expressions, missing files) produce no edge and are counted in the resolver's `unresolved_references` stat.
+
+### RENDERS
+A JSP page renders through an explicitly named Java bean (`beanclass`-style attribute). Emitted by the JSP resolver from `jsp` File nodes.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| source | string | Page File node (absolute path) |
+| target | string | Java Class node qualified name, or the raw dotted FQN when unresolvable |
+| file_path | string | Same as source |
+| line | int | Line of the bean-binding attribute |
+| extra.fqn | string | The raw dotted FQN read off the attribute |
+| extra.resolution | string | `class` when bound to a Class node, `raw` otherwise |
+| extra.unresolved | bool | Present and `true` when the target is a raw FQN matching no node |
+
+### REQUESTS
+A JSP page or plain `.js` file calls a route-annotated Java endpoint: `href`/`action`/`url` attributes and `url:`/`fetch('...')` literals matched against known routes. Emitted by the JSP resolver from `jsp` and `javascript` File nodes.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| source | string | Page or script File node (absolute path) |
+| target | string | Endpoint node, Java Class node, or raw dotted FQN — see binding order below |
+| file_path | string | Same as source |
+| line | int | Line of the URL literal |
+| extra.route | string | Normalized route key the URL reduced to |
+| extra.url | string | The raw URL as written |
+| extra.fqn | string | Raw dotted FQN, when a class-level binding matched |
+| extra.resolution | string | `endpoint`, `class`, or `raw` |
+| extra.unresolved | bool | Present and `true` when the target is a raw FQN matching no node |
+
+Target binding order (highest first):
+
+1. **Endpoint node** — the route matches a parser-emitted Spring `Endpoint` (`extra.route`/`extra.http_method`); handler-method visibility comes from the Endpoint's existing `HANDLES` edge. When several endpoints share a route (e.g. GET and POST on one path), the GET endpoint wins, then the smallest qualified name — deterministic without pretending to know the verb.
+2. **Java Class node** — the route maps (via `route_annotations` on classes, e.g. Stripes `@UrlBinding`) to a dotted FQN, which binds to a Class node by unique repository path-suffix match.
+3. **Raw FQN** — no node matches; the edge keeps the dotted FQN target with `extra.unresolved = true` so the link stays visible instead of silently dropping.
+
+### INCLUDES
+A JSP page statically includes another (`<%@ include file="..." %>` / `<jsp:include page="...">`). Target is the included page's File node; the same href resolution rules as `REFERENCES` apply.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| source | string | Including page File node (absolute path) |
+| target | string | Included page File node (absolute path) |
+| file_path | string | Same as source |
+| line | int | Line of the include directive/tag |
+| extra.href | string | The raw include path as written |
+
 ### INJECTS
 A dependency-injection relationship, currently used by Java/Spring enrichment for injected fields and constructor parameters.
 
@@ -169,6 +227,25 @@ Nodes are uniquely identified by qualified names:
 # Nested class method
 /absolute/path/to/file.py::OuterClass.InnerClass.method_name
 ```
+
+## Presentation-layer resolver (`[resolvers.jsp]`)
+
+The JSP/HTML resolver is **enabled by default** with framework-level defaults; a `[resolvers.jsp]` section in `.code-review-graph/config.toml` overrides individual keys, and `enabled = false` switches it off entirely. A missing or malformed config file means "run with the defaults", never an error. The resolver creates no nodes — it discovers pages (`jsp`, `html`) and scripts (`javascript`) from the graph's own File nodes and rebuilds all of its edges (`RENDERS`, `REQUESTS`, `INCLUDES`, `REFERENCES` from page sources) from live graph state on every run, so deletions never leave stale edges.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| enabled | bool | `true` | Master switch for the resolver |
+| web_root | string | `"web"` | Directory absolute hrefs are probed under |
+| source_root | string | `"src"` | Root of the Java source scanned for route annotations |
+| route_annotations | list | `["UrlBinding", "RequestMapping"]` | Class-level annotations that declare a route |
+| bean_attribute | string | `"beanclass"` | Attribute naming the rendered bean class |
+| bean_package_prefix | string | `"com."` | Required prefix of a bean FQN value |
+| dead_url_suffixes | list | `[".action"]` | URL suffixes that never name a live route |
+| context_paths | list | `[]` | Servlet context path prefixes stripped when probing under `web_root` (e.g. `["/myapp"]`) |
+
+## Coverage reporting
+
+`code-review-graph coverage [--json] [--no-fail] [repo_root]` compares the repository's parseable inventory with the File nodes actually stored in the graph, so a silent indexing gap becomes one visible number. `--json` emits one machine-readable object; `--no-fail` forces exit 0 even when tracked files are missing from the graph. The same report is available over MCP as `coverage_report_tool`.
 
 ## SQLite Tables
 

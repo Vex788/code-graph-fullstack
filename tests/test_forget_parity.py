@@ -54,10 +54,17 @@ CREATE TABLE IF NOT EXISTS embeddings (
 
 
 def _git_init(repo: Path) -> None:
+    # ``core.hookspath=`` disables developer-wide git hooks: a machine with
+    # the code-review-graph git integration runs ``code-review-graph update``
+    # from a global pre-commit hook, which materializes a pre-built
+    # ``.code-review-graph/graph.db`` in the fixture repo mid-test; the first
+    # ``_build`` then opens that db (risk_index already populated) while the
+    # rmtree'd rebuild starts empty, breaking the parity snapshot.
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(
-        ["git", "-c", "user.email=t@e.st", "-c", "user.name=t",
+        ["git", "-c", "core.hookspath=",
+         "-c", "user.email=t@e.st", "-c", "user.name=t",
          "commit", "-qm", "init"],
         cwd=repo, check=True,
     )

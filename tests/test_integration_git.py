@@ -36,9 +36,16 @@ from code_review_graph.wiki import get_wiki_page
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run a git command inside *repo* and return the result."""
+    """Run a git command inside *repo* and return the result.
+
+    ``core.hookspath=`` disables any developer-wide git hooks: a machine
+    with the code-review-graph git integration installed runs
+    ``code-review-graph update`` from a global pre-commit hook, which
+    materializes ``.code-review-graph/graph.db`` inside these fixture
+    repos mid-test and breaks the missing-graph and parity assertions.
+    """
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "core.hookspath=", *args],
         capture_output=True,
         text=True,
         cwd=str(repo),
@@ -885,3 +892,310 @@ def test_update_auto_base_multi_commit_rename_matches_full_rebuild(
     with GraphStore(fresh_data / "graph.db") as fresh_store:
         assert incremental_nodes == node_snapshot(fresh_store)
         assert incremental_edges == edge_snapshot(fresh_store)
+
+
+# ------------------------------------------------------------------
+# 7. Fullstack web layer: parser output -> JSP resolver edges, and
+#    branch-switch parity between incremental and fresh graphs
+# ------------------------------------------------------------------
+
+
+WEB_CONTROLLER_JAVA = """package com.example;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api")
+class CatalogController {
+    @GetMapping("/items")
+    Object items() { return null; }
+
+    @PostMapping("/items")
+    void submit() {}
+}
+"""
+
+WEB_BEAN_JAVA = """package com.example;
+
+@UrlBinding("/home")
+public class HomeActionBean {
+}
+"""
+
+WEB_INDEX_JSP_A = """<html>
+<%@ include file="footer.jspf" %>
+<div beanclass="com.example.HomeActionBean">
+  <form action="/home" method="post">
+    <input type="submit"/>
+  </form>
+  <a href="/api/items">list</a>
+  <a href="about.html">about</a>
+  <script src="app.js"></script>
+  <link rel="stylesheet" href="style.css"/>
+</div>
+</html>
+"""
+
+WEB_INDEX_JSP_B = """<html>
+<%@ include file="footer.jspf" %>
+<div beanclass="com.example.HomeActionBean">
+  <form action="/home" method="post">
+    <input type="submit"/>
+  </form>
+  <a href="new.jsp">new page</a>
+  <script src="new.js"></script>
+</div>
+</html>
+"""
+
+WEB_NEW_JSP = """<html>
+<%@ include file="footer.jspf" %>
+<div beanclass="com.example.HomeActionBean">home</div>
+<link rel="stylesheet" href="style.css"/>
+</html>
+"""
+
+WEB_BROKEN_JSP = """<html>
+<div beanclass="com.example.GoneBean">unresolvable</div>
+</html>
+"""
+
+WEB_ABOUT_HTML_A = (
+    '<html><link rel="stylesheet" href="style.css"/>'
+    "<script src=\"app.js\"></script></html>\n"
+)
+WEB_ABOUT_HTML_B = '<html><script src="app.js"></script></html>\n'
+
+WEB_APP_JS = "fetch('/api/items')\n$.ajax({url: '/home'})\n"
+WEB_NEW_JS = "fetch('/home')\n"
+WEB_STYLE_CSS = "body{color:red}\n"
+
+
+def _write_branch_a(repo: Path) -> None:
+    java = repo / "src" / "com" / "example"
+    java.mkdir(parents=True)
+    (java / "CatalogController.java").write_text(WEB_CONTROLLER_JAVA, encoding="utf-8")
+    (java / "HomeActionBean.java").write_text(WEB_BEAN_JAVA, encoding="utf-8")
+    web = repo / "web"
+    web.mkdir()
+    (web / "index.jsp").write_text(WEB_INDEX_JSP_A, encoding="utf-8")
+    (web / "footer.jspf").write_text("<div>footer</div>\n", encoding="utf-8")
+    (web / "about.html").write_text(WEB_ABOUT_HTML_A, encoding="utf-8")
+    (web / "app.js").write_text(WEB_APP_JS, encoding="utf-8")
+    (web / "style.css").write_text(WEB_STYLE_CSS, encoding="utf-8")
+
+
+def _init_web_repo(tmp_path: Path) -> Path:
+    """A git repo on branch ``main`` holding the full A-shape web fixture."""
+    repo = tmp_path / "web-repo"
+    repo.mkdir()
+    _git_ok(repo, "init", "-b", "main")
+    _git_ok(repo, "config", "user.email", "test@test.com")
+    _git_ok(repo, "config", "user.name", "Test")
+    _write_branch_a(repo)
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-qm", "A: controllers, pages, assets")
+    return repo
+
+
+def _write_branch_b(repo: Path) -> None:
+    """Mutate the worktree into the B shape: controller gone, pages changed."""
+    (repo / "src" / "com" / "example" / "CatalogController.java").unlink()
+    index = repo / "web" / "index.jsp"
+    index.write_text(WEB_INDEX_JSP_B, encoding="utf-8")
+    (repo / "web" / "new.jsp").write_text(WEB_NEW_JSP, encoding="utf-8")
+    (repo / "web" / "new.js").write_text(WEB_NEW_JS, encoding="utf-8")
+    (repo / "web" / "style.css").unlink()
+    (repo / "web" / "about.html").write_text(WEB_ABOUT_HTML_B, encoding="utf-8")
+
+
+def _edge_snapshot(store: GraphStore) -> set[tuple]:
+    return {
+        (
+            row["kind"],
+            row["source_qualified"],
+            row["target_qualified"],
+            row["file_path"],
+            row["line"],
+            row["extra"],
+        )
+        for row in store._conn.execute(
+            "SELECT kind, source_qualified, target_qualified, file_path, line, extra "
+            "FROM edges"
+        ).fetchall()
+    }
+
+
+def _jsp_page_snapshot(store: GraphStore) -> set[str]:
+    return {
+        row["qualified_name"]
+        for row in store._conn.execute(
+            "SELECT qualified_name FROM nodes "
+            "WHERE kind = 'File' AND language = 'jsp'"
+        ).fetchall()
+    }
+
+
+def _disk_jsp_inventory(repo: Path) -> set[str]:
+    return {
+        str(path)
+        for suffix in ("*.jsp", "*.jspf", "*.tag")
+        for path in repo.rglob(suffix)
+        if ".git" not in path.parts
+    }
+
+
+def test_full_build_binds_parser_output_into_resolver_edges(tmp_path: Path) -> None:
+    """End-to-end over a real build: the parser's File/Class/Endpoint nodes
+    are the resolver's only inputs, so the edges must bind to them — never to
+    strings manufactured by the resolver itself."""
+    repo = _init_web_repo(tmp_path)
+    (repo / "web" / "broken.jsp").write_text(WEB_BROKEN_JSP, encoding="utf-8")
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-qm", "add unresolved-bean page")
+
+    store = GraphStore(tmp_path / "e2e.db")
+    try:
+        result = full_build(repo, store)
+        assert result["errors"] == []
+        jsp = result["jsp_resolution"]
+        assert jsp["files_indexed"] == 4  # index, footer, broken, about
+        assert jsp["renders"] == 2
+        assert jsp["requests"] >= 3
+        assert jsp["includes"] == 1
+
+        edges = store._conn.execute(
+            "SELECT kind, source_qualified, target_qualified, extra FROM edges "
+            "WHERE kind IN ('RENDERS', 'REQUESTS', 'INCLUDES', 'REFERENCES')"
+        ).fetchall()
+
+        bean_qn = str(repo / "src" / "com" / "example" / "HomeActionBean.java")
+        bean_qn = f"{bean_qn}::HomeActionBean"
+        index_qn = str(repo / "web" / "index.jsp")
+
+        # Endpoint from parsed java binds with GET preferred over POST.
+        endpoints = {
+            row["qualified_name"]: row["extra"]
+            for row in store._conn.execute(
+                "SELECT qualified_name, extra FROM nodes WHERE kind = 'Endpoint'"
+            ).fetchall()
+        }
+        assert len(endpoints) == 2  # GET and POST /api/items
+        get_qn = next(qn for qn, extra in endpoints.items() if '"GET"' in extra)
+        assert '"route": "/api/items"' in endpoints[get_qn]
+
+        def _extra_of(kind: str, source: str, target: str) -> dict:
+            for row in edges:
+                if (
+                    row["kind"] == kind
+                    and row["source_qualified"] == source
+                    and row["target_qualified"] == target
+                ):
+                    return json.loads(row["extra"])
+            raise AssertionError(f"missing {kind} edge {source} -> {target}")
+
+        # @UrlBinding-style class binding, reached from the form action.
+        assert _extra_of("REQUESTS", index_qn, bean_qn) == {
+            "fqn": "com.example.HomeActionBean",
+            "resolution": "class",
+            "route": "/home",
+            "url": "/home",
+        }
+        # Spring endpoint binding, reached from the anchor href.
+        assert _extra_of("REQUESTS", index_qn, get_qn)["resolution"] == "endpoint"
+        assert "GET /api/items" in get_qn
+
+        # Unresolvable beanclass keeps the raw FQN, flagged.
+        broken_qn = str(repo / "web" / "broken.jsp")
+        assert _extra_of("RENDERS", broken_qn, "com.example.GoneBean") == {
+            "fqn": "com.example.GoneBean",
+            "resolution": "raw",
+            "unresolved": True,
+        }
+
+        # Asset references bind to the parser's own File nodes.
+        assert _extra_of("REFERENCES", index_qn, str(repo / "web" / "app.js")) == {
+            "asset": "script", "href": "app.js",
+        }
+        assert _extra_of("REFERENCES", index_qn, str(repo / "web" / "style.css")) == {
+            "asset": "stylesheet", "href": "style.css",
+        }
+        assert _extra_of("REFERENCES", index_qn, str(repo / "web" / "about.html")) == {
+            "asset": "page", "href": "about.html",
+        }
+        assert _extra_of(
+            "INCLUDES", index_qn, str(repo / "web" / "footer.jspf")
+        ) == {"href": "footer.jspf"}
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("direction", ["a_to_b", "b_to_a"])
+def test_branch_switch_web_layer_matches_a_fresh_full_rebuild(
+    tmp_path: Path, monkeypatch, direction: str,
+) -> None:
+    """R5: switching branches rewrites the web layer (controller deleted,
+    pages added/modified, css deleted). The incrementally updated graph must
+    converge to exactly the graph a fresh full rebuild produces on the same
+    branch — no stale edges, no stale jsp File nodes."""
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    repo = _init_web_repo(tmp_path)
+
+    if direction == "a_to_b":
+        built_branch, switched_branch = "main", "feature"
+    else:
+        _git_ok(repo, "checkout", "-b", "feature")
+        _write_branch_b(repo)
+        _git_ok(repo, "add", ".")
+        _git_ok(repo, "commit", "-qm", "B: rewrite web layer")
+        _git_ok(repo, "checkout", "main")
+        built_branch, switched_branch = "feature", "main"
+
+    incremental_data = tmp_path / "incremental-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(incremental_data))
+    _git_ok(repo, "checkout", built_branch)
+    built = build_or_update_graph(
+        full_rebuild=True, repo_root=str(repo), postprocess="none",
+    )
+    assert built["errors"] == []
+
+    # Switch to the other branch shape.
+    if switched_branch == "feature":
+        _git_ok(repo, "checkout", "-b", "feature")
+        _write_branch_b(repo)
+        _git_ok(repo, "add", ".")
+        _git_ok(repo, "commit", "-qm", "B: rewrite web layer")
+    else:
+        _git_ok(repo, "checkout", switched_branch)
+
+    updated = build_or_update_graph(
+        full_rebuild=False, repo_root=str(repo), base=None, postprocess="none",
+    )
+    assert updated["build_type"] == "incremental"
+    assert updated["errors"] == []
+    assert updated["jsp_resolution"] is not None
+
+    with GraphStore(incremental_data / "graph.db") as incremental_store:
+        edges = _edge_snapshot(incremental_store)
+        # Nothing references the branch's deleted nodes.
+        deleted_markers = ("CatalogController.java", "style.css")
+        if switched_branch == "main":
+            deleted_markers = ("new.jsp", "new.js")
+        for edge in edges:
+            for marker in deleted_markers:
+                assert marker not in edge[1], edge
+                assert marker not in edge[2], edge
+
+        pages = _jsp_page_snapshot(incremental_store)
+        assert pages == _disk_jsp_inventory(repo)
+
+    fresh_data = tmp_path / "fresh-data"
+    monkeypatch.setenv("CRG_DATA_DIR", str(fresh_data))
+    fresh = build_or_update_graph(
+        full_rebuild=True, repo_root=str(repo), postprocess="none",
+    )
+    assert fresh["errors"] == []
+
+    with GraphStore(fresh_data / "graph.db") as fresh_store:
+        assert edges == _edge_snapshot(fresh_store)
+        assert pages == _jsp_page_snapshot(fresh_store)

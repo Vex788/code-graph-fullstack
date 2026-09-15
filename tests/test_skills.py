@@ -385,6 +385,20 @@ class TestShippedHooksFiles:
 
 
 class TestInstallGitHook:
+    @pytest.fixture(autouse=True)
+    def _hermetic_global_git_config(self, monkeypatch):
+        """Ignore the developer's global git config for the whole class.
+
+        A machine-wide ``core.hookspath`` (the code-review-graph git
+        integration) makes ``git rev-parse --git-path hooks`` — run by
+        ``install_git_hook`` itself — resolve to the developer's hook
+        directory instead of the fixture repo's ``.git/hooks``.
+        ``GIT_CONFIG_GLOBAL`` swaps in an empty file for ``~/.gitconfig``,
+        which also keeps the empty ``git commit`` below from firing that
+        global pre-commit hook.
+        """
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+
     def _make_git_repo(self, tmp_path: Path) -> Path:
         (tmp_path / ".git" / "hooks").mkdir(parents=True)
         return tmp_path

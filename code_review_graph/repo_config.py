@@ -3,25 +3,33 @@
 Some resolvers (the JSP linker, for one) need to know a repository's own
 naming conventions — where templates live, which annotations mark a route —
 before they can extract anything meaningful. Those conventions vary per
-repository and must never be guessed at or hardcoded for one organisation.
+repository, but the resolver ships framework-level defaults and runs with
+them out of the box; ``[resolvers.jsp]`` is the override surface, not the
+opt-in gate.
 
-A repo opts in by dropping ``.code-review-graph/config.toml``::
+A repo overrides the defaults by dropping
+``.code-review-graph/config.toml``::
 
     [resolvers.jsp]
+    enabled = true
     web_root = "web"
     source_root = "src"
     route_annotations = ["UrlBinding", "RequestMapping"]
     bean_attribute = "beanclass"
     bean_package_prefix = "com."
     dead_url_suffixes = [".action"]
+    context_paths = ["/myapp"]
 
 Sits beside the ``languages.toml`` loader in :mod:`custom_languages` and
 follows the same rules: cached on ``(mtime_ns, size)``, and a broken or
 missing file never raises — it is logged with ``logger.warning`` and treated
 as absent. Missing keys within a present ``[resolvers.jsp]`` table fall back
 to the defaults shown above (all are generic, framework-level conventions,
-not specific to any organisation). A resolver whose section is entirely
-absent must do nothing rather than guess.
+not specific to any organisation). A missing file or table means "run with
+the defaults" (:func:`load_jsp_resolver_config` still returns ``None`` for
+it, so its existing callers keep their contract; the resolver is what
+decides ``None`` means defaults). Set ``enabled = false`` to switch the
+resolver off entirely.
 """
 
 from __future__ import annotations
@@ -51,12 +59,17 @@ CONFIG_RELATIVE_PATH = Path(".code-review-graph") / "config.toml"
 class JspResolverConfig:
     """Validated ``[resolvers.jsp]`` table, with defaults for omitted keys."""
 
+    enabled: bool = True
     web_root: str = "web"
     source_root: str = "src"
     route_annotations: tuple[str, ...] = ("UrlBinding", "RequestMapping")
     bean_attribute: str = "beanclass"
     bean_package_prefix: str = "com."
     dead_url_suffixes: tuple[str, ...] = (".action",)
+    # Leading URL path segments that are a servlet context path, not a disk
+    # directory: "/myapp/css/x.css" probes "<web_root>/css/x.css" after the
+    # plain "<web_root>/myapp/css/x.css" probe misses.
+    context_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -184,11 +197,42 @@ def _validate_jsp_table(table: object, config_path: Path) -> Optional[JspResolve
             return None
         values[key] = tuple(item.strip() for item in value)
 
+    if "enabled" in table and not isinstance(table["enabled"], bool):
+        logger.warning(
+            "%s: resolvers.jsp.enabled must be a boolean — resolvers.jsp not loaded",
+            config_path,
+        )
+        return None
+
+    context_paths: tuple[str, ...] = ()
+    if "context_paths" in table:
+        value = table["context_paths"]
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            logger.warning(
+                "%s: resolvers.jsp.context_paths must be a list of non-empty "
+                "strings — resolvers.jsp not loaded",
+                config_path,
+            )
+            return None
+        context_paths = tuple(_normalize_context_path(item) for item in value)
+
     return JspResolverConfig(
+        enabled=table.get("enabled", defaults.enabled),
         web_root=values.get("web_root", defaults.web_root),
         source_root=values.get("source_root", defaults.source_root),
         route_annotations=values.get("route_annotations", defaults.route_annotations),
         bean_attribute=values.get("bean_attribute", defaults.bean_attribute),
         bean_package_prefix=values.get("bean_package_prefix", defaults.bean_package_prefix),
         dead_url_suffixes=values.get("dead_url_suffixes", defaults.dead_url_suffixes),
+        context_paths=context_paths or defaults.context_paths,
     )
+
+
+def _normalize_context_path(raw: str) -> str:
+    """Canonicalize one servlet context path to ``/segment`` form."""
+    stripped = raw.strip().rstrip("/")
+    if not stripped:
+        return "/"
+    return stripped if stripped.startswith("/") else "/" + stripped

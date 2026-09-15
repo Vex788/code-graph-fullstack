@@ -3,6 +3,7 @@
 import tempfile
 from pathlib import Path
 
+from code_review_graph import parser as parser_module
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import full_build
 from code_review_graph.parser import CodeParser
@@ -2576,3 +2577,97 @@ class TestTypeScriptTypeDeclarations:
                 and e.target == f"{types.resolve().as_posix()}::Finding"
                 for e in edges
             )
+
+
+# ---------------------------------------------------------------------------
+# Degraded-environment contract: an accepted file keeps its File marker
+# ---------------------------------------------------------------------------
+
+CUSTOM_ERLANG_TOML = """\
+[languages.erlang]
+extensions = [".erl"]
+grammar = "erlang"
+function_node_types = ["function_clause"]
+class_node_types = ["record_decl"]
+import_node_types = ["import_attribute"]
+call_node_types = ["call"]
+comment = "Erlang via the bundled tree-sitter-erlang grammar"
+"""
+
+
+def _marker_only(nodes, edges):
+    """Assert the result is exactly one File marker and return it."""
+    assert [node.kind for node in nodes] == ["File"], nodes
+    assert edges == []
+    return nodes[0]
+
+
+def test_missing_pyyaml_still_yields_the_yaml_file_marker(monkeypatch, tmp_path):
+    # PyYAML unavailable: the generic-YAML branch must not crash or drop the
+    # file; the File marker (language "yaml") is the guaranteed floor.
+    monkeypatch.setattr(parser_module, "_yaml", None)
+    path = tmp_path / "workflow.yml"
+    source = b"name: CI\non: [push]\n"
+
+    marker = _marker_only(*parser_module.CodeParser().parse_bytes(path, source))
+
+    assert marker.language == "yaml"
+    assert marker.line_end == source.count(b"\n") + 1
+
+
+def test_missing_pyyaml_at_ansible_path_yields_the_ansible_file_marker(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(parser_module, "_yaml", None)
+    path = tmp_path / "playbooks" / "site.yml"
+    source = b"- name: Deploy\n  hosts: all\n"
+
+    marker = _marker_only(*parser_module.CodeParser().parse_bytes(path, source))
+
+    assert marker.language == "ansible"
+
+
+def test_missing_pyyaml_at_spring_path_yields_the_spring_config_file_marker(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(parser_module, "_yaml", None)
+    path = tmp_path / "application.yml"
+    source = b"spring:\n  datasource:\n    url: jdbc:x\n"
+
+    marker = _marker_only(*parser_module.CodeParser().parse_bytes(path, source))
+
+    assert marker.language == "spring_config"
+
+
+def test_probe_failed_grammar_yields_the_file_marker(monkeypatch, tmp_path):
+    # The load probe failed for python: the .py file keeps its File marker
+    # instead of vanishing from the graph while staying in the inventory.
+    monkeypatch.setitem(parser_module._PARSER_PROBE_RESULTS, "python", False)
+    path = tmp_path / "app.py"
+    source = b"def run():\n    return 1\n"
+
+    marker = _marker_only(*parser_module.CodeParser().parse_bytes(path, source))
+
+    assert marker.language == "python"
+    assert marker.line_end == source.count(b"\n") + 1
+
+
+def test_custom_language_without_grammar_yields_the_file_marker(
+    monkeypatch, tmp_path,
+):
+    # Same floor for config-driven custom languages: the marker carries the
+    # custom language name even when its grammar cannot be loaded.
+    config_dir = tmp_path / ".code-review-graph"
+    config_dir.mkdir()
+    (config_dir / "languages.toml").write_text(CUSTOM_ERLANG_TOML)
+    monkeypatch.setitem(parser_module._PARSER_PROBE_RESULTS, "erlang", False)
+
+    path = tmp_path / "math_utils.erl"
+    source = b"-module(math_utils).\nadd(A, B) -> A + B.\n"
+
+    parser = parser_module.CodeParser(repo_root=tmp_path)
+    assert parser.detect_language(path, source) == "erlang"
+
+    marker = _marker_only(*parser.parse_bytes(path, source))
+
+    assert marker.language == "erlang"

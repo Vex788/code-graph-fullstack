@@ -896,6 +896,94 @@ class TestIncrementalUpdate:
             store.close()
 
 
+class TestWebLayerResolverGating:
+    """The JSP resolver re-runs on any web-layer language change (fork).
+
+    ``_EXTENSION_LANGUAGES`` maps the web file extensions onto the language
+    tags in the resolver registry, and "jsp" sits in ``_RECONCILE_ON_DELETE``
+    so a deletion that only surfaces through reconciliation still re-runs it
+    and clears the derived edges.
+    """
+
+    def test_changed_languages_maps_web_extensions(self):
+        assert incremental_module._changed_languages(
+            {"a.jsp", "b.jspf", "c.tag"}
+        ) == frozenset({"jsp"})
+        assert incremental_module._changed_languages(
+            {"app.js", "lib.mjs", "view.jsx"}
+        ) == frozenset({"javascript"})
+        assert incremental_module._changed_languages({"old.htm", "page.html"}) == frozenset(
+            {"html"}
+        )
+        assert incremental_module._changed_languages({"site.css"}) == frozenset({"css"})
+        assert incremental_module._changed_languages({"theme.scss"}) == frozenset({"scss"})
+        assert incremental_module._changed_languages({"plain.py"}) == frozenset({"python"})
+
+    def test_js_only_update_reruns_the_jsp_resolver(self, tmp_path):
+        page = tmp_path / "page.jsp"
+        page.write_text("<html><a href='other.jsp'>x</a></html>\n")
+        script = tmp_path / "app.js"
+        script.write_text("fetch('/data')\n")
+
+        store = GraphStore(tmp_path / "test.db")
+        try:
+            first = incremental_update(
+                tmp_path, store, changed_files=["page.jsp", "app.js"]
+            )
+            assert first["jsp_resolution"] is not None
+
+            # A .js-only change: the resolver's edges bind to javascript File
+            # nodes too, so the javascript tag alone must re-run it.
+            script.write_text("fetch('/other')\n")
+            second = incremental_update(tmp_path, store, changed_files=["app.js"])
+            assert second["jsp_resolution"] is not None
+            assert second["jsp_resolution"]["files_indexed"] >= 1
+        finally:
+            store.close()
+
+    def test_deletion_only_update_reruns_the_jsp_resolver(self, tmp_path):
+        page = tmp_path / "page.jsp"
+        page.write_text("<html><div beanclass='com.example.Bean'>x</div></html>\n")
+        java = tmp_path / "Bean.java"
+        java.write_text("package com.example;\npublic class Bean {}\n")
+
+        store = GraphStore(tmp_path / "test.db")
+        try:
+            seeded = incremental_update(
+                tmp_path, store, changed_files=["page.jsp", "Bean.java"]
+            )
+            assert seeded["jsp_resolution"] is not None
+
+            page.unlink()
+            java.unlink()
+            # No changed files at all: the deletion surfaces only through
+            # stale reconciliation, so only the _RECONCILE_ON_DELETE members
+            # may re-run — jsp among them.
+            result = incremental_update(tmp_path, store, changed_files=[])
+            assert result["jsp_resolution"] is not None
+        finally:
+            store.close()
+
+    def test_python_only_change_does_not_run_the_jsp_resolver(self, tmp_path):
+        page = tmp_path / "page.jsp"
+        page.write_text("<html><a href='other.jsp'>x</a></html>\n")
+        module = tmp_path / "mod.py"
+        module.write_text("x = 1\n")
+
+        store = GraphStore(tmp_path / "test.db")
+        try:
+            seeded = incremental_update(
+                tmp_path, store, changed_files=["page.jsp", "mod.py"]
+            )
+            assert seeded["jsp_resolution"] is not None
+
+            module.write_text("x = 2\n")
+            result = incremental_update(tmp_path, store, changed_files=["mod.py"])
+            assert result["jsp_resolution"] is None
+        finally:
+            store.close()
+
+
 class TestRacingSaveSnapshotCoherence:
     """Regression tests for #746: a file saved while it is being indexed.
 

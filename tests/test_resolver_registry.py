@@ -50,8 +50,11 @@ def test_gating_reproduces_the_old_per_resolver_booleans():
     # In the old code, a single `spring_changed` boolean (any .java file
     # changed) gated three different resolvers: spring, spring_event, and
     # temporal. Reproduce that exactly, not "fix" it.
+    # "jsp" joined _RECONCILE_ON_DELETE with the fullstack fork: its edges
+    # are derived from live templates, so a deletion that only surfaces
+    # through reconciliation must still clear them.
     assert incremental_module._RECONCILE_ON_DELETE == frozenset(
-        {"python", "spring", "spring_event", "temporal"}
+        {"python", "spring", "spring_event", "temporal", "jsp"}
     )
     assert (
         RESOLVERS["spring"][2]
@@ -63,6 +66,11 @@ def test_gating_reproduces_the_old_per_resolver_booleans():
     assert RESOLVERS["rescript"][2] == frozenset({"rescript"})
     assert RESOLVERS["hcl"][2] == frozenset({"hcl"})
     assert RESOLVERS["scoped"][2] == frozenset({"php", "rust", "csharp"})
+    # The jsp resolver binds to Java Endpoint/Class nodes and to frontend
+    # asset File nodes alike, so every one of those languages re-runs it.
+    assert RESOLVERS["jsp"][2] == frozenset(
+        {"jsp", "java", "javascript", "html", "css", "scss"}
+    )
     print("OK: gating groups match the old *_changed booleans exactly")
 
 
@@ -138,6 +146,7 @@ def test_unchanged_language_resolver_is_not_run_on_the_incremental_path():
     assert ran["spring"] is False
     assert ran["spring_event"] is False
     assert ran["temporal"] is False
+    assert ran["jsp"] is False
     assert ran["rescript"] is False
     assert ran["scoped"] is False
     print("OK: a resolver whose language did not change is skipped on the incremental path")

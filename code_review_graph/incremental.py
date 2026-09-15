@@ -93,6 +93,17 @@ _EXTENSION_LANGUAGES: dict[str, str] = {
     ".php": "php",
     ".rs": "rust",
     ".cs": "csharp",
+    ".jsp": "jsp",
+    ".jspf": "jsp",
+    ".tag": "jsp",
+    # Frontend assets: the JSP resolver's edges also bind to these File nodes.
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".jsx": "javascript",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "scss",
 }
 
 
@@ -106,11 +117,35 @@ def _changed_languages(paths) -> frozenset[str]:
     )
 
 
+# Result-dict keys every incremental_update return path must carry, mapped
+# from the RESOLVERS registry names (``spring_event`` predates the registry
+# naming and reports as ``event_resolution``). None means the resolver did
+# not run on that path; a stats dict (even all-zero) means it ran.
+_RESOLVER_RESULT_KEYS: dict[str, str] = {
+    "python": "python_resolution",
+    "rescript": "rescript_resolution",
+    "spring": "spring_resolution",
+    "spring_event": "event_resolution",
+    "temporal": "temporal_resolution",
+    "jsp": "jsp_resolution",
+    "hcl": "hcl_resolution",
+    "scoped": "scoped_resolution",
+}
+
+
+def _resolver_results_section(
+    results: dict[str, Optional[dict]],
+) -> dict[str, Optional[dict]]:
+    """Project registry-named resolver results onto the ``*_resolution`` keys."""
+    return {key: results.get(name) for name, key in _RESOLVER_RESULT_KEYS.items()}
+
+
 # Resolvers that must also re-run on a deletion-only change (a stale or
 # missing path, not just a freshly changed one), because they maintain
-# derived/virtual graph state (e.g. Spring Event nodes — issue #474). Every
-# other resolver only looks at newly changed files, as before this refactor.
-_RECONCILE_ON_DELETE = frozenset({"python", "spring", "spring_event", "temporal"})
+# derived/virtual graph state (e.g. Spring Event nodes — issue #474; JSP
+# link edges derived from live templates). Every other resolver only looks
+# at newly changed files, as before this refactor.
+_RECONCILE_ON_DELETE = frozenset({"python", "spring", "spring_event", "temporal", "jsp"})
 
 
 # Default ignore patterns (in addition to .gitignore).
@@ -1330,6 +1365,8 @@ def incremental_update(
         _assert_graph_matches_root(repo_root, store)
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
+    # Initialized once so every return path carries all resolver keys.
+    resolver_results: dict[str, Optional[dict]] = dict.fromkeys(RESOLVERS)
 
     if (
         store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
@@ -1339,6 +1376,8 @@ def incremental_update(
             "C++ identity format changed; rebuilding the graph before incremental update",
         )
         rebuilt = full_build(repo_root, store)
+        for name, key in _RESOLVER_RESULT_KEYS.items():
+            resolver_results[name] = rebuilt.get(key)
         return {
             "files_updated": rebuilt["files_parsed"],
             "total_nodes": rebuilt["total_nodes"],
@@ -1347,13 +1386,7 @@ def incremental_update(
             "dependent_files": [],
             "errors": rebuilt["errors"],
             "identity_rebuild": True,
-            "python_resolution": rebuilt["python_resolution"],
-            "rescript_resolution": rebuilt["rescript_resolution"],
-            "spring_resolution": rebuilt["spring_resolution"],
-            "event_resolution": rebuilt["event_resolution"],
-            "temporal_resolution": rebuilt["temporal_resolution"],
-            "jsp_resolution": rebuilt["jsp_resolution"],
-            "hcl_resolution": rebuilt["hcl_resolution"],
+            **_resolver_results_section(resolver_results),
         }
 
     # Determine changed files
@@ -1370,6 +1403,7 @@ def incremental_update(
             "dependent_files": [],
             "stale_files_removed": 0,
             "errors": [],
+            **_resolver_results_section(resolver_results),
         }
 
     # Find dependent files (files that import from changed files)
@@ -1469,7 +1503,7 @@ def incremental_update(
         store.commit()
 
     # Only re-run a resolver when a file in one of its declared languages
-    # changed. python/spring/spring_event/temporal are in _RECONCILE_ON_DELETE
+    # changed. python/spring/spring_event/temporal/jsp are in _RECONCILE_ON_DELETE
     # and also look at stale/missing paths, so a deletion that only surfaces
     # through reconciliation still clears derived state (e.g. virtual Spring
     # Event nodes — issue #474); every other resolver only looks at newly
@@ -1479,7 +1513,6 @@ def incremental_update(
     )
     changed_languages = _changed_languages(all_files)
 
-    resolver_results: dict[str, Optional[dict]] = {}
     for name, (_resolver, _label, languages) in RESOLVERS.items():
         active_languages = (
             reconciled_languages if name in _RECONCILE_ON_DELETE else changed_languages
@@ -1496,14 +1529,7 @@ def incremental_update(
         "dependent_files": list(dependent_files),
         "stale_files_removed": len(stale_files),
         "errors": errors,
-        "python_resolution": resolver_results["python"],
-        "rescript_resolution": resolver_results["rescript"],
-        "spring_resolution": resolver_results["spring"],
-        "event_resolution": resolver_results["spring_event"],
-        "temporal_resolution": resolver_results["temporal"],
-        "jsp_resolution": resolver_results["jsp"],
-        "hcl_resolution": resolver_results["hcl"],
-        "scoped_resolution": resolver_results["scoped"],
+        **_resolver_results_section(resolver_results),
     }
 
 

@@ -111,6 +111,61 @@ def test_full_section_uses_every_value():
     print("OK: full section uses every configured value")
 
 
+def test_enabled_false_round_trips():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, "[resolvers.jsp]\nenabled = false\n")
+        result = load_jsp_resolver_config(root)
+    assert result == JspResolverConfig(enabled=False)
+    print("OK: enabled=false loads, every other key keeps its default")
+
+
+def test_context_paths_normalize_to_slash_segment_form():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(
+            root,
+            '[resolvers.jsp]\ncontext_paths = ["myapp", "/ctx/", "deep/nested"]\n',
+        )
+        result = load_jsp_resolver_config(root)
+    assert result is not None
+    assert result.context_paths == ("/myapp", "/ctx", "/deep/nested")
+    assert result.enabled is True  # untouched key keeps its default
+    print("OK: context_paths normalize to '/segment' form")
+
+
+def test_enabled_with_wrong_type_warns_and_returns_none():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, '[resolvers.jsp]\nenabled = "yes"\n')  # wrong type
+        with patch("code_review_graph.repo_config.logger.warning") as warn:
+            result = load_jsp_resolver_config(root)
+    assert result is None
+    assert warn.call_count == 1
+    print("OK: non-boolean enabled -> warns once, whole section treated as absent")
+
+
+def test_context_paths_with_wrong_type_warns_and_returns_none():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, '[resolvers.jsp]\ncontext_paths = ["/ok", 5]\n')  # wrong type
+        with patch("code_review_graph.repo_config.logger.warning") as warn:
+            result = load_jsp_resolver_config(root)
+    assert result is None
+    assert warn.call_count == 1
+    print("OK: wrong-typed context_paths -> warns once, whole section treated as absent")
+
+
+def test_empty_context_paths_list_keeps_the_default():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, '[resolvers.jsp]\ncontext_paths = []\n')
+        result = load_jsp_resolver_config(root)
+    assert result is not None
+    assert result.context_paths == ()
+    print("OK: an explicitly empty context_paths list is accepted as 'no context paths'")
+
+
 def test_result_is_cached_until_file_changes():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

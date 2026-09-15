@@ -62,7 +62,10 @@ RESOLVERS: dict[str, tuple[Resolver, str, frozenset[str]]] = {
     "jsp": (
         resolve_jsp_links,
         "JSP link resolver",
-        frozenset({"jsp", "java"}),
+        # Edges bind to Java nodes (Endpoint/Class) and to frontend asset
+        # File nodes (js/css/scss/jsp/html), so any of those changing can
+        # invalidate this resolver's derived edges.
+        frozenset({"jsp", "java", "javascript", "html", "css", "scss"}),
     ),
     "hcl": (
         resolve_hcl_module_references,

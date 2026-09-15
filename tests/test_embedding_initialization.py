@@ -238,7 +238,13 @@ def test_windows_server_still_prewarms_before_mcp_run(monkeypatch, tmp_path):
     policy = object()
     monkeypatch.delenv("CRG_TOOLS", raising=False)
     monkeypatch.setattr(crg_main, "_default_repo_root", None)
-    monkeypatch.setattr(crg_main.sys, "platform", "win32")
+    # The fake policy must be installed while sys.platform is still POSIX:
+    # on Python 3.14 asyncio's module __getattr__ only tolerates the missing
+    # name there (clean AttributeError). With the platform already "win32"
+    # it reaches for the Windows-only windows_events global and raises
+    # NameError from inside monkeypatch's old-value probe. A plain setattr
+    # into asyncio.__dict__ shadows __getattr__, so the production lookup
+    # finds the fake under any platform value.
     monkeypatch.setattr(
         crg_main.asyncio,
         "WindowsSelectorEventLoopPolicy",
@@ -250,6 +256,7 @@ def test_windows_server_still_prewarms_before_mcp_run(monkeypatch, tmp_path):
         "set_event_loop_policy",
         lambda value: events.append("policy") if value is policy else None,
     )
+    monkeypatch.setattr(crg_main.sys, "platform", "win32")
     monkeypatch.setattr(
         embeddings,
         "prewarm_local_embeddings",
