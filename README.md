@@ -353,6 +353,7 @@ code-review-graph install --platform <name>  # Target a specific platform
 code-review-graph uninstall --dry-run  # Preview safe removal of installed artifacts
 code-review-graph build            # Parse entire codebase
 code-review-graph update           # Incremental update (changed files only)
+code-review-graph build --data-dir <dir>  # External graph DB dir (persistent until 'unregister')
 code-review-graph status           # Graph statistics
 code-review-graph watch            # Auto-update on file changes
 code-review-graph visualize        # Generate interactive HTML graph

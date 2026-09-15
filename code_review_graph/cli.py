@@ -458,13 +458,23 @@ def _handle_init(args: argparse.Namespace) -> None:
 
 def _handle_data_dir_option(args, repo_root: Path) -> None:
     """Handle --data-dir option by updating registry if specified."""
+    # Invariant: write-commands (build/update/postprocess/embed, plus forget
+    # and dead-code via the shared _data_dir_cmds path) persist the data dir
+    # in the global registry so hook-driven plain `update` keeps finding the
+    # network share. Read-only commands treat an explicit --data-dir as
+    # per-invocation only (read_only_explicit_data_dir in main()).
     if hasattr(args, "data_dir") and args.data_dir:
         try:
             from .registry import Registry
             data_dir_path = Path(args.data_dir).expanduser().resolve()
             data_dir_path.mkdir(parents=True, exist_ok=True)
             Registry().set_data_dir(str(repo_root), str(data_dir_path))
-            logging.info(f"Graph database will be stored at: {data_dir_path}")
+            print(f"Data directory for this repository set to: {data_dir_path}")
+            print(
+                f"(persistent — future build/update will use it; run "
+                f"'code-review-graph unregister <repo-path>' to revert to "
+                f"{repo_root}/.code-review-graph/)"
+            )
         except Exception as exc:
             logging.error(f"Failed to set data directory: {exc}")
             sys.exit(1)
@@ -829,7 +839,8 @@ def main() -> None:
     build_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network "
+             "shares); persistent until 'unregister'",
     )
     _add_embedding_refresh_args(build_cmd)
 
@@ -873,7 +884,8 @@ def main() -> None:
     update_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network "
+             "shares); persistent until 'unregister'",
     )
     _add_embedding_refresh_args(update_cmd)
 
@@ -889,7 +901,8 @@ def main() -> None:
     pp_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network "
+             "shares); persistent until 'unregister'",
     )
     _add_embedding_refresh_args(pp_cmd)
 
@@ -914,7 +927,8 @@ def main() -> None:
     embed_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network "
+             "shares); persistent until 'unregister'",
     )
 
     # watch
@@ -988,7 +1002,8 @@ def main() -> None:
     forget_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory to store graph database (useful for network shares)"
+        help="External directory to store graph database (useful for network "
+             "shares); persistent until 'unregister'",
     )
 
     # visualize
@@ -1148,7 +1163,8 @@ def main() -> None:
     dead_cmd.add_argument(
         "--data-dir",
         default=None,
-        help="External directory containing the graph database",
+        help="External directory to store graph database (useful for network "
+             "shares); persistent until 'unregister'",
     )
 
     # Graph tool wrappers

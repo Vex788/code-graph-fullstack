@@ -492,3 +492,108 @@ def test_dead_code_missing_graph_exits_nonzero(tmp_path, monkeypatch, capsys):
 
     assert exc_info.value.code == 1
     assert "No graph found" in capsys.readouterr().err
+
+
+def test_data_dir_option_prints_persistent_notice_and_registers_repo(
+    tmp_path, capsys,
+):
+    """--data-dir persists in the registry, so the notice must say so.
+
+    The persistence is by design (hook-driven plain ``update`` keeps finding
+    the network share), but it used to be announced only via logging.info —
+    invisible on a normal stdout scan. It must be a stdout notice naming the
+    way out.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    data_dir = tmp_path / "net-share"
+
+    cli._handle_data_dir_option(SimpleNamespace(data_dir=str(data_dir)), repo)
+
+    out = capsys.readouterr().out
+    assert "Data directory for this repository set to:" in out
+    assert str(data_dir) in out
+    assert "code-review-graph unregister" in out
+
+    from code_review_graph.registry import Registry
+
+    registry = Registry()
+    assert registry.get_data_dir_for_repo(str(repo.resolve())) == str(data_dir)
+
+    # A fresh Registry re-reads disk: the entry really persisted, and
+    # unregister really removes it.
+    assert registry.unregister(str(repo)) is True
+    assert Registry().get_data_dir_for_repo(str(repo.resolve())) is None
+
+
+def test_build_data_dir_notice_registry_and_db_location_end_to_end(
+    tmp_path, capsys,
+):
+    """``build --data-dir X`` end to end: notice on stdout, registry entry,
+    and the database actually living in the external directory."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "a.py").write_text("def helper():\n    return 1\n")
+    subprocess.run(
+        ["git", "-c", "core.hookspath=", "init", "-q"],
+        cwd=str(repo), check=True, capture_output=True, timeout=30,
+    )
+    subprocess.run(
+        [
+            "git", "-c", "core.hookspath=",
+            "-c", "user.email=t@test", "-c", "user.name=t",
+            "add", ".",
+        ],
+        cwd=str(repo), check=True, capture_output=True, timeout=30,
+    )
+    subprocess.run(
+        [
+            "git", "-c", "core.hookspath=",
+            "-c", "user.email=t@test", "-c", "user.name=t",
+            "commit", "-qm", "init",
+        ],
+        cwd=str(repo), check=True, capture_output=True, timeout=30,
+    )
+    data_dir = tmp_path / "share"
+
+    argv = [
+        "code-review-graph", "build",
+        "--repo", str(repo),
+        "--data-dir", str(data_dir),
+        "--skip-postprocess",
+    ]
+    with patch.object(sys, "argv", argv):
+        cli.main()
+
+    out = capsys.readouterr().out
+    assert "Data directory for this repository set to:" in out
+    assert "code-review-graph unregister" in out
+    # The registry entry steers the build into the external directory.
+    assert (data_dir / "graph.db").exists()
+
+    from code_review_graph.registry import Registry
+
+    assert (
+        Registry().get_data_dir_for_repo(str(repo.resolve()))
+        == str(data_dir)
+    )
+    assert Registry().unregister(str(repo)) is True
+    assert Registry().get_data_dir_for_repo(str(repo.resolve())) is None
+
+
+@pytest.mark.parametrize("command", ["build", "update", "postprocess", "embed"])
+def test_data_dir_help_documents_persistence(command, capsys):
+    """The write commands' --data-dir help must disclose the persistence."""
+    argv = ["code-review-graph", command, "--help"]
+    with patch.object(sys, "argv", argv):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main()
+
+    assert exc_info.value.code == 0
+    # Whitespace-normalized: argparse wraps the help at terminal width, so
+    # the fragment must survive any line breaking.
+    normalized = " ".join(capsys.readouterr().out.split())
+    assert "persistent until 'unregister'" in normalized

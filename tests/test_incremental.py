@@ -1901,3 +1901,131 @@ class TestRenamePurgeParity:
             assert store.get_nodes_by_file(str(tmp_path / "b.py"))
         finally:
             store.close()
+
+
+class TestContentDriftReconciliation:
+    """A watcher edit that git later reverts must still reach the graph.
+
+    The watcher applies an edit while HEAD stands still (an explicit
+    changed_files batch, reconcile_stale=False), the edit is then undone
+    with ``git checkout -- <file>``, and every git diff against any base
+    comes back empty even though the graph still describes the reverted
+    content. The plain update's stat-first content-drift sweep closes that
+    gap; the hash comparison alone decides what is really drifted.
+    """
+
+    # Every return path of incremental_update must carry these keys: the
+    # drift counter plus one section per registered resolver.
+    RESULT_RESOLUTION_KEYS = frozenset({
+        "python_resolution",
+        "rescript_resolution",
+        "spring_resolution",
+        "event_resolution",
+        "temporal_resolution",
+        "jsp_resolution",
+        "hcl_resolution",
+        "scoped_resolution",
+    })
+
+    def _git(self, cwd, *args):
+        # ``core.hookspath=`` disables developer-wide git hooks (see
+        # test_integration_git._git): a global pre-commit running
+        # ``code-review-graph update`` would materialize graph state inside
+        # these fixture repos mid-test.
+        subprocess.run(
+            [
+                "git", "-c", "core.hookspath=",
+                "-c", "user.email=t@test", "-c", "user.name=t", *args,
+            ],
+            cwd=str(cwd), check=True, capture_output=True,
+        )
+
+    def _build_fixture(self, tmp_path):
+        (tmp_path / "web").mkdir()
+        (tmp_path / "a.py").write_text("def helper():\n    return 1\n")
+        (tmp_path / "web" / "app.jsp").write_text(
+            "<html><body>home</body></html>\n"
+        )
+        (tmp_path / "web" / "app.js").write_text("function boot() {}\n")
+        self._git(tmp_path, "init", "-q")
+        self._git(tmp_path, "add", ".")
+        self._git(tmp_path, "commit", "-qm", "init")
+        return tmp_path
+
+    def _page_references(self, store, page):
+        return [
+            edge for edge in store.get_edges_by_source(str(page))
+            if edge.kind == "REFERENCES"
+        ]
+
+    def _pin_zero_drift_tolerance(self, monkeypatch):
+        # The tolerance is read from the environment once at import, so pin
+        # the module attribute (and keep the env var consistent). Tolerance 0
+        # makes any post-update mtime a sweep candidate without sleeps; the
+        # 1-second strftime resolution of last_updated then never hides a
+        # file touched in the same second as the update that recorded it.
+        monkeypatch.setattr(
+            incremental_module, "_DRIFT_MTIME_TOLERANCE_SECONDS", 0.0,
+        )
+        monkeypatch.setenv("CRG_DRIFT_MTIME_TOLERANCE", "0")
+
+    def test_reverted_watcher_edit_is_swept_into_the_changed_set(
+        self, tmp_path, monkeypatch,
+    ):
+        self._pin_zero_drift_tolerance(monkeypatch)
+        root = self._build_fixture(tmp_path)
+        store = GraphStore(tmp_path / "g.db")
+        try:
+            full_build(root, store)
+
+            page = tmp_path / "web" / "app.jsp"
+            script = tmp_path / "web" / "app.js"
+            with page.open("a", encoding="utf-8") as fh:
+                fh.write('<script src="app.js"></script>\n')
+
+            # The watcher's entry point: an explicit batch, no reconciliation.
+            watcher = incremental_update(
+                root, store, changed_files=["web/app.jsp"], reconcile_stale=False,
+            )
+            assert watcher["files_updated"] == 1
+            assert any(
+                edge.target_qualified == str(script)
+                for edge in self._page_references(store, page)
+            )
+
+            # Revert the edit: every git diff is empty again, but the graph
+            # still carries the script-tag REFERENCES edge.
+            self._git(root, "checkout", "--", "web/app.jsp")
+
+            reverted = incremental_update(root, store)
+            assert reverted["files_updated"] == 1
+            assert reverted["changed_files"] == ["web/app.jsp"]
+            assert reverted["content_drift_detected"] == 1
+            assert self._page_references(store, page) == []
+
+            # Idempotent: further plain updates hash their mtime candidates,
+            # find them unchanged, and leave the graph alone.
+            for _ in range(2):
+                quiet = incremental_update(root, store)
+                assert quiet["files_updated"] == 0
+                assert quiet["changed_files"] == []
+                assert quiet["content_drift_detected"] == 0
+        finally:
+            store.close()
+
+    def test_plain_update_on_untouched_repo_reports_zero_drift_and_full_keys(
+        self, tmp_path, monkeypatch,
+    ):
+        self._pin_zero_drift_tolerance(monkeypatch)
+        root = self._build_fixture(tmp_path)
+        store = GraphStore(tmp_path / "g.db")
+        try:
+            full_build(root, store)
+
+            result = incremental_update(root, store)
+
+            assert result["files_updated"] == 0
+            assert result["content_drift_detected"] == 0
+            assert self.RESULT_RESOLUTION_KEYS <= set(result)
+        finally:
+            store.close()

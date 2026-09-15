@@ -20,6 +20,7 @@ from typing import Optional
 from fastmcp import FastMCP
 
 from . import incremental as _incremental
+from .cli import _get_version
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
 from .prompts import (
@@ -90,6 +91,10 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
 
 mcp = FastMCP(
     "code-review-graph",
+    # Same derivation the CLI prints for --version (dist-info first, then
+    # __version__ fallback); without this FastMCP falls back to its own
+    # library version in the MCP initialize handshake. See: df3ee7e.
+    version=_get_version(),
     instructions=(
         "Persistent incremental knowledge graph for token-efficient, "
         "context-aware code reviews. Parses your codebase with Tree-sitter, "

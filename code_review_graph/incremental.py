@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -1105,6 +1106,58 @@ def _reconcile_stale_files(
     return stale_files
 
 
+# Clock tolerance for the content-drift sweep. ``last_updated`` is written by
+# ``time.strftime`` with one-second resolution, so a file saved in the same
+# instant an update recorded its own finish can stat as "newer" without any
+# real change. The hash comparison decides drift; this window only keeps such
+# same-instant files from being re-hashed on every later update.
+_DRIFT_MTIME_TOLERANCE_SECONDS = float(
+    os.environ.get("CRG_DRIFT_MTIME_TOLERANCE", "0.25")
+)
+
+
+def _detect_content_drift(repo_root: Path, store: GraphStore) -> list[str]:
+    """Find indexed files whose on-disk content no longer matches the graph.
+
+    Git cannot see this divergence: the watcher applies an edit while HEAD
+    stands still, the edit is later reverted (``git checkout -- <file>``), and
+    every diff against the stored base comes back empty even though the graph
+    still describes the reverted content. The sweep is stat-first — only files
+    whose mtime is newer than the graph's ``last_updated`` record are hashed —
+    so a quiet repository pays one ``stat`` per indexed file and no hashing.
+    Returns repo-relative paths ready to enter the changed-file pipeline.
+    """
+    built_at_raw = store.get_metadata("last_updated")
+    if not built_at_raw:
+        return []
+    try:
+        # ``last_updated`` is written by time.strftime (naive local time);
+        # .timestamp() reads it back in that same local-time frame.
+        threshold = datetime.fromisoformat(built_at_raw).timestamp()
+    except ValueError:
+        return []
+    threshold += _DRIFT_MTIME_TOLERANCE_SECONDS
+
+    drifted: list[str] = []
+    for stored_path in store.get_all_files():
+        path = Path(stored_path)
+        try:
+            if path.stat().st_mtime <= threshold:
+                continue
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        node = next(store.iter_nodes_by_file(stored_path), None)
+        if node is None or not node.file_hash:
+            continue
+        if hashlib.sha256(raw).hexdigest() != node.file_hash:
+            try:
+                drifted.append(str(path.relative_to(repo_root)))
+            except ValueError:
+                drifted.append(str(path))
+    return sorted(drifted)
+
+
 def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
     """Refuse an incremental reconciliation anchored to a different root.
 
@@ -1386,13 +1439,29 @@ def incremental_update(
             "dependent_files": [],
             "errors": rebuilt["errors"],
             "identity_rebuild": True,
+            "content_drift_detected": 0,
             **_resolver_results_section(resolver_results),
         }
 
     # Determine changed files
-    if changed_files is None:
+    auto_discovery = changed_files is None
+    if auto_discovery:
         changed_files = get_changed_files(repo_root, base)
     stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
+
+    # An empty diff does not prove the graph matches disk: edits the watcher
+    # applied and a later ``git checkout`` reverted leave HEAD unchanged while
+    # the graph still describes the reverted content. Sweep mtimes (stat-first)
+    # and let any drifted file enter the normal changed-file pipeline below.
+    # Explicit changed_files lists (the watcher's own batches) skip the sweep —
+    # they already know what changed.
+    drifted_files = (
+        _detect_content_drift(repo_root, store)
+        if auto_discovery and not changed_files
+        else []
+    )
+    if drifted_files:
+        changed_files = drifted_files
 
     if not changed_files and not stale_files:
         return {
@@ -1402,6 +1471,7 @@ def incremental_update(
             "changed_files": [],
             "dependent_files": [],
             "stale_files_removed": 0,
+            "content_drift_detected": 0,
             "errors": [],
             **_resolver_results_section(resolver_results),
         }
@@ -1528,6 +1598,7 @@ def incremental_update(
         "changed_files": list(changed_files),
         "dependent_files": list(dependent_files),
         "stale_files_removed": len(stale_files),
+        "content_drift_detected": len(drifted_files),
         "errors": errors,
         **_resolver_results_section(resolver_results),
     }

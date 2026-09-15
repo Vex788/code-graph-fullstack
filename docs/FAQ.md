@@ -227,7 +227,8 @@ generated code), or pass `--repo <path>` to point a command at a specific direct
 across worktrees at different commits — the graph reflects one working tree. If you
 want the database outside the working tree entirely (ephemeral workspaces, network
 shares), use `--data-dir <path>` on `build`/`update`/etc., or set the `CRG_DATA_DIR`
-environment variable.
+environment variable. The `--data-dir` choice is persistent until
+`code-review-graph unregister <repo>`.
 
 **Multiple repos.** A lightweight registry (stored at
 `~/.code-review-graph/registry.json`) lets MCP clients search across projects:
