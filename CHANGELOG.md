@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.1] - 2026-09-16
+
+**Fullstack fork release.** Extends 2.3.8 with a server-rendered web layer:
+JSP/template files become first-class graph citizens bound to their Java
+endpoints and assets, the parser guarantees a File node for every parsed
+file, and a coverage gate makes "the graph is behind the tree" a hard,
+checkable failure instead of a silent wrong answer. Version identity
+carries the `+fs.1` local suffix so MCP clients can distinguish a fork
+runtime from upstream.
+
+### Added
+
+- **Fullstack web layer**: `.jsp`/`.jspf`/`.tag` (and `.html`) files are
+  indexed as File nodes, and a post-build resolver owns the edges between
+  them and the rest of the graph. `RENDERS` binds a jsp to an
+  Endpoint/Class via an explicit bean-binding attribute; `REQUESTS` binds
+  jsp/js `href`/`action`/`url`/ajax/`fetch` targets to Endpoint nodes
+  (Spring request mappings) first, then Java Class nodes by
+  repository-suffix FQN match, then the raw dotted FQN flagged
+  `extra.unresolved = true`; `INCLUDES` links `include` directives jsp to
+  jsp; `REFERENCES` links jsp/html to the File nodes of scripts and
+  stylesheets they load. The resolver runs with framework-level defaults
+  on every build and incremental update, and `[resolvers.jsp]` in
+  `.code-review-graph/config.toml` overrides the framework patterns
+  (`enabled = false` switches it off). It creates no nodes of its own —
+  every discovery starts from existing File/Class/Endpoint nodes, so an
+  older database without jsp File nodes is a clean no-op — and it is
+  idempotent, deleting its own edge kinds first so full rebuilds and
+  incremental updates converge to the same graph.
+- **Coverage gate** (`code-review-graph coverage <repo>` and the MCP
+  `coverage_report_tool`): compares the graph's File nodes against the
+  parseable repository inventory and exits non-zero (CLI) / reports
+  `status: "incomplete"` (MCP) when files are missing from the graph or
+  the graph holds stale files, with a per-language breakdown and the
+  excluded (ignored/binary/no-language/untracked) accounting. A green
+  build is now a checkable claim, not an assumption.
+- **MCP identity version**: the MCP `initialize` handshake reports the
+  package version (`2.3.8+fs.1`), so a client can tell a fork runtime
+  from upstream 2.3.8 before relying on fork-only tools.
+
+### Changed
+
+- **Parser File-node invariant**: every file the parser accepts now
+  yields exactly one File node — including the yaml family (`.yml`/
+  `.yaml`) — so the coverage inventory and the graph agree by
+  construction instead of by luck.
+- **Drift reconciliation**: before parsing, stored files that are absent
+  from the current parseable inventory are removed permanently, and an
+  mtime-gated content sweep re-hashes indexed files newer than the last
+  build's timestamp, catching edits a watcher applied and a later
+  `git checkout` reverted — divergence git diffs cannot see. A full
+  rebuild and an incremental update over the same tree now converge to
+  the same graph.
+- **Data-dir persistence notice**: `--data-dir` registers the external
+  database location per repository and the registration persists until
+  `unregister` — relocating the directory without unregistering leaves
+  tools reading the old path against an empty-looking graph. The
+  `coverage`/`status` inventory reads honour the registered location.
+
 ## [2.3.8] - 2026-08-21
 
 ### Added
