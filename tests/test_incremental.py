@@ -28,6 +28,7 @@ from code_review_graph.incremental import (
     get_db_path,
     get_staged_and_unstaged,
     incremental_update,
+    resolve_incremental_base,
     start_watch_thread,
     watch,
 )
@@ -2027,5 +2028,87 @@ class TestContentDriftReconciliation:
             assert result["files_updated"] == 0
             assert result["content_drift_detected"] == 0
             assert self.RESULT_RESOLUTION_KEYS <= set(result)
+        finally:
+            store.close()
+
+
+class TestAnchorAdvancesOnFullyHashSkippedUpdate:
+    """A fully hash-skipped update must still advance the git anchor.
+
+    A global git pre-commit hook runs ``code-review-graph update`` BEFORE the
+    commit moves HEAD: the graph gets the new file content but stamps the OLD
+    sha as its diff base. The next plain update diffs old-sha..HEAD, finds the
+    changed file, hash-skips it (the content is already current — correct),
+    and with a files_updated-only metadata gate skipped the anchor refresh
+    too, stranding ``git_head_sha`` behind HEAD forever: every later update
+    repeats the same all-skipped pipeline run against the same stale diff.
+    """
+
+    def _git(self, cwd, *args):
+        # ``core.hookspath=`` disables developer-wide git hooks (see
+        # test_integration_git._git): a global pre-commit running
+        # ``code-review-graph update`` would materialize graph state inside
+        # these fixture repos mid-test.
+        subprocess.run(
+            [
+                "git", "-c", "core.hookspath=",
+                "-c", "user.email=t@test", "-c", "user.name=t", *args,
+            ],
+            cwd=str(cwd), check=True, capture_output=True,
+        )
+
+    def _head(self, cwd):
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(cwd), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def test_fully_hash_skipped_update_advances_git_anchor(self, tmp_path):
+        # The graph db lives outside the repo so the post-edit commit can
+        # ``git add .`` without staging database files into the diff.
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "a.py").write_text("def one():\n    return 1\n")
+        self._git(root, "init", "-q")
+        self._git(root, "add", ".")
+        self._git(root, "commit", "-qm", "init")
+        first_head = self._head(root)
+
+        store = GraphStore(tmp_path / "g.db")
+        try:
+            full_build(root, store)
+            assert store.get_metadata("git_head_sha") == first_head
+
+            # The pre-commit hook: the edit reaches the graph before the
+            # commit exists, so the anchor stays at first_head.
+            (root / "a.py").write_text("def two():\n    return 2\n")
+            hook = incremental_update(root, store, changed_files=["a.py"])
+            assert hook["files_updated"] == 1
+            assert store.get_metadata("git_head_sha") == first_head
+
+            self._git(root, "add", ".")
+            self._git(root, "commit", "-qm", "edit a.py")
+            second_head = self._head(root)
+
+            # Plain update through the CLI's auto base: the diff
+            # first_head..HEAD is non-empty but every file in it hash-skips.
+            base = resolve_incremental_base(root, store)
+            assert base == first_head
+            skipped = incremental_update(root, store, base=base)
+            assert skipped["files_updated"] == 0
+            assert skipped["changed_files"] == ["a.py"]
+            # The catch: the anchor must now record HEAD even though nothing
+            # was parsed — the graph equals disk, which is what it anchors.
+            assert store.get_metadata("git_head_sha") == second_head
+
+            # With the anchor current, the next plain update is a clean
+            # no-change run and leaves the anchor where it is.
+            quiet = incremental_update(
+                root, store,
+                base=resolve_incremental_base(root, store),
+            )
+            assert quiet["files_updated"] == 0
+            assert quiet["changed_files"] == []
+            assert store.get_metadata("git_head_sha") == second_head
         finally:
             store.close()

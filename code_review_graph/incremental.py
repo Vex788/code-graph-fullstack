@@ -1565,7 +1565,16 @@ def incremental_update(
 
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
     files_updated = parsed_files + len(stale_files) + removed_files
-    if files_updated:
+    # The VCS anchor must also advance when the update ran the pipeline over
+    # a non-empty discovered change set yet every file was hash-skipped: a
+    # global pre-commit hook that runs ``update`` before its own commit moves
+    # HEAD leaves the graph content already current while the stored base
+    # still names the old commit, and a files_updated-only gate strands the
+    # anchor there forever (every later update hash-skips the same diff). At
+    # that point the graph equals disk, which is exactly what the anchor
+    # records. The empty-discovery early return above keeps skipping this.
+    touched = bool(changed_files or stale_files or missing_paths)
+    if files_updated or touched:
         store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
         store.set_metadata("last_build_type", "incremental")
         store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
