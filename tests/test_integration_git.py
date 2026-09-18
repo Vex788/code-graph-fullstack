@@ -1199,3 +1199,76 @@ def test_branch_switch_web_layer_matches_a_fresh_full_rebuild(
     with GraphStore(fresh_data / "graph.db") as fresh_store:
         assert edges == _edge_snapshot(fresh_store)
         assert pages == _jsp_page_snapshot(fresh_store)
+
+
+# ------------------------------------------------------------------
+# Readiness must track the real state of the graph, in both directions
+# ------------------------------------------------------------------
+
+
+def _readiness(repo: Path) -> dict:
+    from code_review_graph.tools.context import get_minimal_context
+
+    return get_minimal_context(
+        task="readiness probe", changed_files=[], base="HEAD", repo_root=str(repo),
+    )
+
+
+def test_readiness_is_ok_after_a_hash_skipped_update_following_a_commit(
+    tmp_path: Path,
+) -> None:
+    """The pre-commit-hook shape must not strand readiness on ``stale_graph``.
+
+    A global ``pre-commit`` hook runs ``update`` while HEAD is still the old
+    commit, so the graph already holds the new content when HEAD moves. The
+    next update hash-skips every file; if that path skips the anchor write,
+    readiness reports a stale graph forever even though content is current.
+    """
+    repo = _init_repo(tmp_path)
+    build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
+
+    (repo / "a.py").write_text("def alpha():\n    return 2\n")
+    _git_ok(repo, "add", ".")
+    build_or_update_graph(repo_root=str(repo), postprocess="none")  # the hook
+    _git_ok(repo, "commit", "-m", "c1")
+    build_or_update_graph(repo_root=str(repo), postprocess="none")  # hash-skipped
+
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
+        assert store.get_metadata("git_head_sha") == head
+
+    assert _readiness(repo)["status"] == "ok"
+
+
+def test_readiness_still_reports_stale_when_head_moves_without_an_update(
+    tmp_path: Path,
+) -> None:
+    """The paired guard: never buy a green readiness with a false green."""
+    repo = _init_repo(tmp_path)
+    build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
+
+    _commit_file(repo, "beta")  # HEAD moves, nothing tells the graph
+
+    result = _readiness(repo)
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "stale_graph"
+
+
+def test_readiness_reports_not_ready_when_the_graph_has_no_build_anchor(
+    tmp_path: Path,
+) -> None:
+    """A graph that never recorded a commit cannot be declared current.
+
+    Without an anchor there is nothing to compare against HEAD, so answering
+    ``ok`` hands the caller a graph whose relationship to the tree is unknown.
+    """
+    repo = _init_repo(tmp_path)
+    build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
+
+    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
+        store.set_metadata("git_head_sha", "")
+        store.commit()
+
+    result = _readiness(repo)
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "no_build_anchor"

@@ -93,6 +93,12 @@ def get_minimal_context(
                 "The graph was built at a different Git commit. "
                 "Update it before requesting context.",
             )
+        if provenance and provenance.get("missing_build_anchor"):
+            return _not_ready(
+                "no_build_anchor",
+                "The graph never recorded the commit it was built at, so its "
+                "freshness cannot be checked. Rebuild it before requesting context.",
+            )
 
         # 2. Risk from changed files
         risk = "unknown"

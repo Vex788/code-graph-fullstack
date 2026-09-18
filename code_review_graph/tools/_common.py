@@ -117,6 +117,12 @@ def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
                 provenance["head_sha"] = live_head_sha
                 if isinstance(head_sha, str) and head_sha:
                     provenance["head_matches_build"] = live_head_sha == head_sha
+                else:
+                    # A graph in a git repo that never recorded the commit it
+                    # was built at cannot be compared to HEAD at all. Saying
+                    # nothing here reads downstream as "current", which is the
+                    # one answer we know to be unsupported.
+                    provenance["missing_build_anchor"] = True
         return provenance or None
     except Exception:
         return None

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.2] - 2026-09-18
+
+**Freshness fixes.** Two ways the readiness answer could mislead a caller are
+closed. An update whose discovered change set is entirely hash-skipped now
+advances the VCS anchor, so a graph whose content is current stops reporting
+`stale_graph` forever after a pre-commit hook indexed the change before the
+commit moved HEAD. And a graph inside a git repository that never recorded the
+commit it was built at now answers `not_ready: no_build_anchor` instead of
+`ok`: with no anchor there is nothing to compare against HEAD, and claiming
+currency was the one answer known to be unsupported.
+
+
 ## [2.3.8+fs.1] - 2026-09-16
 
 **Fullstack fork release.** Extends 2.3.8 with a server-rendered web layer:
