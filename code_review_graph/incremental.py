@@ -171,11 +171,10 @@ DEFAULT_IGNORE_PATTERNS = [
     "/target/**",
     "/bin/**",
     "/obj/**",
-    # PHP / Laravel / Composer. Deliberately depth-matching: in a PHP monorepo a
-    # Composer vendor/ dir legitimately sits under each package (issue #91). A source
-    # package literally named `vendor` is a per-repository quirk and belongs in that
-    # repository's own ignore configuration, not in a weakened default.
-    "**/vendor/**",
+    # PHP / Laravel / Composer. PMS carries first-party source packages literally
+    # named `vendor` (src/.../out/vendor/order), so the depth-matching Composer
+    # exclude is NOT a default here — repositories that need it add
+    # `**/vendor/**` to their own .code-review-graphignore (see issue #91).
     "/storage/**",
     "/bootstrap/cache/**",
     "/public/build/**",
