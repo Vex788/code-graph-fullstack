@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.3] - 2026-09-18
+
+**Readiness stops trusting the commit alone.** `get_minimal_context` now compares
+the working tree against what the graph actually indexed. A file on disk with no
+node blocks with `not_ready: stale_worktree` — that is the drift that makes a
+query answer "this symbol does not exist". Files that are merely edited stay
+`ok` and carry `stale_files`, because the symbol is still found and a red answer
+there would paint every editing session red. The check reads git's dirty set,
+never the whole tree, and hashing is capped.
+
+**A worktree is pointed at the graph it can use.** A linked worktree with no
+graph of its own now answers `worktree_no_graph` naming its main checkout,
+instead of demanding a build that costs minutes and gigabytes per worktree.
+
+**Cheaper updates.** An update that parsed nothing no longer rebuilds the whole
+FTS index, cutting a no-op `--skip-flows` update on a large repository from 5.3s
+to 3.9s.
+
+
 ## [2.3.8+fs.2] - 2026-09-18
 
 **Freshness fixes.** Two ways the readiness answer could mislead a caller are

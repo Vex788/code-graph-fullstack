@@ -766,6 +766,26 @@ def _decode_name_status_paths(output: bytes) -> list[str]:
     return paths
 
 
+def _store_indexed_dirty_paths(repo_root: Path, store: "GraphStore") -> None:
+    """Record which paths were dirty when the graph was built.
+
+    A freshness check that only looks at the CURRENT dirty set misses one case:
+    a file that was dirty at build time and has since been restored to its HEAD
+    content leaves the dirty set entirely, while the graph still holds the
+    version it was indexed from. Storing the paths (not their hashes -- the
+    authoritative hash is ``nodes.file_hash``, read live) keeps that file under
+    observation. An empty list is written deliberately: a MISSING key means the
+    graph predates this feature, which callers treat differently.
+    """
+    try:
+        dirty = sorted(get_staged_and_unstaged(repo_root))
+    except (OSError, subprocess.SubprocessError):
+        return
+    store.set_metadata(
+        "indexed_dirty_paths", json.dumps(dirty, separators=(",", ":")),
+    )
+
+
 def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> None:
     """Persist VCS branch/revision info into the graph metadata table."""
     vcs = detect_vcs(repo_root)
@@ -775,6 +795,7 @@ def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> None:
             store.set_metadata("git_branch", branch)
         if sha:
             store.set_metadata("git_head_sha", sha)
+        _store_indexed_dirty_paths(repo_root, store)
     elif vcs == "svn":
         branch, rev = _svn_revision_info(repo_root)
         if branch:

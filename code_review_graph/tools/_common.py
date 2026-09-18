@@ -343,3 +343,131 @@ def compact_response(
     if detail_level != "minimal" and data:
         resp["data"] = data
     return resp
+
+
+# Bounds the pathological dirty set (an unignored build directory reaching the
+# check through --untracked-files=all). Missing files are a set difference and
+# stay exact past the cap; only hashing is capped.
+_DRIFT_HASH_CAP = 500
+
+
+def working_tree_drift(
+    root: Path, store: "GraphStore", dirty: list[str] | None = None,
+) -> dict[str, Any]:
+    """Compare the working tree against what the graph actually indexed.
+
+    Commit identity says nothing about uncommitted work: a file written and not
+    yet committed has no node at all, so a graph that is "current" by commit
+    answers "this symbol does not exist". This reads the dirty set instead and
+    classifies it against ``nodes.file_hash``.
+
+    Returns ``missing`` (on disk, never indexed), ``mismatched`` (indexed under
+    different bytes), ``deleted`` (indexed, gone from disk), and a ``check``
+    field: ``full``, ``partial`` (hash cap reached) or ``unavailable`` (the
+    graph predates ``indexed_dirty_paths``, so a restored file could hide).
+    """
+    import hashlib
+    import json as _json
+
+    from ..incremental import (
+        _is_binary,
+        _load_ignore_patterns,
+        _should_ignore,
+        get_staged_and_unstaged,
+    )
+    from ..parser import CodeParser, normalize_file_path
+
+    result: dict[str, Any] = {
+        "missing": [], "mismatched": [], "deleted": [], "check": "full",
+    }
+    try:
+        live = list(dirty) if dirty is not None else get_staged_and_unstaged(root)
+    except (OSError, subprocess.SubprocessError):
+        result["check"] = "unavailable"
+        return result
+
+    indexed_dirty = store.get_metadata("indexed_dirty_paths")
+    if indexed_dirty is None:
+        # No build-time snapshot: a file restored to HEAD content after the
+        # build is invisible here. Say so rather than hashing the whole tree.
+        result["check"] = "unavailable"
+        candidates = set(live)
+    else:
+        try:
+            candidates = set(live) | set(_json.loads(indexed_dirty))
+        except ValueError:
+            result["check"] = "unavailable"
+            candidates = set(live)
+
+    if not candidates:
+        return result
+
+    patterns = _load_ignore_patterns(root)
+    parser = CodeParser()
+    on_disk: dict[str, Path] = {}
+    gone: list[str] = []
+    for relative in sorted(candidates):
+        path = root / relative
+        if _should_ignore(relative, patterns):
+            continue
+        if not path.is_file():
+            gone.append(normalize_file_path(path))
+            continue
+        if _is_binary(path) or parser.detect_language(path) is None:
+            continue
+        on_disk[normalize_file_path(path)] = path
+
+    lookup = sorted(set(on_disk) | set(gone))
+    if not lookup:
+        return result
+    placeholders = ", ".join("?" * len(lookup))
+    indexed = dict(store._conn.execute(
+        f"SELECT file_path, file_hash FROM nodes WHERE kind = 'File' "
+        f"AND file_path IN ({placeholders})",
+        lookup,
+    ).fetchall())
+
+    result["deleted"] = sorted(p for p in gone if p in indexed)
+    hashed = 0
+    for absolute, path in sorted(on_disk.items()):
+        stored = indexed.get(absolute)
+        if stored is None:
+            result["missing"].append(absolute)
+            continue
+        if hashed >= _DRIFT_HASH_CAP:
+            result["check"] = "partial"
+            continue
+        try:
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        hashed += 1
+        if stored and current != stored:
+            result["mismatched"].append(absolute)
+    return result
+
+
+def sibling_graph_root(root: Path) -> Path | None:
+    """The main checkout of a linked worktree, when it owns a graph.
+
+    A short-lived worktree rarely justifies its own index (a PMS-sized build is
+    ~5 minutes and ~1.7 GB), but the main checkout it was branched from usually
+    has one already. That graph is authoritative for every file the branch did
+    not touch, which is most of them.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "rev-parse",
+             "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None
+    main_root = Path(completed.stdout.strip()).parent
+    if main_root == root or not main_root.is_dir():
+        return None
+    from ..incremental import get_db_path
+
+    return main_root if get_db_path(main_root, read_only=True).is_file() else None

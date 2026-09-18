@@ -131,9 +131,21 @@ def _run_postprocess(
     try:
         from code_review_graph.search import rebuild_fts_index
 
-        fts_count = rebuild_fts_index(store)
-        build_result["fts_indexed"] = fts_count
-        build_result["fts_rebuilt"] = True
+        # An update that parsed nothing cannot have changed a node, so the FTS
+        # content is already correct. Rebuilding it anyway re-indexes every row
+        # (62k on a PMS-sized graph) on every git hook firing.
+        nothing_changed = (
+            not full_rebuild
+            and not changed_files
+            and not build_result.get("files_reparsed")
+            and not build_result.get("content_drift_detected")
+        )
+        if nothing_changed:
+            build_result["fts_rebuilt"] = False
+        else:
+            fts_count = rebuild_fts_index(store)
+            build_result["fts_indexed"] = fts_count
+            build_result["fts_rebuilt"] = True
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("FTS index rebuild failed: %s", e)
         warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")

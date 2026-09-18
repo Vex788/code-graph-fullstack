@@ -8,21 +8,43 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from ..incremental import get_db_path
+from ..incremental import get_db_path, get_staged_and_unstaged
 from ..parser import normalize_file_path
-from ._common import _get_store, _resolve_root, compact_response, graph_provenance
+from ._common import (
+    _get_store,
+    _resolve_root,
+    compact_response,
+    graph_provenance,
+    sibling_graph_root,
+    working_tree_drift,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _not_ready(reason: str, summary: str) -> dict[str, Any]:
+def _short(root: Path, absolute: str) -> str:
+    """Repo-relative path for a response; absolute paths bloat a 100-token reply."""
+    try:
+        return str(Path(absolute).relative_to(root))
+    except ValueError:
+        return absolute
+
+
+def _not_ready(
+    reason: str,
+    summary: str,
+    next_tool_suggestions: list[str] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
     """Return a compact response that directs callers to initialize the graph."""
-    return {
+    response: dict[str, Any] = {
         "status": "not_ready",
         "reason": reason,
         "summary": summary,
-        "next_tool_suggestions": ["build_or_update_graph"],
+        "next_tool_suggestions": next_tool_suggestions or ["build_or_update_graph"],
     }
+    response.update(extra)
+    return response
 
 
 def _has_git_changes(root: Path, base: str) -> bool:
@@ -71,6 +93,18 @@ def get_minimal_context(
     root = _resolve_root(repo_root)
     db_path = get_db_path(root, read_only=True)
     if not db_path.is_file():
+        sibling = sibling_graph_root(root)
+        if sibling is not None:
+            return _not_ready(
+                "worktree_no_graph",
+                f"This worktree has no graph, but its main checkout at {sibling} does. "
+                "Query that root: it is authoritative for everything this branch did "
+                "not touch, and silent about symbols the branch adds -- take those "
+                "from the diff, not from an empty graph result.",
+                next_tool_suggestions=["orient", "query_graph", "get_impact_radius"],
+                graph_repo_root=str(sibling),
+                graph_provenance=graph_provenance(str(sibling)),
+            )
         return _not_ready(
             "missing_graph",
             "No graph database found. Build the graph before requesting context.",
@@ -98,6 +132,22 @@ def get_minimal_context(
                 "no_build_anchor",
                 "The graph never recorded the commit it was built at, so its "
                 "freshness cannot be checked. Rebuild it before requesting context.",
+            )
+
+        # Commit identity says nothing about uncommitted work. A file the graph
+        # has never seen is the one drift that makes a query answer "no such
+        # symbol", so it blocks; edited-but-indexed files only warn, because
+        # going red there would paint every active editing session red and send
+        # agents to grep.
+        dirty = get_staged_and_unstaged(root)
+        drift = working_tree_drift(root, store, dirty)
+        if drift["missing"]:
+            return _not_ready(
+                "stale_worktree",
+                f"{len(drift['missing'])} file(s) on disk have no node in the graph; "
+                "update it before asking what exists.",
+                drifted_files=[_short(root, p) for p in drift["missing"][:10]],
+                drifted_file_count=len(drift["missing"]),
             )
 
         # 2. Risk from changed files
@@ -183,7 +233,7 @@ def get_minimal_context(
         if test_gap_count:
             summary_parts.append(f"{test_gap_count} test gaps.")
 
-        return compact_response(
+        response = compact_response(
             summary=" ".join(summary_parts),
             key_entities=top_affected or None,
             risk=risk,
@@ -191,5 +241,14 @@ def get_minimal_context(
             flows_affected=flows or None,
             next_tool_suggestions=suggestions,
         )
+        # The graph still finds these symbols; their bodies and line numbers may
+        # be behind the working tree. A label, not a refusal.
+        edited = drift["mismatched"] + drift["deleted"]
+        if edited:
+            response["stale_files"] = [_short(root, p) for p in edited[:10]]
+            response["stale_file_count"] = len(edited)
+        if drift["check"] != "full":
+            response["content_check"] = drift["check"]
+        return response
     finally:
         store.close()

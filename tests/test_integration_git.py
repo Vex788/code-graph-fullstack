@@ -1272,3 +1272,152 @@ def test_readiness_reports_not_ready_when_the_graph_has_no_build_anchor(
     result = _readiness(repo)
     assert result["status"] == "not_ready"
     assert result["reason"] == "no_build_anchor"
+
+
+# ------------------------------------------------------------------
+# Readiness must see uncommitted work, in both directions
+# ------------------------------------------------------------------
+
+
+def _build(repo: Path) -> None:
+    build_or_update_graph(full_rebuild=True, repo_root=str(repo), postprocess="none")
+
+
+def test_new_uncommitted_file_makes_readiness_not_ready(tmp_path: Path) -> None:
+    """The reported failure: a file the graph never saw must not read as current.
+
+    Commit identity says the graph is at HEAD, so the old check answered ``ok``
+    and an agent querying the new symbol got nothing back — which reads as
+    "this code does not exist" rather than "the graph has not seen it yet".
+    """
+    repo = _init_repo(tmp_path)
+    _build(repo)
+
+    (repo / "orphan.py").write_text("def orphan():\n    return 1\n")
+
+    result = _readiness(repo)
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "stale_worktree"
+    assert "orphan.py" in result["drifted_files"]
+
+
+def test_clean_worktree_stays_ok_and_carries_no_stale_fields(tmp_path: Path) -> None:
+    """Pair: the content check must not invent a red answer on a clean tree."""
+    repo = _init_repo(tmp_path)
+    _build(repo)
+
+    result = _readiness(repo)
+    assert result["status"] == "ok"
+    assert "stale_files" not in result
+    assert "content_check" not in result
+
+
+def test_edited_indexed_file_warns_but_stays_usable(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    _build(repo)
+
+    (repo / "a.py").write_text("def alpha():\n    return 99\n")
+
+    result = _readiness(repo)
+    assert result["status"] == "ok"
+    assert result["stale_files"] == ["a.py"]
+    assert result["stale_file_count"] == 1
+
+
+def test_an_edited_file_never_hides_a_missing_one(tmp_path: Path) -> None:
+    """Pair: the warning path must not swallow the blocking one."""
+    repo = _init_repo(tmp_path)
+    _build(repo)
+
+    (repo / "a.py").write_text("def alpha():\n    return 99\n")
+    (repo / "fresh.py").write_text("def fresh():\n    return 1\n")
+
+    result = _readiness(repo)
+    assert result["status"] == "not_ready"
+    assert "fresh.py" in result["drifted_files"]
+
+
+def test_unparseable_and_ignored_files_do_not_trip_readiness(tmp_path: Path) -> None:
+    """The opposite false red: noise in the dirty set must not block anything."""
+    repo = _init_repo(tmp_path)
+    (repo / ".gitignore").write_text("build/\n")
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-m", "ignore rules")
+    _build(repo)
+
+    (repo / "notes.md").write_text("# not code\n")
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02\x00")
+    (repo / "build").mkdir()
+    (repo / "build" / "generated.py").write_text("def generated():\n    return 1\n")
+
+    assert _readiness(repo)["status"] == "ok"
+
+
+def test_file_restored_after_the_build_is_still_reported(tmp_path: Path) -> None:
+    """Why the build-time dirty list is stored at all.
+
+    A file dirty at build time and later restored to HEAD content vanishes from
+    the live dirty set, while the graph still holds the version it indexed.
+    """
+    repo = _init_repo(tmp_path)
+    (repo / "a.py").write_text("def alpha():\n    return 2\n")
+    _build(repo)
+    _git_ok(repo, "checkout", "--", "a.py")
+
+    result = _readiness(repo)
+    assert result["stale_files"] == ["a.py"]
+
+
+def test_graph_without_the_dirty_snapshot_says_so_instead_of_hashing_everything(
+    tmp_path: Path,
+) -> None:
+    """Pair (hot path): an older graph degrades loudly, it does not scan the tree."""
+    repo = _init_repo(tmp_path)
+    _build(repo)
+    with GraphStore(repo / ".code-review-graph" / "graph.db") as store:
+        store._conn.execute("DELETE FROM metadata WHERE key = 'indexed_dirty_paths'")
+        store.commit()
+
+    result = _readiness(repo)
+    assert result["status"] == "ok"
+    assert result["content_check"] == "unavailable"
+
+
+def test_worktree_without_a_graph_is_pointed_at_the_main_checkout(
+    tmp_path: Path,
+) -> None:
+    """A linked worktree should use the main graph, not be told to build its own.
+
+    Building one costs minutes and gigabytes per worktree; the main checkout's
+    graph already answers every structural question about untouched files.
+    """
+    repo = _init_repo(tmp_path)
+    _build(repo)
+    linked = tmp_path / "linked"
+    _git_ok(repo, "worktree", "add", "-b", "side", str(linked))
+
+    result = _readiness(linked)
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "worktree_no_graph"
+    assert result["graph_repo_root"] == str(repo)
+    assert "build_or_update_graph" not in result["next_tool_suggestions"]
+
+
+def test_plain_repo_without_a_graph_still_says_missing_graph(tmp_path: Path) -> None:
+    """Pair: the fallback must not swallow the honest 'there is no graph here'."""
+    repo = _init_repo(tmp_path)
+
+    result = _readiness(repo)
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "missing_graph"
+
+
+def test_worktree_falls_back_to_missing_graph_when_the_main_has_none(
+    tmp_path: Path,
+) -> None:
+    """Pair: no graph anywhere means build one, not 'go ask the main checkout'."""
+    repo = _init_repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git_ok(repo, "worktree", "add", "-b", "side", str(linked))
+
+    assert _readiness(linked)["reason"] == "missing_graph"
