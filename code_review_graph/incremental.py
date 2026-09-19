@@ -171,10 +171,17 @@ DEFAULT_IGNORE_PATTERNS = [
     "/target/**",
     "/bin/**",
     "/obj/**",
-    # PHP / Laravel / Composer. PMS carries first-party source packages literally
-    # named `vendor` (src/.../out/vendor/order), so the depth-matching Composer
-    # exclude is NOT a default here — repositories that need it add
-    # `**/vendor/**` to their own .code-review-graphignore (see issue #91).
+    # PHP / Laravel / Composer. Deliberately depth-matching: in a PHP monorepo a
+    # Composer vendor/ dir legitimately sits under each package (issue #91).
+    # Applied only to Composer projects -- `_load_ignore_patterns` drops this
+    # pattern when the repository has no `composer.json`, because outside PHP a
+    # directory named `vendor` is ordinary source (a Java `…core.vendor`
+    # package, a `vendor/` of first-party integrations) and silently losing it
+    # makes the graph answer "no such symbol" for code that exists. This
+    # supersedes 6a517f8, which deleted the pattern outright: that also fixed
+    # the Java case but left PHP repositories indexing their whole
+    # dependency tree.
+    "**/vendor/**",
     "/storage/**",
     "/bootstrap/cache/**",
     "/public/build/**",
@@ -374,6 +381,10 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
     inner ``.gitignore`` (with ``*``) is written so any accidentally-nested
     files never get committed. Both are idempotent. Pass ``create=False``
     when resolving the path for a read-only existence check.
+
+    A registry entry pointing at a directory that no longer exists is
+    ignored when the repository still has its own ``.code-review-graph``
+    database, so a swept temp directory cannot silently strand a graph.
     """
     # Check registry first
     try:
@@ -385,10 +396,28 @@ def get_data_dir(repo_root: Path, *, create: bool = True) -> Path:
             registry_data_dir = Registry().get_data_dir_for_repo(str(repo_root))
             if registry_data_dir:
                 data_dir = Path(registry_data_dir).resolve()
-                if create:
-                    data_dir.mkdir(parents=True, exist_ok=True)
-                    _write_data_dir_gitignore(data_dir)
-                return data_dir
+                # A registry entry whose directory has vanished must not be
+                # recreated empty while the repository still holds its own
+                # graph: ``create=True`` would build a second, empty database
+                # there and the real one would report ``missing_graph``
+                # forever. Relocating to a fresh directory stays supported --
+                # the guard only fires when a local graph already exists.
+                local_graph = repo_root / ".code-review-graph" / "graph.db"
+                if create and not data_dir.exists() and local_graph.is_file():
+                    logger.warning(
+                        "Registry maps %s to %s, which does not exist, while %s "
+                        "holds a graph. Ignoring the registry entry; clear it with: "
+                        "code-review-graph unregister %s",
+                        repo_root,
+                        data_dir,
+                        local_graph,
+                        repo_root,
+                    )
+                else:
+                    if create:
+                        data_dir.mkdir(parents=True, exist_ok=True)
+                        _write_data_dir_gitignore(data_dir)
+                    return data_dir
     except Exception as exc:
         # If registry lookup fails, log and fall through to other methods
         logger.debug("Registry lookup failed for %s: %s", repo_root, exc)
@@ -471,8 +500,14 @@ def _load_ignore_patterns(repo_root: Path) -> list[str]:
     A line starting with ``!`` keeps a path out of the automatic nested
     build-output detection (see :data:`NESTED_OUTPUT_DIR_MARKERS`); it does not
     negate the explicit patterns, which keep their existing meaning.
+
+    ``**/vendor/**`` is a Composer default and applies only when the repository
+    has a ``composer.json``. Elsewhere a ``vendor`` directory is ordinary
+    source, and there is no syntax for a repository to take a default back.
     """
     patterns = list(DEFAULT_IGNORE_PATTERNS)
+    if "**/vendor/**" in patterns and not (repo_root / "composer.json").is_file():
+        patterns.remove("**/vendor/**")
     keep: list[str] = []
     ignore_file = repo_root / ".code-review-graphignore"
     if ignore_file.exists():
@@ -500,6 +535,21 @@ def _load_ignore_patterns(repo_root: Path) -> list[str]:
                     patterns.append(line)
     patterns.extend(_nested_output_ignore_patterns(repo_root, patterns, tuple(keep)))
     return patterns
+
+
+_IGNORE_POLICY_METADATA_KEY = "ignore_policy_fingerprint"
+
+
+def ignore_policy_fingerprint(patterns: list[str]) -> str:
+    """Fingerprint the effective ignore policy an index was built under.
+
+    Takes the already-loaded list rather than a repository root, so a caller
+    physically cannot record a policy other than the one it is using -- the
+    seven independent ``_load_ignore_patterns`` call sites would otherwise have
+    to agree by convention. An adapter that rebinds the loader is fingerprinted
+    correctly for free.
+    """
+    return hashlib.sha256("\n".join(sorted(patterns)).encode()).hexdigest()[:16]
 
 
 def _should_ignore(path: str, patterns: list[str]) -> bool:
@@ -1401,6 +1451,10 @@ def full_build(
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
+    store.set_metadata(
+        _IGNORE_POLICY_METADATA_KEY,
+        ignore_policy_fingerprint(_load_ignore_patterns(repo_root)),
+    )
     if not cpp_errors:
         store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
     _store_vcs_metadata(repo_root, store)
@@ -1467,7 +1521,24 @@ def incremental_update(
     auto_discovery = changed_files is None
     if auto_discovery:
         changed_files = get_changed_files(repo_root, base)
-    stale_files = _reconcile_stale_files(repo_root, store) if reconcile_stale else []
+    # A changed ignore policy is invisible to a diff: files it newly admits were
+    # never in the graph and never appear in `git diff`, so without this they
+    # stay missing until a full rebuild. Comparison happens before any inventory
+    # work -- on the common path this costs one metadata read and one sha256.
+    policy = ignore_policy_fingerprint(ignore_patterns)
+    # A missing key means the index predates fingerprinting, which is exactly
+    # the population that needs reconciling; treat it as a mismatch.
+    # ``reconcile_stale=False`` is the watch path: it carries an explicit file
+    # list and must never walk the repository (a batch that inventoried 6000
+    # files on every save would make watching unusable). A policy change is
+    # picked up by the next ordinary update instead.
+    policy_changed = reconcile_stale and (
+        store.get_metadata(_IGNORE_POLICY_METADATA_KEY) != policy
+    )
+    inventory = collect_all_files(repo_root) if policy_changed else None
+    stale_files = (
+        _reconcile_stale_files(repo_root, store, inventory) if reconcile_stale else []
+    )
 
     # An empty diff does not prove the graph matches disk: edits the watcher
     # applied and a later ``git checkout`` reverted leave HEAD unchanged while
@@ -1483,7 +1554,27 @@ def incremental_update(
     if drifted_files:
         changed_files = drifted_files
 
+    if inventory is not None:
+        # Read after the reconcile above so removed rows are already gone.
+        known = {normalize_file_path(path) for path in store.get_all_files()}
+        added = [
+            rel
+            for rel in inventory
+            if normalize_file_path(repo_root / rel) not in known
+        ]
+        if added:
+            logger.info(
+                "Ignore policy changed: %d file(s) newly indexable", len(added)
+            )
+            changed_files = list(dict.fromkeys(list(changed_files or []) + added))
+
     if not changed_files and not stale_files:
+        if policy_changed:
+            # Nothing was added and nothing removed, so the new policy really
+            # did produce no work -- record it, or every later update pays for
+            # the inventory again.
+            store.set_metadata(_IGNORE_POLICY_METADATA_KEY, policy)
+            store.commit()
         return {
             "files_updated": 0,
             "total_nodes": 0,
@@ -1598,6 +1689,8 @@ def incremental_update(
         store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
         store.set_metadata("last_build_type", "incremental")
         store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
+        # Stamped only after the work it describes actually landed.
+        store.set_metadata(_IGNORE_POLICY_METADATA_KEY, policy)
         _store_vcs_metadata(repo_root, store)
         store.commit()
 

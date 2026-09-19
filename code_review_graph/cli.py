@@ -1641,7 +1641,16 @@ def main() -> None:
                 for entry in repos:
                     alias = entry.get("alias", "")
                     alias_str = f"  ({alias})" if alias else ""
-                    print(f"  {entry['path']}{alias_str}")
+                    # A relocated data dir is invisible otherwise, so a graph
+                    # that moved (or whose directory was swept) looks like a
+                    # graph that was never built.
+                    entry_data_dir = entry.get("data_dir")
+                    if entry_data_dir:
+                        missing = "" if Path(entry_data_dir).is_dir() else " [MISSING]"
+                        data_str = f"  -> {entry_data_dir}{missing}"
+                    else:
+                        data_str = ""
+                    print(f"  {entry['path']}{alias_str}{data_str}")
         return
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")

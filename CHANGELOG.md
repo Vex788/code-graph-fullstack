@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.4] - 2026-09-19
+
+**A `vendor` package is only a dependency dump in PHP.** `**/vendor/**` was an
+unconditional default with no way for a repository to take it back: `!` lines in
+`.code-review-graphignore` only exempt a path from nested build-output detection,
+and `_should_ignore` has no concept of negation at all. In a Java codebase whose
+domain package is literally named `vendor`, that silently hid 630 production
+files, and a graph query for any of them answered "no such symbol". The default
+now applies only when the repository has a `composer.json`, which is the case
+the pattern was written for.
+
+**A changed ignore policy no longer needs a full rebuild.** Files a policy newly
+admits were never in the graph, so they never appear in a diff and an
+incremental update could not discover them — an index could carry a current
+stamp while missing hundreds of files (measured: 894 in one worktree). Builds
+now record an `ignore_policy_fingerprint`, and an update whose fingerprint
+differs reconciles against the live inventory. A missing key counts as a
+mismatch, so indexes built before this release repair themselves. On the
+matching path the cost is one metadata read and one sha256; watch batches, which
+carry an explicit file list, never inventory the repository.
+
+**A registry entry pointing at a directory that no longer exists stops
+resurrecting it.** `get_data_dir(create=True)` used to `mkdir` the registered
+path unconditionally, so a temp directory cleared by the OS came back empty and
+every tool reported `missing_graph` while the real database sat in the
+repository. The entry is now ignored when the repository has its own graph, and
+`repos` prints each entry's `data_dir` with a `[MISSING]` marker so a relocated
+graph is visible at all.
+
+
 ## [2.3.8+fs.3] - 2026-09-18
 
 **Readiness stops trusting the commit alone.** `get_minimal_context` now compares

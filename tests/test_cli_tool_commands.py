@@ -144,3 +144,43 @@ def test_tool_command_missing_graph_exits_nonzero(tmp_path, monkeypatch, capsys)
 
     assert exc_info.value.code == 1
     assert "No graph found" in capsys.readouterr().err
+
+
+def test_repos_marks_a_vanished_data_dir(tmp_path, capsys):
+    """A relocated graph is invisible in `repos` unless the target is printed.
+
+    Two production graphs were redirected into /private/tmp by a stale
+    `--data-dir`; one directory was later swept and every tool reported
+    `missing_graph` while `repos` showed nothing unusual.
+    """
+    from code_review_graph.registry import Registry
+
+    repo = tmp_path / "project"
+    (repo / ".git").mkdir(parents=True)
+    gone = tmp_path / "swept"
+    Registry().set_data_dir(str(repo), str(gone))
+
+    with patch.object(sys, "argv", ["code-review-graph", "repos"]):
+        cli.main()
+
+    out = capsys.readouterr().out
+    assert str(gone.resolve()) in out
+    assert "[MISSING]" in out
+
+
+def test_repos_does_not_mark_a_present_data_dir(tmp_path, capsys):
+    """Pair: a healthy relocation must not be flagged."""
+    from code_review_graph.registry import Registry
+
+    repo = tmp_path / "project"
+    (repo / ".git").mkdir(parents=True)
+    present = tmp_path / "graphs"
+    present.mkdir()
+    Registry().set_data_dir(str(repo), str(present))
+
+    with patch.object(sys, "argv", ["code-review-graph", "repos"]):
+        cli.main()
+
+    out = capsys.readouterr().out
+    assert str(present.resolve()) in out
+    assert "[MISSING]" not in out

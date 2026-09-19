@@ -11,6 +11,7 @@ import pytest
 import code_review_graph.incremental as incremental_module
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
+    _IGNORE_POLICY_METADATA_KEY,
     _create_watch_handler,
     _decode_name_status_paths,
     _is_binary,
@@ -27,6 +28,7 @@ from code_review_graph.incremental import (
     get_changed_files,
     get_db_path,
     get_staged_and_unstaged,
+    ignore_policy_fingerprint,
     incremental_update,
     resolve_incremental_base,
     start_watch_thread,
@@ -260,6 +262,24 @@ class TestIgnorePatterns:
         assert "# comment" not in patterns
         assert "" not in patterns
 
+    def test_vendor_default_applies_only_to_composer_projects(self, tmp_path):
+        """A `vendor` package outside PHP is source, not a dependency dump.
+
+        PMS keeps 630 production Java files under `…/core/**/vendor/**`; the
+        Composer default hid every one of them and the repository had no way to
+        take the default back.
+        """
+        patterns = _load_ignore_patterns(tmp_path)
+        assert "**/vendor/**" not in patterns
+        assert not _should_ignore("src/com/x/core/vendor/Order.java", patterns)
+
+    def test_vendor_default_still_applies_with_composer_json(self, tmp_path):
+        """The Composer case it was written for keeps working."""
+        (tmp_path / "composer.json").write_text("{}")
+        patterns = _load_ignore_patterns(tmp_path)
+        assert "**/vendor/**" in patterns
+        assert _should_ignore("packages/app/vendor/autoload.php", patterns)
+
     def test_should_ignore_matches(self):
         patterns = ["node_modules/**", "*.pyc", ".git/**"]
         assert _should_ignore("node_modules/foo/bar.js", patterns)
@@ -461,6 +481,54 @@ class TestDataDirRegistry:
         assert result == external.resolve()
         assert result.is_dir()
         assert not (repo / ".code-review-graph").exists()
+
+    def test_registry_pointing_at_a_vanished_dir_does_not_resurrect_it(
+        self, tmp_path, monkeypatch
+    ):
+        """A swept registry directory must not strand the repository's own graph.
+
+        ``create=True`` used to mkdir the registered path unconditionally, so a
+        temp directory cleared by the OS came back empty and every tool reported
+        ``missing_graph`` while the real database sat in the repository.
+        """
+        from code_review_graph.incremental import get_data_dir
+        from code_review_graph.registry import Registry
+
+        repo = tmp_path / "project"
+        (repo / ".code-review-graph").mkdir(parents=True)
+        (repo / ".code-review-graph" / "graph.db").write_bytes(b"")
+        vanished = tmp_path / "swept"
+
+        monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+        Registry().set_data_dir(str(repo), str(vanished))
+
+        result = get_data_dir(repo)
+
+        assert result == (repo / ".code-review-graph").resolve()
+        assert not vanished.exists()
+
+    def test_registry_data_dir_is_created_when_the_repo_has_no_graph(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard above must not break an ordinary relocation.
+
+        Pointing a graph-less repository at a fresh directory is the documented
+        use of ``--data-dir`` and still creates it.
+        """
+        from code_review_graph.incremental import get_data_dir
+        from code_review_graph.registry import Registry
+
+        repo = tmp_path / "project"
+        repo.mkdir()
+        fresh = tmp_path / "fresh"
+
+        monkeypatch.delenv("CRG_DATA_DIR", raising=False)
+        Registry().set_data_dir(str(repo), str(fresh))
+
+        result = get_data_dir(repo)
+
+        assert result == fresh.resolve()
+        assert result.is_dir()
 
     def test_registry_data_dir_overrides_env_var(self, tmp_path, monkeypatch):
         """Registry data_dir should override CRG_DATA_DIR."""
@@ -1077,6 +1145,16 @@ class TestRacingSaveSnapshotCoherence:
 
         store = GraphStore(tmp_path / "test.db")
         try:
+            # This test counts reads to pin the parse-stage one. Put the graph
+            # in its steady state first: a graph with no ignore-policy
+            # fingerprint takes a one-time repository inventory, whose binary
+            # probe reads files and shifts the count. The race being tested is
+            # the parse-stage read, not the inventory.
+            store.set_metadata(
+                _IGNORE_POLICY_METADATA_KEY,
+                ignore_policy_fingerprint(_load_ignore_patterns(tmp_path)),
+            )
+            store.commit()
             reads = {"count": 0}
             real_read_bytes = Path.read_bytes
 

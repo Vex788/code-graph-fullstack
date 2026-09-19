@@ -1421,3 +1421,47 @@ def test_worktree_falls_back_to_missing_graph_when_the_main_has_none(
     _git_ok(repo, "worktree", "add", "-b", "side", str(linked))
 
     assert _readiness(linked)["reason"] == "missing_graph"
+
+
+def test_policy_change_indexes_vendor_without_a_full_rebuild(tmp_path: Path) -> None:
+    """A real repo whose `vendor/` package stops being ignored gets it back.
+
+    This is the PMS case in miniature: 630 production Java files lived under
+    `…/core/**/vendor/**` and the Composer default hid every one of them. The
+    repair must be an ordinary incremental update, not a 5-minute rebuild.
+    """
+    repo = _init_repo(tmp_path)
+    (repo / "composer.json").write_text("{}")
+    vendor = repo / "pkg" / "vendor"
+    vendor.mkdir(parents=True)
+    (vendor / "supplier.py").write_text("def supplier():\n    return 1\n")
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-m", "vendor")
+
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    try:
+        full_build(repo, store)
+        assert not [f for f in store.get_all_files() if "/vendor/" in f]
+
+        (repo / "composer.json").unlink()
+        _git_ok(repo, "add", "-A")
+        _git_ok(repo, "commit", "-m", "drop composer")
+
+        result = incremental_update(repo, store, changed_files=[])
+
+        assert [f for f in store.get_all_files() if "/vendor/" in f]
+        assert result["files_updated"] > 0
+    finally:
+        store.close()
+
+
+def test_clean_repo_update_stays_a_no_op(tmp_path: Path) -> None:
+    """Pair for the test above: the fingerprint must not make every update work."""
+    repo = _init_repo(tmp_path)
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    try:
+        full_build(repo, store)
+        result = incremental_update(repo, store, changed_files=[])
+        assert result["files_updated"] == 0
+    finally:
+        store.close()
