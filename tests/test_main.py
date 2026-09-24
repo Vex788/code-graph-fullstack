@@ -62,6 +62,46 @@ class TestResolveRepoRoot:
         crg_main._default_repo_root = None
         assert crg_main._resolve_repo_root("/explicit") == "/explicit"
 
+    def test_slash_treated_as_unset(self):
+        crg_main._default_repo_root = "/tmp/flag-repo"
+        assert crg_main._resolve_repo_root("/") == "/tmp/flag-repo"
+
+    def test_whitespace_treated_as_unset(self):
+        crg_main._default_repo_root = "/tmp/flag-repo"
+        assert crg_main._resolve_repo_root("  \t") == "/tmp/flag-repo"
+
+
+def test_serve_ignores_non_project_cwd_as_default_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(crg_main, "_default_repo_root", "sentinel")
+    monkeypatch.setattr(crg_main, "find_project_root", lambda: tmp_path)
+    monkeypatch.setattr(crg_main.mcp, "run", lambda **kwargs: None)
+
+    crg_main.main(repo_root=None)
+    assert crg_main._default_repo_root is None
+
+    (tmp_path / ".git").mkdir()
+    crg_main.main(repo_root=None)
+    assert crg_main._default_repo_root == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_build_tool_passes_status_only(monkeypatch):
+    calls = []
+
+    def fake_build(**kwargs):
+        calls.append(kwargs)
+        return {"status": "idle"}
+
+    monkeypatch.setattr(crg_main, "build_or_update_graph", fake_build)
+    monkeypatch.setattr(crg_main, "with_provenance", lambda result, root=None: result)
+    tool = getattr(crg_main.build_or_update_graph_tool, "fn", None)
+    underlying = tool or crg_main.build_or_update_graph_tool
+
+    result = await underlying(status_only=True)
+
+    assert result == {"status": "idle"}
+    assert calls[0]["status_only"] is True
+
 
 def test_docs_wrapper_falls_back_to_packaged_docs_with_resolved_repo(
     tmp_path, monkeypatch,
@@ -161,6 +201,7 @@ class TestLongRunningToolsAreAsync:
         "embed_graph_tool",
         "detect_changes_tool",
         "generate_wiki_tool",
+        "batch_query_tool",
     }
 
     HEAVY_TOOL_IMPLS = {
@@ -169,7 +210,11 @@ class TestLongRunningToolsAreAsync:
         "embed_graph_tool": "embed_graph",
         "detect_changes_tool": "detect_changes_func",
         "generate_wiki_tool": "generate_wiki_func",
+        "batch_query_tool": "batch_query",
     }
+
+    # Required arguments for tools that have any.
+    HEAVY_TOOL_ARGS = {"batch_query_tool": {"queries": []}}
 
     def test_heavy_tools_are_coroutines(self):
         """Regression guard for #46/#136: the 5 long-running MCP tools must
@@ -245,7 +290,7 @@ class TestLongRunningToolsAreAsync:
         )
         tool = getattr(crg_main, tool_name)
         underlying = getattr(tool, "fn", None) or tool
-        result = await underlying()
+        result = await underlying(**self.HEAVY_TOOL_ARGS.get(tool_name, {}))
 
         assert result["impl"] == impl_name
         assert result["_graph"]["updated_at"] == "worker"
@@ -354,7 +399,7 @@ class TestGraphBackedToolProvenanceCoverage:
             "get_minimal_context_tool", "get_impact_radius_tool",
             "query_graph_tool", "get_review_context_tool",
             "semantic_search_nodes_tool", "find_large_functions_tool",
-            "traverse_graph_tool",
+            "traverse_graph_tool", "batch_query_tool",
         },
         "embeddings_and_stats": {"embed_graph_tool", "list_graph_stats_tool"},
         "flows_and_communities": {

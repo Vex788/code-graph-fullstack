@@ -47,6 +47,31 @@ def _not_ready(
     return response
 
 
+def missing_graph_response(root: Path) -> dict[str, Any] | None:
+    """``not_ready`` when *root* has no graph database, else None.
+
+    Checked read-only so a query against a cold root never creates an empty DB.
+    """
+    if get_db_path(root, read_only=True).is_file():
+        return None
+    sibling = sibling_graph_root(root)
+    if sibling is not None:
+        return _not_ready(
+            "worktree_no_graph",
+            f"This worktree has no graph, but its main checkout at {sibling} does. "
+            "Query that root: it is authoritative for everything this branch did "
+            "not touch, and silent about symbols the branch adds -- take those "
+            "from the diff, not from an empty graph result.",
+            next_tool_suggestions=["orient", "query_graph", "get_impact_radius"],
+            graph_repo_root=str(sibling),
+            graph_provenance=graph_provenance(str(sibling)),
+        )
+    return _not_ready(
+        "missing_graph",
+        "No graph database found. Build the graph before requesting context.",
+    )
+
+
 def _has_git_changes(root: Path, base: str) -> bool:
     """Quick check for uncommitted or diffed changes."""
     try:
@@ -91,24 +116,9 @@ def get_minimal_context(
         missing, empty, or known to have been built at a different Git commit.
     """
     root = _resolve_root(repo_root)
-    db_path = get_db_path(root, read_only=True)
-    if not db_path.is_file():
-        sibling = sibling_graph_root(root)
-        if sibling is not None:
-            return _not_ready(
-                "worktree_no_graph",
-                f"This worktree has no graph, but its main checkout at {sibling} does. "
-                "Query that root: it is authoritative for everything this branch did "
-                "not touch, and silent about symbols the branch adds -- take those "
-                "from the diff, not from an empty graph result.",
-                next_tool_suggestions=["orient", "query_graph", "get_impact_radius"],
-                graph_repo_root=str(sibling),
-                graph_provenance=graph_provenance(str(sibling)),
-            )
-        return _not_ready(
-            "missing_graph",
-            "No graph database found. Build the graph before requesting context.",
-        )
+    missing = missing_graph_response(root)
+    if missing is not None:
+        return missing
 
     store, root = _get_store(str(root))
     try:

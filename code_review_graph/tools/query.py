@@ -13,14 +13,21 @@ from ..embeddings import EmbeddingStore
 from ..graph import GraphNode, GraphStore, _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
-from ..parser import normalize_file_path
+from ..parser import _is_test_file, normalize_file_path
 from ..search import hybrid_search
 from ..uncertainty import (
     empty_impact_confidence,
     empty_query_confidence,
     empty_search_confidence,
 )
-from ._common import _BUILTIN_CALL_NAMES, _get_store, _resolve_graph_file_paths
+from ._common import (
+    _BUILTIN_CALL_NAMES,
+    _get_store,
+    _resolve_graph_file_paths,
+    _resolve_root,
+)
+from .context import missing_graph_response
+from .navigation import _short
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +114,112 @@ def _rank_disambiguation_candidates(
         return rank, node.qualified_name
 
     return [node_to_dict(node) for node in sorted(candidates, key=score)]
+
+
+_MERGE_PATTERNS = ("callers_of", "callees_of", "tests_for")
+_MERGE_MAX_CANDIDATES = 5
+
+
+def _overload_label(node: GraphNode) -> str:
+    """``name(params)`` from a C++ overload's qualified name."""
+    tail = node.qualified_name.rsplit("::", 1)[-1]
+    start = tail.find(f"{node.name}(")
+    return _sanitize_name(tail[start:] if start >= 0 else tail)
+
+
+def _merge_candidates(
+    pattern: str,
+    target: str,
+    candidates: list[GraphNode],
+    ranked: list[dict[str, Any]],
+    detail_level: str,
+    max_results: int,
+    response_limit: int,
+    store_root: tuple[GraphStore, Path],
+) -> dict[str, Any]:
+    """Answer for every same-named candidate instead of returning ``ambiguous``.
+
+    Distinct owners (file, parent) give ``per_candidate``; several candidates in
+    one owner are a C++ overload set whose callers may be recorded only as
+    ambiguous bare-name edges, so those are added for ``callers_of``.
+    """
+    owners = {(c.file_path, c.parent_name) for c in candidates}
+    overload_set = len(owners) < len(candidates)
+    groups: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(result: dict[str, Any], via: str) -> None:
+        key = result.get("qualified_name") or repr(sorted(result.items()))
+        if key in seen:
+            return
+        seen.add(key)
+        results.append({**result, "via": via})
+
+    for candidate in candidates:
+        sub = query_graph(
+            pattern, candidate.qualified_name, detail_level="standard",
+            max_results=max_results, _store=store_root,
+        )
+        groups.append({
+            "name": _sanitize_name(candidate.name),
+            "qualified_name": _sanitize_name(candidate.qualified_name),
+            "parent_name": _sanitize_name(candidate.parent_name)
+            if candidate.parent_name else candidate.parent_name,
+            "line_start": candidate.line_start,
+            "result_count": sub.get("result_count", 0),
+        })
+        via = (
+            _overload_label(candidate) if overload_set
+            else _sanitize_name(candidate.qualified_name)
+        )
+        for result in sub.get("results", []):
+            add(result, via)
+        edges.extend(sub.get("edges", []))
+
+    if overload_set and pattern == "callers_of":
+        store = store_root[0]
+        overload_qns = {c.qualified_name for c in candidates}
+        first = candidates[0]
+        for edge in store.iter_edges_by_target_name(
+            first.name, language=first.language or None,
+        ):
+            ambiguous = edge.extra.get("ambiguous_targets")
+            if not isinstance(ambiguous, list) or not set(ambiguous) <= overload_qns:
+                continue
+            caller = store.get_node(edge.source_qualified)
+            if caller:
+                add(node_to_dict(caller), "ambiguous_overload")
+                edges.append(edge_to_dict(edge))
+
+    total = len(results)
+    visible = results[:response_limit]
+    if detail_level == "minimal":
+        visible = [
+            {k: r[k] for k in ("name", "kind", "file_path", "indirect", "via") if k in r}
+            for r in visible
+        ]
+    resolution = "overload_set" if overload_set else "per_candidate"
+    response: dict[str, Any] = {
+        "status": "ok",
+        "pattern": pattern,
+        "target": target,
+        "description": _QUERY_PATTERNS[pattern],
+        "summary": (
+            f"'{target}' matches {len(candidates)} same-named node(s); "
+            f"{resolution}: {total} result(s) across all of them."
+        ),
+        "resolution": resolution,
+        "groups": groups,
+        "candidates": ranked,
+        "result_count": total,
+        "results_omitted": total - len(visible),
+        "results": visible,
+    }
+    if detail_level != "minimal":
+        response["edges"] = edges
+    return response
 
 
 def get_impact_radius(
@@ -252,6 +365,7 @@ def query_graph(
     repo_root: str | None = None,
     detail_level: str = "standard",
     max_results: int = 100,
+    _store: tuple[GraphStore, Path] | None = None,
 ) -> dict[str, Any]:
     """Run a predefined graph query.
 
@@ -265,6 +379,8 @@ def query_graph(
         detail_level: "standard" (full output) or "minimal" (summary only).
         max_results: Maximum results to return. Minimal mode additionally caps
             visible results at five and reports the exact omitted count.
+        _store: An open ``(store, root)`` owned by the caller (``batch_query``);
+            it is neither readiness-checked nor closed here.
 
     Returns:
         Matching nodes and their aligned edges, with total and omitted counts.
@@ -272,17 +388,27 @@ def query_graph(
     if isinstance(max_results, bool) or max_results < 1:
         raise ValueError("max_results must be an integer greater than or equal to 1")
 
-    store, root = _get_store(repo_root)
-    try:
-        if pattern not in _QUERY_PATTERNS:
-            return {
-                "status": "error",
-                "error": (
-                    f"Unknown pattern '{pattern}'. "
-                    f"Available: {list(_QUERY_PATTERNS.keys())}"
-                ),
-            }
+    if pattern not in _QUERY_PATTERNS:
+        if target in _QUERY_PATTERNS:
+            swapped = query_graph(
+                target, pattern, repo_root, detail_level, max_results, _store,
+            )
+            swapped["argument_swap"] = True
+            return swapped
+        return {
+            "status": "error",
+            "error": (
+                f"Unknown pattern '{pattern}'. "
+                f"Available: {list(_QUERY_PATTERNS.keys())}"
+            ),
+        }
 
+    if _store is None:
+        missing = missing_graph_response(_resolve_root(repo_root))
+        if missing is not None:
+            return missing
+    store, root = _store or _get_store(repo_root)
+    try:
         response_limit = min(max_results, 5) if detail_level == "minimal" else max_results
         results: list[dict[str, Any]] = []
         edges_out: list[dict[str, Any]] = []
@@ -354,6 +480,19 @@ def query_graph(
                         else store.count_search_nodes(target)
                     )
                     ranked = _rank_disambiguation_candidates(candidates, target)
+                    bare_name = (
+                        target.rsplit(".", 1)[-1] if java_candidates is not None else target
+                    )
+                    if (
+                        pattern in _MERGE_PATTERNS
+                        and len(candidates) <= _MERGE_MAX_CANDIDATES
+                        and candidate_count <= len(candidates)
+                        and all(c.name == bare_name for c in candidates)
+                    ):
+                        return _merge_candidates(
+                            pattern, target, candidates, ranked, detail_level,
+                            max_results, response_limit, (store, root),
+                        )
                     return {
                         "status": "ambiguous",
                         "summary": (
@@ -731,7 +870,173 @@ def query_graph(
             response["confidence"] = confidence
         return response
     finally:
+        if _store is None:
+            store.close()
+
+
+# ---------------------------------------------------------------------------
+# batch_query: many query_graph calls over one open store
+# ---------------------------------------------------------------------------
+
+_BATCH_MAX_QUERIES = 25
+_BATCH_MAX_CANDIDATES = 8
+_BATCH_ITEM_RESULTS = 500
+
+
+def _compact_label(result: dict[str, Any], root: Path) -> str:
+    """``Parent.name:line``; the short qualified name when there is no parent."""
+    name = result.get("name")
+    parent = result.get("parent_name")
+    if parent and name:
+        label = f"{parent}.{name}"
+    else:
+        qn = (
+            result.get("qualified_name") or result.get("importer")
+            or result.get("import_target") or name or ""
+        )
+        label = _short(str(qn), root)
+    line = result.get("line_start")
+    return f"{label}:{line}" if line else label
+
+
+def _compact_item(
+    pattern: str,
+    target: str,
+    result: dict[str, Any],
+    store: GraphStore,
+    root: Path,
+    limit: int,
+) -> dict[str, Any]:
+    """Shrink one query_graph response to the fields an agent acts on."""
+    item: dict[str, Any] = {
+        "pattern": result.get("pattern", pattern),
+        "target": target,
+        "status": result.get("status", "error"),
+    }
+    if result.get("argument_swap"):
+        item["argument_swap"] = True
+    if item["status"] == "ambiguous":
+        item["candidate_count"] = result.get("candidate_count")
+        item["candidates"] = [
+            _compact_label(c, root)
+            for c in result.get("candidates", [])[:_BATCH_MAX_CANDIDATES]
+        ]
+        return item
+    if item["status"] != "ok":
+        item["summary"] = result.get("summary") or result.get("error")
+        return item
+
+    results = result.get("results", [])
+    if "resolution" in result:
+        item["resolution"] = result["resolution"]
+        item["groups"] = [
+            {"resolved": _compact_label(g, root), "result_count": g["result_count"]}
+            for g in result["groups"]
+        ]
+        self_qns = {g["qualified_name"] for g in result["groups"]}
+    else:
+        resolved = result.get("target", target)
+        node = store.get_node(resolved) or store.get_node(
+            normalize_file_path(root / resolved),
+        )
+        self_qns = {_sanitize_name(node.qualified_name)} if node else set()
+        if node:
+            item["resolved"] = _compact_label(node_to_dict(node), root)
+    if result.get("results_omitted"):
+        item["truncated"] = True
+
+    if item["pattern"] == "tests_for":
+        item["tests"] = result.get("result_count", len(results))
+        item["test_names"] = [_compact_label(r, root) for r in results[:limit]]
+        return item
+
+    def is_test(r: dict[str, Any]) -> bool:
+        # helpers in test files (stubs, fixtures) carry is_test=False
+        path = str(r.get("file_path") or "")
+        try:
+            path = Path(path).relative_to(root).as_posix()
+        except ValueError:
+            pass
+        return bool(r.get("is_test")) or _is_test_file(path)
+
+    tests = [r for r in results if is_test(r)]
+    prod = [
+        r for r in results
+        if not is_test(r) and r.get("qualified_name") not in self_qns
+    ]
+    item["prod"] = [_compact_label(r, root) for r in prod[:limit]]
+    item["prod_count"] = len(prod)
+    item["tests"] = len(tests)
+    item["self_call"] = any(r.get("qualified_name") in self_qns for r in results)
+    return item
+
+
+def batch_query(
+    queries: list[dict[str, Any]],
+    repo_root: str | None = None,
+    max_results_per_query: int = 10,
+) -> dict[str, Any]:
+    """Run several ``query_graph`` lookups over one open graph store.
+
+    Duplicate ``(pattern, target)`` pairs run once; beyond
+    ``_BATCH_MAX_QUERIES`` the rest are counted in ``queries_dropped``. Each
+    item carries its own status, so one bad item never fails the batch.
+    """
+    if isinstance(max_results_per_query, bool) or max_results_per_query < 1:
+        raise ValueError("max_results_per_query must be an integer >= 1")
+
+    missing = missing_graph_response(_resolve_root(repo_root))
+    if missing is not None:
+        return missing
+
+    unique: list[tuple[Any, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for spec in queries:
+        pattern = spec.get("pattern") if isinstance(spec, dict) else None
+        target = spec.get("target") if isinstance(spec, dict) else None
+        key = (repr(pattern), repr(target))
+        if key not in seen:
+            seen.add(key)
+            unique.append((pattern, target))
+    queries_dropped = max(0, len(unique) - _BATCH_MAX_QUERIES)
+
+    items: list[dict[str, Any]] = []
+    store, root = _get_store(repo_root)
+    try:
+        for pattern, target in unique[:_BATCH_MAX_QUERIES]:
+            if not isinstance(pattern, str) or not isinstance(target, str):
+                items.append({
+                    "pattern": pattern, "target": target, "status": "error",
+                    "summary": "Each query needs string 'pattern' and 'target'.",
+                })
+                continue
+            try:
+                result = query_graph(
+                    pattern, target, max_results=_BATCH_ITEM_RESULTS,
+                    _store=(store, root),
+                )
+            except ValueError as exc:
+                result = {"status": "error", "error": str(exc)}
+            items.append(
+                _compact_item(pattern, target, result, store, root, max_results_per_query),
+            )
+    finally:
         store.close()
+
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    summary = f"{len(items)} queries: " + ", ".join(
+        f"{n} {status}" for status, n in counts.items()
+    )
+    if queries_dropped:
+        summary += f"; {queries_dropped} dropped over the {_BATCH_MAX_QUERIES} cap"
+    return {
+        "status": "ok",
+        "summary": summary,
+        "queries_dropped": queries_dropped,
+        "results": items,
+    }
 
 
 # ---------------------------------------------------------------------------

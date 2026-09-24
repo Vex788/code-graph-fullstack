@@ -482,6 +482,7 @@ def build_or_update_graph(
     recurse_submodules: bool | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    status_only: bool = False,
 ) -> dict[str, Any]:
     """Build or incrementally update the code knowledge graph.
 
@@ -508,10 +509,14 @@ def build_or_update_graph(
             source-derived text or load an embedding model unexpectedly.
         embedding_model: Exact model for an explicitly requested post-build
             embedding refresh. Must be supplied with ``embedding_provider``.
+        status_only: Report the background job instead of building. Builds
+            here run in the caller, so there is never a job to report.
 
     Returns:
         Summary with files_parsed/updated, node/edge counts, and errors.
     """
+    if status_only:
+        return {"status": "idle", "summary": "no background job tracking for this root"}
     store, root = _get_store(repo_root)
     try:
         if not full_rebuild and not store.has_nodes():

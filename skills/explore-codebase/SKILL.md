@@ -23,7 +23,7 @@ Use the code-review-graph MCP tools to explore and understand the codebase.
 - Use `find_large_functions_tool` to identify complex code.
 
 ## Token Efficiency Rules
-- Start with `get_minimal_context_tool(task="<your task>")` before other graph tools.
+- Batch several lookups with `batch_query_tool`; check `_graph` in the first response and call `get_minimal_context_tool` only when it is missing or not ready.
 - Use `detail_level="minimal"` on all calls. Only escalate to "standard" when minimal is insufficient.
 - Target: complete any review/debug/refactor task in ≤5 tool calls and ≤800 total output tokens.
 - Read the implementation and its tests before changing code. The graph narrows scope; it does not replace the source.

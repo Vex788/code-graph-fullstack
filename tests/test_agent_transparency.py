@@ -248,15 +248,21 @@ class TestSymbolDisambiguation:
 
         result = query_graph("callers_of", "process", str(root))
 
-        assert result["status"] == "ambiguous"
-        assert result["candidates"] == result["disambiguation"]
-        assert len(result["disambiguation"]) == 2
-        assert "qualified_name" in result["hint"]
+        # Same-named functions in distinct files are answered per candidate.
+        assert result["status"] == "ok"
+        assert result["resolution"] == "per_candidate"
+        assert len(result["candidates"]) == 2
         assert all(
             {"qualified_name", "name", "kind", "file_path", "line_start"}
             <= candidate.keys()
-            for candidate in result["disambiguation"]
+            for candidate in result["candidates"]
         )
+
+        # A fuzzy candidate set still returns the ranked disambiguation.
+        ambiguous = query_graph("callers_of", "proc", str(root))
+        assert ambiguous["status"] == "ambiguous"
+        assert ambiguous["candidates"] == ambiguous["disambiguation"]
+        assert "qualified_name" in ambiguous["hint"]
 
     def test_java_fqn_requires_matching_language_and_class(self, tmp_path):
         root, store = _make_repo(tmp_path)
@@ -331,7 +337,7 @@ class TestSymbolDisambiguation:
         )
         assert result["status"] == "not_found"
 
-    def test_duplicate_java_class_method_stays_ambiguous(self, tmp_path):
+    def test_duplicate_java_class_method_merges_per_candidate(self, tmp_path):
         root, store = _make_repo(tmp_path)
         try:
             for directory in ("v1", "v2"):
@@ -353,8 +359,9 @@ class TestSymbolDisambiguation:
             "com.example.OrderHandler.process",
             str(root),
         )
-        assert result["status"] == "ambiguous"
-        assert len(result["disambiguation"]) == 2
+        assert result["status"] == "ok"
+        assert result["resolution"] == "per_candidate"
+        assert len(result["groups"]) == 2
 
     def test_file_summary_path_does_not_enter_symbol_resolution(self, tmp_path):
         root, store = _make_repo(tmp_path)

@@ -283,6 +283,22 @@ BUDGETS: dict[str, dict[str, Any]] = {
         # own value, so a whole-file summary is the realistic worst case.
         "worst_max": 40_000,
     },
+    "batch_query_tool": {
+        "default": {"queries": [
+            {"pattern": "callers_of", "target": "helper_0_0_0"},
+            {"pattern": "tests_for", "target": "helper_0_0_0"},
+        ]},
+        # 40 queries exercise the 25-item cap; per-item output is compact.
+        "worst": {
+            "queries": [
+                {"pattern": "callers_of", "target": f"helper_0_0_{i}"}
+                for i in range(40)
+            ],
+            "max_results_per_query": HUGE,
+        },
+        "default_max": 2_000,
+        "worst_max": 40_000,
+    },
     "get_review_context_tool": {
         "default": {"changed_files": "LEAF"},
         "worst": {
