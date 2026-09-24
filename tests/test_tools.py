@@ -758,7 +758,7 @@ class TestQueryGraphTestsFor:
         )
         assert minimal["results"][0]["indirect"] is True
 
-    def test_query_graph_tests_for_keeps_ambiguous_target_explicit(self):
+    def test_query_graph_tests_for_merges_same_named_candidates(self):
         from code_review_graph.tools import query_graph
 
         result = query_graph(
@@ -767,8 +767,12 @@ class TestQueryGraphTestsFor:
             repo_root=str(self.repo_root),
         )
 
-        assert result["status"] == "ambiguous"
+        assert result["status"] == "ok"
+        assert result["resolution"] == "per_candidate"
         assert len(result["candidates"]) == 2
+        assert {g["qualified_name"] for g in result["groups"]} == {
+            "/src/first.py::shared_name", "/src/second.py::shared_name",
+        }
 
 
 class TestGetDocsSection:
@@ -2479,3 +2483,103 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
     ]
     scores = [node["impact_score"] for node in result["impacted_nodes"]]
     assert scores == sorted(scores, reverse=True)
+
+
+def _query_repo(tmp_path):
+    """A repo whose graph holds one caller of ``target``."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    (root / ".code-review-graph").mkdir()
+    store = GraphStore(root / ".code-review-graph" / "graph.db")
+    try:
+        for name in ("target", "caller"):
+            store.upsert_node(NodeInfo(
+                kind="Function", name=name, file_path=str(root / "m.py"),
+                line_start=1, line_end=2, language="python",
+            ))
+        store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f"{root / 'm.py'}::caller",
+            target=f"{root / 'm.py'}::target", file_path=str(root / "m.py"), line=1,
+        ))
+        store.commit()
+    finally:
+        store.close()
+    return root
+
+
+def test_query_graph_swaps_pattern_and_target(tmp_path):
+    root = _query_repo(tmp_path)
+
+    result = query_graph(pattern="target", target="callers_of", repo_root=str(root))
+
+    assert result["status"] == "ok"
+    assert result["argument_swap"] is True
+    assert result["pattern"] == "callers_of"
+    assert [r["name"] for r in result["results"]] == ["caller"]
+
+
+def test_unknown_pattern_without_swap_stays_error(tmp_path):
+    root = _query_repo(tmp_path)
+
+    result = query_graph(pattern="who_calls", target="target", repo_root=str(root))
+
+    assert result["status"] == "error"
+    assert "Unknown pattern 'who_calls'" in result["error"]
+    assert "argument_swap" not in result
+
+
+def test_query_graph_missing_graph_returns_not_ready_without_creating_database(tmp_path):
+    repo = tmp_path / "cold-worktree"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
+
+    result = query_graph(pattern="callers_of", target="target", repo_root=str(repo))
+
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "missing_graph"
+    assert not (repo / ".code-review-graph").exists()
+
+
+def test_query_graph_in_worktree_names_main_checkout_graph(tmp_path):
+    import subprocess
+
+    main_root = _query_repo(tmp_path)
+    (main_root / ".git").rmdir()
+
+    def git(*args):
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=main_root, check=True, capture_output=True,
+        )
+
+    git("init", "-q")
+    (main_root / "m.py").write_text("def target(): pass\n")
+    git("add", "m.py")
+    git("commit", "-q", "-m", "init")
+    linked = tmp_path / "linked"
+    git("worktree", "add", "-q", "-b", "side", str(linked))
+
+    result = query_graph(pattern="callers_of", target="target", repo_root=str(linked))
+
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "worktree_no_graph"
+    assert Path(result["graph_repo_root"]).resolve() == main_root.resolve()
+    assert not (linked / ".code-review-graph").exists()
+
+
+def test_build_status_only_returns_idle_without_building(tmp_path, monkeypatch):
+    import code_review_graph.tools.build as build_module
+
+    def must_not_open(*args, **kwargs):
+        raise AssertionError("status_only must not open the graph")
+
+    monkeypatch.setattr(build_module, "_get_store", must_not_open)
+
+    result = build_module.build_or_update_graph(
+        repo_root=str(tmp_path), status_only=True,
+    )
+
+    assert result == {
+        "status": "idle", "summary": "no background job tracking for this root",
+    }
+    assert not (tmp_path / ".code-review-graph").exists()

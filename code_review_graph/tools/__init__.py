@@ -85,6 +85,7 @@ from .flows_tools import get_flow, list_flows
 
 # -- query ------------------------------------------------------------------
 from .query import (
+    batch_query,
     find_large_functions,
     get_impact_radius,
     list_graph_stats,
@@ -133,6 +134,7 @@ __all__ = [
     "get_flow",
     "list_flows",
     # query
+    "batch_query",
     "find_large_functions",
     "get_impact_radius",
     "list_graph_stats",

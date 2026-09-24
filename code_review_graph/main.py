@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
+from typing_extensions import TypedDict  # pydantic rejects typing.TypedDict below 3.12
 
 from . import incremental as _incremental
 from .cli import _get_version
@@ -32,6 +33,7 @@ from .prompts import (
 )
 from .tools import (
     apply_refactor_func,
+    batch_query,
     build_or_update_graph,
     coverage_report,
     cross_repo_search_func,
@@ -85,8 +87,13 @@ def _resolve_repo_root(repo_root: Optional[str]) -> Optional[str]:
     All MCP tools that accept ``repo_root`` should use this helper so
     ``serve --repo <X>`` applies consistently, including
     ``get_docs_section_tool``. See: #222.
+
+    None, empty, whitespace and ``"/"`` count as unset: clients send them
+    when they mean "the default repository".
     """
-    return repo_root if repo_root else _default_repo_root
+    if repo_root is None or repo_root.strip() in ("", "/"):
+        return _default_repo_root
+    return repo_root
 
 
 mcp = FastMCP(
@@ -112,6 +119,7 @@ async def build_or_update_graph_tool(
     recurse_submodules: Optional[bool] = None,
     embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    status_only: bool = False,
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -141,6 +149,8 @@ async def build_or_update_graph_tool(
             refresh. Must be supplied with embedding_model. Default: disabled.
         embedding_model: Exact model for an explicit post-build embedding
             refresh. Must be supplied with embedding_provider. Default: disabled.
+        status_only: If True, report the background build job for this root
+            without building. Default: False.
     """
     root = _resolve_repo_root(repo_root)
 
@@ -150,6 +160,7 @@ async def build_or_update_graph_tool(
             postprocess=postprocess, recurse_submodules=recurse_submodules,
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
+            status_only=status_only,
         ), root)
 
     return await asyncio.to_thread(_run)
@@ -231,11 +242,12 @@ def get_minimal_context_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
 ) -> dict:
-    """Get ultra-compact context for any task (~100 tokens). Always call this first.
+    """Get ultra-compact context for any task (~100 tokens).
 
+    Diagnostic readiness and risk context. Call it when a response's
+    `_graph` is missing or not ready, or when you need risk/community context.
     Returns graph stats, risk score, top communities/flows, and suggested
-    next tools in a single compact response. Use this as the entry point
-    before any other graph tool to minimize token usage. Returns
+    next tools in a single compact response. Returns
     ``status: not_ready`` with a build suggestion when the graph is missing,
     empty, or known to have been built at a different Git commit.
 
@@ -319,6 +331,47 @@ def query_graph_tool(
         pattern=pattern, target=target, repo_root=root,
         detail_level=detail_level, max_results=max_results,
     ), root)
+
+
+class QuerySpec(TypedDict):
+    """One ``query_graph`` lookup inside ``batch_query_tool``."""
+
+    pattern: str
+    target: str
+
+
+@mcp.tool()
+async def batch_query_tool(
+    queries: list[QuerySpec],
+    repo_root: Optional[str] = None,
+    max_results_per_query: int = 10,
+) -> dict:
+    """Run several query_graph lookups in one call over one open graph.
+
+    Use this instead of query_graph_tool whenever you have more than one
+    target or pattern (e.g. callers_of for 3 methods plus tests_for one).
+    Accepts the same patterns as query_graph_tool. Up to 25 unique
+    (pattern, target) pairs; duplicates run once, extras are counted in
+    ``queries_dropped``. Each item has its own status (ok, not_found,
+    ambiguous, error) and never fails the batch. Items are compact:
+    ``resolved``, ``prod: ["Class.method:line"]``, ``prod_count``,
+    ``tests`` (count), ``self_call``; tests_for gives ``tests`` and
+    ``test_names``; same-named candidates may be merged (``resolution``).
+
+    Args:
+        queries: List of {"pattern": ..., "target": ...} objects.
+        repo_root: Repository root path. Auto-detected if omitted.
+        max_results_per_query: Names listed per item. Default: 10.
+    """
+    root = _resolve_repo_root(repo_root)
+
+    def _run() -> dict:
+        return with_provenance(batch_query(
+            queries=[dict(q) for q in queries], repo_root=root,
+            max_results_per_query=max_results_per_query,
+        ), root)
+
+    return await asyncio.to_thread(_run)
 
 
 @mcp.tool()
@@ -1306,7 +1359,12 @@ def main(
     """
     global _default_repo_root
     root = Path(repo_root) if repo_root else find_project_root()
-    _default_repo_root = str(root)
+    # A client-launched server often starts in $HOME or "/"; that cwd is not a
+    # repository, so it must not become every call's silent default.
+    if repo_root or (root / ".git").exists() or (root / ".code-review-graph").exists():
+        _default_repo_root = str(root)
+    else:
+        _default_repo_root = None
     _apply_tool_filter(tools)
 
     previous_stdio_state = _incremental._MCP_STDIO_ACTIVE

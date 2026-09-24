@@ -119,11 +119,17 @@ void caller() { process(1); }
     finally:
         store.close()
 
-    ambiguous = query_graph("callers_of", "process", repo_root=str(tmp_path))
-    assert ambiguous["status"] == "ambiguous"
+    # The bare name answers for the whole overload set; the ambiguous call is
+    # labelled as such instead of being claimed by either overload.
+    merged = query_graph("callers_of", "process", repo_root=str(tmp_path))
+    assert merged["status"] == "ok"
+    assert merged["resolution"] == "overload_set"
     assert {
-        candidate["qualified_name"] for candidate in ambiguous["disambiguation"]
+        candidate["qualified_name"] for candidate in merged["candidates"]
     } == {int_overload, double_overload}
+    assert [(r["qualified_name"], r["via"]) for r in merged["results"]] == [
+        (caller, "ambiguous_overload"),
+    ]
 
     exact = query_graph("callers_of", int_overload, repo_root=str(tmp_path))
     assert exact["status"] == "ok"
