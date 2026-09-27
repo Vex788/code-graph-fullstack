@@ -168,7 +168,8 @@ def _validate_jsp_table(table: object, config_path: Path) -> Optional[JspResolve
         return None
 
     defaults = JspResolverConfig()
-    values: dict[str, object] = {}
+    str_values: dict[str, str] = {}
+    tuple_values: dict[str, tuple[str, ...]] = {}
 
     for key in ("web_root", "source_root", "bean_attribute", "bean_package_prefix"):
         if key not in table:
@@ -180,7 +181,7 @@ def _validate_jsp_table(table: object, config_path: Path) -> Optional[JspResolve
                 config_path, key,
             )
             return None
-        values[key] = value.strip()
+        str_values[key] = value.strip()
 
     for key in ("route_annotations", "dead_url_suffixes"):
         if key not in table:
@@ -195,7 +196,7 @@ def _validate_jsp_table(table: object, config_path: Path) -> Optional[JspResolve
                 config_path, key,
             )
             return None
-        values[key] = tuple(item.strip() for item in value)
+        tuple_values[key] = tuple(item.strip() for item in value)
 
     if "enabled" in table and not isinstance(table["enabled"], bool):
         logger.warning(
@@ -220,12 +221,12 @@ def _validate_jsp_table(table: object, config_path: Path) -> Optional[JspResolve
 
     return JspResolverConfig(
         enabled=table.get("enabled", defaults.enabled),
-        web_root=values.get("web_root", defaults.web_root),
-        source_root=values.get("source_root", defaults.source_root),
-        route_annotations=values.get("route_annotations", defaults.route_annotations),
-        bean_attribute=values.get("bean_attribute", defaults.bean_attribute),
-        bean_package_prefix=values.get("bean_package_prefix", defaults.bean_package_prefix),
-        dead_url_suffixes=values.get("dead_url_suffixes", defaults.dead_url_suffixes),
+        web_root=str_values.get("web_root", defaults.web_root),
+        source_root=str_values.get("source_root", defaults.source_root),
+        route_annotations=tuple_values.get("route_annotations", defaults.route_annotations),
+        bean_attribute=str_values.get("bean_attribute", defaults.bean_attribute),
+        bean_package_prefix=str_values.get("bean_package_prefix", defaults.bean_package_prefix),
+        dead_url_suffixes=tuple_values.get("dead_url_suffixes", defaults.dead_url_suffixes),
         context_paths=context_paths or defaults.context_paths,
     )
 

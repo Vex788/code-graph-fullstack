@@ -134,7 +134,7 @@ def coverage_report(
     parser = CodeParser(root)
     ignore_patterns = _load_ignore_patterns(root)
 
-    excluded_files = {reason: [] for reason in _EXCLUSION_REASONS}
+    excluded_files: dict[str, list[str]] = {reason: [] for reason in _EXCLUSION_REASONS}
     tracked = set(get_all_tracked_files(root))
     candidates = tracked | set(_untracked_files(root))
     for rel_path in candidates:

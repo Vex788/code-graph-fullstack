@@ -1990,12 +1990,12 @@ def main() -> None:
         elif args.command == "coverage":
             from .tools.coverage import coverage_report, format_coverage_text
 
-            report = coverage_report(str(repo_root), store=store)
+            coverage = coverage_report(str(repo_root), store=store)
             if args.json_output:
-                print(json.dumps(report, indent=2, default=str))
+                print(json.dumps(coverage, indent=2, default=str))
             else:
-                print(format_coverage_text(report))
-            if report.get("missing_from_graph_total") and not args.no_fail:
+                print(format_coverage_text(coverage))
+            if coverage.get("missing_from_graph_total") and not args.no_fail:
                 sys.exit(1)
 
         elif args.command == "forget":
