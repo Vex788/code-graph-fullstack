@@ -144,11 +144,6 @@ def test_fts_integrity_control_on_fresh_build(built_fixture: Path):
     assert _fts_integrity_error(get_db_path(built_fixture)) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="W1/W2b: a raw path rewrite of a copied graph desyncs nodes_fts (wave0); "
-    "since v10 the FTS triggers need crg_name_tokens, so the raw UPDATE fails",
-)
 def test_fts_integrity_survives_path_rewrite_of_copied_graph(tmp_path: Path):
     from code_review_graph.incremental import get_db_path
 

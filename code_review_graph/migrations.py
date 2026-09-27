@@ -299,7 +299,6 @@ def _migrate_v9(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 _NAME_TOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+[0-9]*|[A-Z]+[0-9]*|[0-9]+")
-NAME_TOKENS_SQL_FUNCTION = "crg_name_tokens"
 
 
 def split_name_tokens(name: Optional[str]) -> str:
@@ -321,11 +320,33 @@ def split_name_tokens(name: Optional[str]) -> str:
     return " ".join(words)
 
 
-def register_sql_functions(conn: sqlite3.Connection) -> None:
-    """Register SQL functions the FTS triggers call. Needed on every writer."""
-    conn.create_function(
-        NAME_TOKENS_SQL_FUNCTION, 1, split_name_tokens, deterministic=True,
+def backfill_name_tokens(
+    conn: sqlite3.Connection, *, all_rows: bool = False, batch_size: int = 5000,
+) -> int:
+    """Compute ``name_tokens`` for rows a raw writer left NULL.
+
+    ``all_rows`` also fixes tokens left stale by a raw rename. Returns the
+    number of rows updated.
+    """
+    where = "" if all_rows else "name_tokens IS NULL AND "
+    sql = (
+        f"SELECT id, name, name_tokens FROM nodes WHERE {where}id > ? "  # nosec B608
+        "ORDER BY id LIMIT ?"
     )
+    updated = 0
+    last_id = -1
+    while True:
+        rows = conn.execute(sql, (last_id, batch_size)).fetchall()
+        if not rows:
+            return updated
+        last_id = rows[-1][0]
+        changes = [
+            (tokens, row_id)
+            for row_id, name, current in rows
+            if (tokens := split_name_tokens(name)) != current
+        ]
+        conn.executemany("UPDATE nodes SET name_tokens = ? WHERE id = ?", changes)
+        updated += len(changes)
 
 
 FTS_COLUMNS = ("name", "qualified_name", "file_path", "signature", "name_tokens")
@@ -341,17 +362,15 @@ FTS_TABLE_SQL = """
     )
 """
 
-# External-content FTS: a 'delete' must repeat exactly the indexed values.
-# name_tokens is always crg_name_tokens(name), so it is recomputed, never
-# trusted from the writer.
+# External-content FTS: a 'delete' must repeat exactly the indexed values, so
+# the triggers index the stored columns as they are. Only built-in SQL here:
+# the sqlite3 CLI and other raw writers must be able to fire them.
 _FTS_TRIGGER_SQL = (
     """
     CREATE TRIGGER IF NOT EXISTS nodes_fts_sync_ins AFTER INSERT ON nodes BEGIN
-        UPDATE nodes SET name_tokens = crg_name_tokens(new.name)
-        WHERE id = new.id AND name_tokens IS NOT crg_name_tokens(new.name);
         INSERT INTO nodes_fts(rowid, name, qualified_name, file_path, signature, name_tokens)
         VALUES (new.id, new.name, new.qualified_name, new.file_path, new.signature,
-                crg_name_tokens(new.name));
+                new.name_tokens);
     END
     """,
     """
@@ -366,19 +385,27 @@ _FTS_TRIGGER_SQL = (
     CREATE TRIGGER IF NOT EXISTS nodes_fts_sync_upd AFTER UPDATE ON nodes
     WHEN old.name IS NOT new.name OR old.qualified_name IS NOT new.qualified_name
       OR old.file_path IS NOT new.file_path OR old.signature IS NOT new.signature
+      OR old.name_tokens IS NOT new.name_tokens
     BEGIN
         INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path,
                               signature, name_tokens)
         VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path,
                 old.signature, old.name_tokens);
-        UPDATE nodes SET name_tokens = crg_name_tokens(new.name)
-        WHERE id = new.id AND name_tokens IS NOT crg_name_tokens(new.name);
         INSERT INTO nodes_fts(rowid, name, qualified_name, file_path, signature, name_tokens)
         VALUES (new.id, new.name, new.qualified_name, new.file_path, new.signature,
-                crg_name_tokens(new.name));
+                new.name_tokens);
     END
     """,
 )
+
+
+def _normalized_sql(sql: str) -> str:
+    return " ".join(sql.replace("IF NOT EXISTS ", "").split())
+
+
+_EXPECTED_TRIGGER_SQL = {
+    name: _normalized_sql(sql) for name, sql in zip(FTS_TRIGGERS, _FTS_TRIGGER_SQL)
+}
 
 
 def drop_fts_triggers(conn: sqlite3.Connection) -> None:
@@ -393,18 +420,55 @@ def create_fts_triggers(conn: sqlite3.Connection) -> None:
         conn.execute(sql)
 
 
+def fts_triggers_outdated(conn: sqlite3.Connection) -> bool:
+    """True when an FTS trigger exists in a form this build did not write.
+
+    Missing triggers are not outdated: a bulk load drops them on purpose.
+    """
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'nodes'"
+    ).fetchall()
+    for name, sql in rows:
+        if name in _LEGACY_FTS_TRIGGERS:
+            return True
+        expected = _EXPECTED_TRIGGER_SQL.get(name)
+        if expected is not None and _normalized_sql(sql or "") != expected:
+            return True
+    return False
+
+
+def replace_outdated_fts_triggers(conn: sqlite3.Connection) -> bool:
+    """Rebuild FTS with current triggers if outdated ones are installed.
+
+    Early v10 databases carry triggers that call an app-registered SQL
+    function, which breaks every raw writer. Returns True when replaced.
+    """
+    if not fts_triggers_outdated(conn):
+        return False
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        replaced = fts_triggers_outdated(conn)
+        if replaced:
+            rebuild_fts_in_transaction(conn)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    if replaced:
+        logger.info("Replaced outdated FTS triggers and rebuilt nodes_fts")
+    return replaced
+
+
 def rebuild_fts_in_transaction(conn: sqlite3.Connection) -> int:
     """Recreate ``nodes_fts`` from ``nodes`` inside the caller's transaction.
 
     Triggers are dropped first so the token backfill does not churn the old
     index, and re-created last. Returns the number of indexed rows.
     """
-    register_sql_functions(conn)
     drop_fts_triggers(conn)
-    conn.execute(
-        "UPDATE nodes SET name_tokens = crg_name_tokens(name) "
-        "WHERE name_tokens IS NOT crg_name_tokens(name)"
-    )
+    backfill_name_tokens(conn, all_rows=True)
     conn.execute("DROP TABLE IF EXISTS nodes_fts")
     conn.execute(FTS_TABLE_SQL)
     conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
@@ -542,10 +606,10 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current > LATEST_VERSION:
         raise SchemaTooNewError(current, LATEST_VERSION)
     if current >= LATEST_VERSION:
+        replace_outdated_fts_triggers(conn)
         return
 
     logger.info("Schema version %d -> %d: running migrations", current, LATEST_VERSION)
-    register_sql_functions(conn)
     if conn.in_transaction:
         conn.commit()
     saved_isolation = conn.isolation_level

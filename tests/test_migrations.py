@@ -240,9 +240,9 @@ def _fts_integrity(conn):
 
 def _add_node(store, name, qn):
     store._conn.execute(
-        "INSERT INTO nodes (kind, name, qualified_name, file_path, updated_at) "
-        "VALUES ('Class', ?, ?, 'src/X.java', 0)",
-        (name, qn),
+        "INSERT INTO nodes (kind, name, qualified_name, file_path, name_tokens, updated_at) "
+        "VALUES ('Class', ?, ?, 'src/X.java', ?, 0)",
+        (name, qn, split_name_tokens(name)),
     )
 
 
@@ -309,9 +309,9 @@ def test_fts_triggers_track_insert_update_delete(tmp_path):
         _add_node(store, "VendorInvoiceActionBean", "x::VendorInvoiceActionBean")
         assert _fts_hits(conn, "vendor invoice") == ["x::VendorInvoiceActionBean"]
         conn.execute(
-            "UPDATE nodes SET name = 'PurchaseOrderBean', "
+            "UPDATE nodes SET name = 'PurchaseOrderBean', name_tokens = ?, "
             "qualified_name = 'x::PurchaseOrderBean' WHERE qualified_name = ?",
-            ("x::VendorInvoiceActionBean",),
+            (split_name_tokens("PurchaseOrderBean"), "x::VendorInvoiceActionBean"),
         )
         assert _fts_hits(conn, "vendor") == []
         assert _fts_hits(conn, "purchase order") == ["x::PurchaseOrderBean"]
@@ -334,6 +334,158 @@ def test_upsert_keeps_fts_in_sync(tmp_path):
         store.commit()
         assert len(_fts_hits(store._conn, "user name")) == 1
         _fts_integrity(store._conn)
+
+
+def test_upsert_stores_name_tokens(tmp_path):
+    from code_review_graph.parser import NodeInfo
+
+    with GraphStore(tmp_path / "graph.db") as store:
+        node = NodeInfo(kind="Function", name="getUserName", file_path="a.py",
+                        line_start=1, line_end=2, language="python")
+        store.upsert_node(node)
+        store.commit()
+        row = store._conn.execute("SELECT name_tokens FROM nodes").fetchone()
+        assert row[0] == "get user name"
+
+
+def _no_function_triggers(conn):
+    sqls = [r[0] for r in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger'").fetchall()]
+    return sqls and all("crg_" not in sql for sql in sqls)
+
+
+def test_raw_sqlite_writer_needs_no_app_functions(tmp_path):
+    from code_review_graph.parser import NodeInfo
+
+    db = tmp_path / "graph.db"
+    with GraphStore(db) as store:
+        store.upsert_node(NodeInfo(kind="Function", name="getUserName", file_path="a.py",
+                                   line_start=1, line_end=2, language="python"))
+        store.commit()
+    conn = sqlite3.connect(str(db))  # nothing registered, like the sqlite3 CLI
+    try:
+        assert _no_function_triggers(conn)
+        conn.execute(
+            "INSERT INTO nodes (kind, name, qualified_name, file_path, updated_at) "
+            "VALUES ('Class', 'VendorInvoice', 'x::VendorInvoice', 'src/X.java', 0)"
+        )
+        conn.execute("UPDATE nodes SET file_path = 'moved/a.py' WHERE name = 'getUserName'")
+        conn.execute("UPDATE nodes SET qualified_name = 'x::Renamed' "
+                     "WHERE qualified_name = 'x::VendorInvoice'")
+        conn.commit()
+        _fts_integrity(conn)
+        assert _fts_hits(conn, "file_path : moved") == ["a.py::getUserName"]
+        # Tokens written by GraphStore still give camelCase recall.
+        assert _fts_hits(conn, "user name") == ["a.py::getUserName"]
+        # A raw insert without tokens is still found by name.
+        assert _fts_hits(conn, "VendorInvoice") == ["x::Renamed"]
+        conn.execute("DELETE FROM nodes WHERE qualified_name = 'x::Renamed'")
+        conn.commit()
+        _fts_integrity(conn)
+        assert _fts_hits(conn, "VendorInvoice") == []
+    finally:
+        conn.close()
+
+
+def test_backfill_name_tokens_fills_nulls(tmp_path):
+    from code_review_graph.migrations import backfill_name_tokens
+
+    with GraphStore(tmp_path / "graph.db") as store:
+        conn = store._conn
+        for name in ("VendorInvoice", "HTTPServer", "done_already"):
+            conn.execute(
+                "INSERT INTO nodes (kind, name, qualified_name, file_path, updated_at) "
+                "VALUES ('Class', ?, ?, 'src/X.java', 0)",
+                (name, f"x::{name}"),
+            )
+        conn.execute("UPDATE nodes SET name_tokens = 'kept' WHERE name = 'done_already'")
+        assert _fts_hits(conn, "vendor invoice") == []
+        assert backfill_name_tokens(conn, batch_size=1) == 2
+        tokens = dict(conn.execute("SELECT name, name_tokens FROM nodes").fetchall())
+        assert tokens == {"VendorInvoice": "vendor invoice", "HTTPServer": "http server",
+                          "done_already": "kept"}
+        # The update trigger re-indexes backfilled rows.
+        assert _fts_hits(conn, "vendor invoice") == ["x::VendorInvoice"]
+        _fts_integrity(conn)
+        assert backfill_name_tokens(conn) == 0
+
+
+def test_rebuild_fts_recomputes_null_and_stale_tokens(tmp_path):
+    with GraphStore(tmp_path / "graph.db") as store:
+        conn = store._conn
+        conn.execute(
+            "INSERT INTO nodes (kind, name, qualified_name, file_path, name_tokens, "
+            "updated_at) VALUES ('Class', 'NewName', 'x::A', 'a', 'old name', 0), "
+            "('Class', 'NullTokens', 'x::B', 'b', NULL, 0)"
+        )
+        assert rebuild_fts(conn) == 2
+        tokens = dict(conn.execute("SELECT name, name_tokens FROM nodes").fetchall())
+        assert tokens == {"NewName": "new name", "NullTokens": "null tokens"}
+        assert _fts_hits(conn, "old") == []
+        assert _fts_hits(conn, "null tokens") == ["x::B"]
+        _fts_integrity(conn)
+
+
+# The trigger bodies commit 04b8b7b shipped at v10, before they stopped calling
+# an app-registered function.
+_EARLY_V10_TRIGGERS = (
+    """CREATE TRIGGER nodes_fts_sync_ins AFTER INSERT ON nodes BEGIN
+        UPDATE nodes SET name_tokens = crg_name_tokens(new.name)
+        WHERE id = new.id AND name_tokens IS NOT crg_name_tokens(new.name);
+        INSERT INTO nodes_fts(rowid, name, qualified_name, file_path, signature, name_tokens)
+        VALUES (new.id, new.name, new.qualified_name, new.file_path, new.signature,
+                crg_name_tokens(new.name));
+    END""",
+    """CREATE TRIGGER nodes_fts_sync_del AFTER DELETE ON nodes BEGIN
+        INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path,
+                              signature, name_tokens)
+        VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path,
+                old.signature, old.name_tokens);
+    END""",
+)
+
+
+def test_open_replaces_function_triggers_of_early_v10(tmp_path):
+    db = tmp_path / "graph.db"
+    with GraphStore(db) as store:
+        _add_node(store, "VendorInvoice", "x::VendorInvoice")
+    conn = sqlite3.connect(str(db))
+    conn.execute("DROP TRIGGER nodes_fts_sync_ins")
+    conn.execute("DROP TRIGGER nodes_fts_sync_del")
+    for sql in _EARLY_V10_TRIGGERS:
+        conn.execute(sql)
+    conn.execute("UPDATE nodes SET name_tokens = NULL")
+    conn.commit()
+    with pytest.raises(sqlite3.OperationalError, match="crg_name_tokens"):
+        conn.execute("INSERT INTO nodes (kind, name, qualified_name, file_path, updated_at) "
+                     "VALUES ('Class', 'B', 'x::B', 'b', 0)")
+    conn.rollback()
+    conn.close()
+
+    with GraphStore(db) as store:
+        assert get_schema_version(store._conn) == LATEST_VERSION
+        assert _no_function_triggers(store._conn)
+        assert _fts_hits(store._conn, "vendor invoice") == ["x::VendorInvoice"]
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("INSERT INTO nodes (kind, name, qualified_name, file_path, updated_at) "
+                     "VALUES ('Class', 'B', 'x::B', 'b', 0)")
+        conn.commit()
+        _fts_integrity(conn)
+    finally:
+        conn.close()
+
+
+def test_open_leaves_dropped_triggers_of_a_bulk_load_alone(tmp_path):
+    db = tmp_path / "graph.db"
+    GraphStore(db).close()
+    conn = sqlite3.connect(str(db))
+    disable_fts_triggers(conn)
+    conn.commit()
+    conn.close()
+    with GraphStore(db) as store:
+        assert store._conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()[0] == 0
 
 
 def test_bulk_load_helpers(tmp_path):

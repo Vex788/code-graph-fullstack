@@ -17,7 +17,6 @@ from .migrations import (
     create_fts_triggers,
     drop_fts_triggers,
     rebuild_fts_in_transaction,
-    register_sql_functions,
 )
 from .parser import normalize_file_path
 
@@ -40,7 +39,6 @@ def disable_fts_triggers(conn: sqlite3.Connection) -> None:
 
 def enable_fts_triggers(conn: sqlite3.Connection) -> None:
     """Resume row-level FTS maintenance (only valid on an in-sync index)."""
-    register_sql_functions(conn)
     create_fts_triggers(conn)
 
 

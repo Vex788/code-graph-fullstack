@@ -40,9 +40,10 @@ from .migrations import (
     MIGRATION_LOCK_WAIT_SECONDS,
     SchemaMigrationPending,
     check_readable,
+    fts_triggers_outdated,
     get_schema_version,
-    register_sql_functions,
     run_migrations,
+    split_name_tokens,
 )
 from .parser import EdgeInfo, NodeInfo, normalize_file_path
 
@@ -199,8 +200,6 @@ class GraphStore:
             isolation_level=None,  # Disable implicit transactions (#135)
         )
         self._conn.row_factory = sqlite3.Row
-        # The FTS triggers call this function on every node write.
-        register_sql_functions(self._conn)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         try:
@@ -224,7 +223,10 @@ class GraphStore:
         ``MIGRATION_LOCK_WAIT_SECONDS`` for the writer lock and raises
         :class:`SchemaMigrationPending` if another writer keeps it.
         """
-        if check_readable(self._conn) >= LATEST_VERSION:
+        version = check_readable(self._conn)
+        if version > LATEST_VERSION or (
+            version == LATEST_VERSION and not fts_triggers_outdated(self._conn)
+        ):
             return
         if str(self.db_path) in ("", ":memory:"):
             # Private to this connection; no other process can see it.
@@ -273,10 +275,11 @@ class GraphStore:
             """INSERT INTO nodes
                (kind, name, qualified_name, file_path, line_start, line_end,
                 language, parent_name, params, return_type, modifiers, is_test,
-                file_hash, extra, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_hash, extra, updated_at, name_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(qualified_name) DO UPDATE SET
                  kind=excluded.kind, name=excluded.name,
+                 name_tokens=excluded.name_tokens,
                  file_path=excluded.file_path, line_start=excluded.line_start,
                  line_end=excluded.line_end, language=excluded.language,
                  parent_name=excluded.parent_name, params=excluded.params,
@@ -289,7 +292,7 @@ class GraphStore:
                 node.line_start, node.line_end, node.language,
                 node.parent_name, node.params, node.return_type,
                 node.modifiers, int(node.is_test), file_hash,
-                extra, now,
+                extra, now, split_name_tokens(node.name),
             ),
         )
         row = self._conn.execute(

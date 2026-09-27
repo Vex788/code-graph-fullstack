@@ -282,6 +282,9 @@ class TestHybridSearch:
         """_out_mode is 'semantic' when only embeddings contribute."""
         import code_review_graph.search as search_mod
 
+        # Triggers index nodes on write; empty the index so only embeddings hit.
+        self.store._conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all')")
+        self.store._conn.commit()
         node_id = self.store._conn.execute(
             "SELECT id FROM nodes WHERE name = 'authenticate'"
         ).fetchone()[0]
