@@ -354,7 +354,8 @@ class TestJavaParsing:
         inherits = [e for e in self.edges if e.kind == "INHERITS"]
         # InMemoryRepo implements UserRepository + CachedRepo extends InMemoryRepo
         assert len(inherits) >= 2
-        targets = {e.target for e in inherits}
+        # Same-file types resolve to their Class node.
+        targets = {e.target.rsplit("::", 1)[-1] for e in inherits}
         assert "UserRepository" in targets
         assert "InMemoryRepo" in targets
 

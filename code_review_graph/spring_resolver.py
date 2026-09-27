@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _bare_type_name(type_ref: str) -> str:
+    """``path/X.java::Outer.X`` or ``a.b.X`` -> ``X``."""
+    return type_ref.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+
+
 def resolve_spring_di_calls(store: GraphStore) -> dict:
     """Resolve Java CALLS edges whose receiver is a Spring-injected field.
 
@@ -107,8 +112,12 @@ def resolve_spring_di_calls(store: GraphStore) -> dict:
     ).fetchall():
         iface = row["target_qualified"]
         impl = row["source_qualified"]
-        if any(impl.startswith(f) for f in java_files) or "::" in impl:
-            implementors.setdefault(iface, []).append(impl)
+        if impl.partition("::")[0] not in java_files:
+            continue
+        # INHERITS targets are qualified when the parser resolved the type
+        # and bare otherwise; index both spellings.
+        for key in {iface, _bare_type_name(iface)}:
+            implementors.setdefault(key, []).append(impl)
 
     # -----------------------------------------------------------------------
     # Resolve CALLS edges

@@ -22,6 +22,8 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from .spring_resolver import _bare_type_name
+
 if TYPE_CHECKING:
     from .graph import GraphStore
 
@@ -110,8 +112,12 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
     ).fetchall():
         iface = row["target_qualified"]
         impl = row["source_qualified"]
-        if any(impl.startswith(f) for f in java_files) or "::" in impl:
-            implementors.setdefault(iface, []).append(impl)
+        if impl.partition("::")[0] not in java_files:
+            continue
+        # INHERITS targets are qualified when the parser resolved the type
+        # and bare otherwise; index both spellings.
+        for key in {iface, _bare_type_name(iface)}:
+            implementors.setdefault(key, []).append(impl)
 
     # -----------------------------------------------------------------------
     # Resolve CALLS edges

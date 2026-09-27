@@ -951,7 +951,10 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # impl_item is a scope for methods, not a second type definition. It is
     # dispatched separately so repeated impl blocks cannot overwrite structs.
     "rust": ["struct_item", "enum_item", "trait_item"],
-    "java": ["class_declaration", "interface_declaration", "enum_declaration"],
+    "java": [
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "annotation_type_declaration",
+    ],
     "c": ["struct_specifier", "type_definition"],
     "cpp": ["class_specifier", "struct_specifier"],
     "csharp": [
@@ -1038,7 +1041,9 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     "tsx": ["function_declaration", "method_definition", "arrow_function"],
     "go": ["function_declaration", "method_declaration"],
     "rust": ["function_item", "function_signature_item"],
-    "java": ["method_declaration", "constructor_declaration"],
+    "java": [
+        "method_declaration", "constructor_declaration", "compact_constructor_declaration",
+    ],
     "c": ["function_definition"],
     "cpp": ["function_definition", "declaration", "field_declaration"],
     "csharp": ["method_declaration", "constructor_declaration"],
@@ -9761,6 +9766,49 @@ class CodeParser:
         return f"{package}.{normalized}" if package else normalized
 
     @staticmethod
+    def _java_erased_type_name(node) -> Optional[str]:
+        """Return a Java type as written minus type arguments, or None."""
+        if node.type == "generic_type":
+            head = next(
+                (
+                    sub for sub in node.children
+                    if sub.type in ("type_identifier", "scoped_type_identifier")
+                ),
+                None,
+            )
+            return CodeParser._java_erased_type_name(head) if head is not None else None
+        if node.type in ("type_identifier", "scoped_type_identifier"):
+            return node.text.decode("utf-8", errors="replace")
+        return None
+
+    def _resolve_java_type_target(
+        self,
+        type_name: str,
+        file_path: str,
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> str:
+        """Qualify a Java type to its repository Class node, else return it unchanged.
+
+        Same-file classes win, then single-type imports, then the package
+        (which also covers same-package classes that need no import).
+        """
+        head = type_name.split(".", 1)[0]
+        if "." not in type_name and type_name in defined_names:
+            return self._qualify(type_name, file_path, None)
+        if head[:1].islower() or head in import_map or _JAVA_PACKAGE_KEY in import_map:
+            module = self._resolve_java_type_identity(type_name, import_map)
+        else:
+            # Default package: a sibling file of the same name.
+            module = type_name
+        resolved = self._resolve_module_to_file(module, file_path, "java")
+        if not resolved:
+            return type_name
+        simple = type_name.rsplit(".", 1)[-1]
+        stem = Path(resolved).stem
+        return self._qualify(simple, resolved, None if stem == simple else stem)
+
+    @staticmethod
     def _descendants_of_type(node, node_type: str) -> list:
         matches: list = []
         if node.type == node_type:
@@ -10356,6 +10404,10 @@ class CodeParser:
         # Inheritance edges
         bases = self._get_bases(child, language, source)
         for base in bases:
+            if language == "java":
+                base = self._resolve_java_type_target(
+                    base, file_path, import_map or {}, defined_names or set(),
+                )
             edges.append(EdgeInfo(
                 kind="INHERITS",
                 source=self._qualify(
@@ -15384,21 +15436,26 @@ class CodeParser:
                         if arg.type in ("identifier", "attribute"):
                             bases.append(arg.text.decode("utf-8", errors="replace"))
         elif language == "java":
-            # Java: superclass and super_interfaces wrap the keyword
-            # (extends/implements) around type_identifier children.
-            # Taking .text would include the keyword (e.g. "implements Foo").
-            # Drill into the children to extract bare type names.
+            # Java: superclass, super_interfaces (classes, records) and
+            # extends_interfaces (interfaces) wrap the keyword around the
+            # types. Type arguments are erased: ``GenericDao<User>`` is
+            # ``GenericDao``.
             for child in node.children:
                 if child.type == "superclass":
-                    for sub in child.children:
-                        if sub.type in ("type_identifier", "generic_type"):
-                            bases.append(sub.text.decode("utf-8", errors="replace"))
-                elif child.type == "super_interfaces":
-                    for sub in child.children:
-                        if sub.type == "type_list":
-                            for ident in sub.children:
-                                if ident.type in ("type_identifier", "generic_type"):
-                                    bases.append(ident.text.decode("utf-8", errors="replace"))
+                    types = child.children
+                elif child.type in ("super_interfaces", "extends_interfaces"):
+                    types = [
+                        ident
+                        for sub in child.children
+                        if sub.type == "type_list"
+                        for ident in sub.children
+                    ]
+                else:
+                    continue
+                for sub in types:
+                    erased = self._java_erased_type_name(sub)
+                    if erased:
+                        bases.append(erased)
         elif language == "csharp":
             # C# wraps ``: Base, IFace`` in a base_list. Iterate named type
             # entries so punctuation is excluded while qualified/generic names

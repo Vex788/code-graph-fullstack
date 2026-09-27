@@ -43,6 +43,7 @@ INHERITS	src/main/java/com/acme/web/action/BaseActionBean.java::BaseActionBean	n
 INHERITS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	net.sourceforge.stripes.action.ActionBean	now
 INHERITS	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	src/main/java/com/acme/web/action/BaseActionBean.java::BaseActionBean	now
 INHERITS	src/main/java/com/acme/web/action/UserListActionBean.java::UserListActionBean	src/main/java/com/acme/web/action/BaseActionBean.java::BaseActionBean	now
+INHERITS	src/main/java/com/acme/dao/UserDaoApi.java::UserDaoApi	src/main/java/com/acme/dao/GenericDao.java::GenericDao	now
 IMPORTS_FROM	src/main/java/com/acme/service/InvoiceServiceImpl.java	src/main/java/com/acme/util/Strings.java	now
 IMPORTS_FROM	src/main/java/com/acme/service/InvoiceServiceImpl.java	src/main/java/com/acme/dao/InvoiceDao.java	now
 IMPORTS_FROM	src/main/java/com/acme/report/InvoiceReport.java	src/main/java/com/acme/util/Strings.java	now
@@ -67,7 +68,6 @@ CONTAINS	src/main/java/com/acme/model/Money.java	src/main/java/com/acme/model/Mo
 CONTAINS	src/main/java/com/acme/model/Money.java::Money	src/main/java/com/acme/model/Money.java::Money.plus	target
 CONTAINS	src/main/java/com/acme/model/Money.java::Money	src/main/java/com/acme/model/Money.java::Money.format	target
 CONTAINS	src/main/java/com/acme/dao/UserDao.java::UserDao	src/main/java/com/acme/dao/UserDao.java::UserDao$1	target
-INHERITS	src/main/java/com/acme/dao/UserDaoApi.java::UserDaoApi	src/main/java/com/acme/dao/GenericDao.java::GenericDao	target
 INJECTS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/service/InvoiceService.java::InvoiceService	target
 INJECTS	src/main/java/com/acme/web/action/UserListActionBean.java::UserListActionBean	src/main/java/com/acme/service/UserService.java::UserService	target
 INJECTS	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	src/main/java/com/acme/service/OrderService.java::OrderService	target

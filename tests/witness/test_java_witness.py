@@ -56,7 +56,6 @@ def test_user_dao_save_overloads_are_distinct_nodes(built_fixture: Path):
     assert len(rows) == 2, rows
 
 
-@pytest.mark.xfail(strict=True, reason="W3a: Java records get no Class node")
 def test_record_money_has_class_node(built_fixture: Path):
     rows = _rows(
         built_fixture,
@@ -65,7 +64,6 @@ def test_record_money_has_class_node(built_fixture: Path):
     assert len(rows) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="W3a: interface extends emits no INHERITS edge")
 def test_interface_extends_emits_inherits(built_fixture: Path):
     rows = _rows(
         built_fixture,
