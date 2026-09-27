@@ -67,6 +67,10 @@ _SOURCE_IDENTITY_SCHEMA: dict[str, Any] = {
         "runtime_matches_source": {"type": "boolean"},
         "index_matches_runtime": {"type": "boolean"},
         "source_matches_build": {"type": "boolean"},
+        "missing_indexed_paths": {"type": "array", "items": {"type": "string"}},
+        "deleted_indexed_paths": {"type": "array", "items": {"type": "string"}},
+        "mismatched_indexed_paths": {"type": "array", "items": {"type": "string"}},
+        "check": {"enum": ["full", "partial", "unavailable"]},
     },
 }
 
@@ -84,12 +88,20 @@ RECEIPT_SCHEMA: dict[str, Any] = {
         "head_sha": {"type": "string"},
         "head_matches_build": {"type": "boolean"},
         "missing_build_anchor": {"type": "boolean"},
-        "status": {"enum": STATUS_VALUES},
+        # "error" only with error_code (e.g. schema_too_new).
+        "status": {"enum": [*STATUS_VALUES, "error"]},
+        "error_code": {"type": "string"},
+        "message": {"type": "string"},
         "embeddings": {"enum": EMBEDDINGS_VALUES},
         "reasons": {"type": "array", "items": {"type": "string"}},
         "contract_version": {"type": "string"},
-        "schema_version": {"type": "integer"},
+        "schema_version": {"type": ["integer", "null"]},
         "index_generation": {"type": ["integer", "null"]},
+        "built_at_commit": _NULLABLE_STRING,
+        "current_sha": _NULLABLE_STRING,
+        "failed_files": {"type": "integer", "minimum": 0},
+        "resolver_failures": {"type": "integer", "minimum": 0},
+        "etag": {"type": "string"},
         "source_identity": _SOURCE_IDENTITY_SCHEMA,
     },
 }

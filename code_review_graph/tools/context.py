@@ -8,15 +8,19 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from ..incremental import get_db_path, get_staged_and_unstaged
+from ..incremental import get_db_path
+from ..migrations import SchemaMigrationPending, SchemaTooNewError
 from ..parser import normalize_file_path
+from ..readiness import GIT_OK, GIT_UNAVAILABLE, ReadinessStatus
+from ..readiness_facts import gather_report
 from ._common import (
     _get_store,
     _resolve_root,
+    building_response,
     compact_response,
     graph_provenance,
+    schema_error_response,
     sibling_graph_root,
-    working_tree_drift,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,7 +124,25 @@ def get_minimal_context(
     if missing is not None:
         return missing
 
-    store, root = _get_store(str(root))
+    try:
+        report = gather_report(root, get_db_path(root, read_only=True))
+    except SchemaTooNewError as exc:
+        return schema_error_response(exc)
+    readiness = report.readiness
+    status_block = readiness.to_dict()
+    if readiness.status is ReadinessStatus.BUILDING:
+        return building_response(status_block)
+    if "index_generation_mismatch" in readiness.reasons:
+        return _not_ready(
+            "rebuild_required",
+            "The graph was indexed by an incompatible build. Run a full rebuild.",
+            readiness=status_block,
+        )
+
+    try:
+        store, root = _get_store(str(root))
+    except SchemaMigrationPending:
+        return building_response(status_block)
     try:
         # 1. Quick stats
         stats = store.get_stats()
@@ -128,20 +150,30 @@ def get_minimal_context(
             return _not_ready(
                 "empty_graph",
                 "The graph database contains no nodes. Build the graph before requesting context.",
+                readiness=status_block,
             )
 
-        provenance = graph_provenance(str(root))
-        if provenance and provenance.get("head_matches_build") is False:
+        facts = report.facts
+        if facts.git_state == GIT_UNAVAILABLE:
             return _not_ready(
-                "stale_graph",
-                "The graph was built at a different Git commit. "
-                "Update it before requesting context.",
+                "git_unavailable",
+                "git could not report HEAD or the working tree, so the graph's "
+                "freshness cannot be checked. Fix git, then retry.",
+                readiness=status_block,
             )
-        if provenance and provenance.get("missing_build_anchor"):
+        if facts.git_state == GIT_OK and not facts.built_at_commit:
             return _not_ready(
                 "no_build_anchor",
                 "The graph never recorded the commit it was built at, so its "
                 "freshness cannot be checked. Rebuild it before requesting context.",
+                readiness=status_block,
+            )
+        if "head_moved" in readiness.reasons:
+            return _not_ready(
+                "stale_graph",
+                "The graph was built at a different Git commit. "
+                "Update it before requesting context.",
+                readiness=status_block,
             )
 
         # Commit identity says nothing about uncommitted work. A file the graph
@@ -149,8 +181,9 @@ def get_minimal_context(
         # symbol", so it blocks; edited-but-indexed files only warn, because
         # going red there would paint every active editing session red and send
         # agents to grep.
-        dirty = get_staged_and_unstaged(root)
-        drift = working_tree_drift(root, store, dirty)
+        drift = report.drift or {
+            "missing": [], "mismatched": [], "deleted": [], "check": "unavailable",
+        }
         if drift["missing"]:
             return _not_ready(
                 "stale_worktree",
@@ -158,6 +191,7 @@ def get_minimal_context(
                 "update it before asking what exists.",
                 drifted_files=[_short(root, p) for p in drift["missing"][:10]],
                 drifted_file_count=len(drift["missing"]),
+                readiness=status_block,
             )
 
         # 2. Risk from changed files
@@ -259,6 +293,10 @@ def get_minimal_context(
             response["stale_file_count"] = len(edited)
         if drift["check"] != "full":
             response["content_check"] = drift["check"]
+        if facts.failed_files or facts.resolver_failures:
+            response["failed_files"] = facts.failed_files
+            response["resolver_failures"] = facts.resolver_failures
+        response["readiness"] = status_block
         return response
     finally:
         store.close()

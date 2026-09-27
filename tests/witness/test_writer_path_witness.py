@@ -88,7 +88,6 @@ def test_git_status_control_reports_untracked_file(fixture_repo: Path):
     assert [Path(p).name for p in drift["missing"]] == ["NewThing.java"]
 
 
-@pytest.mark.xfail(strict=True, reason="W2a: a git timeout reads as a clean working tree")
 def test_git_timeout_is_not_a_clean_worktree(fixture_repo: Path, monkeypatch):
     from code_review_graph import incremental
     from code_review_graph.tools._common import working_tree_drift

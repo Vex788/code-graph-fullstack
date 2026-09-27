@@ -1526,8 +1526,15 @@
             "partial_index",
             "stale_graph",
             "stale_worktree",
-            "ok"
+            "ok",
+            "error"
           ]
+        },
+        "error_code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
         },
         "embeddings": {
           "enum": [
@@ -1547,13 +1554,39 @@
           "type": "string"
         },
         "schema_version": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "index_generation": {
           "type": [
             "integer",
             "null"
           ]
+        },
+        "built_at_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failed_files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resolver_failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "etag": {
+          "type": "string"
         },
         "source_identity": {
           "type": "object",
@@ -1566,6 +1599,31 @@
             },
             "source_matches_build": {
               "type": "boolean"
+            },
+            "missing_indexed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deleted_indexed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mismatched_indexed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "check": {
+              "enum": [
+                "full",
+                "partial",
+                "unavailable"
+              ]
             }
           }
         }
@@ -1706,6 +1764,31 @@
             },
             "source_matches_build": {
               "type": "boolean"
+            },
+            "missing_indexed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deleted_indexed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mismatched_indexed_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "check": {
+              "enum": [
+                "full",
+                "partial",
+                "unavailable"
+              ]
             }
           }
         }

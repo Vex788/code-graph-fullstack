@@ -1,6 +1,7 @@
 """Tests for MCP tool functions."""
 
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -2064,7 +2065,16 @@ class TestGetMinimalContext:
     def setup_method(self):
         self.tmp = tempfile.mkdtemp()
         self.root = Path(self.tmp)
-        (self.root / ".git").mkdir()
+        # A real repository: a git failure no longer reads as a fresh graph.
+        git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t"]
+        subprocess.run([*git, "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(
+            [*git, "commit", "-q", "--allow-empty", "-m", "init"], cwd=self.root, check=True,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
         (self.root / ".code-review-graph").mkdir()
         # Create a small graph
         db_path = self.root / ".code-review-graph" / "graph.db"
@@ -2077,6 +2087,7 @@ class TestGetMinimalContext:
             kind="Function", name="main", file_path=str(self.root / "app.py"),
             line_start=5, line_end=20, language="python",
         ))
+        self.store.set_metadata("git_head_sha", head)
         self.store.commit()
         self.store.close()
 
