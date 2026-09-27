@@ -9,7 +9,7 @@ from typing import Any
 from ..changes import analyze_changes, parse_diff_ranges, parse_git_diff_ranges  # noqa: F401
 from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..flows import get_affected_flows as _get_affected_flows
-from ..graph import edge_to_dict, node_to_dict
+from ..graph import _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
 from ..incremental import get_changed_files, get_staged_and_unstaged
 from ..parser import normalize_file_path
@@ -77,6 +77,48 @@ _MAX_DETECT_FLOWS = 200
 _DETECT_FLOW_FIELDS = (
     "id", "name", "criticality", "depth", "node_count", "file_count",
 )
+
+
+def _impacted_entries(
+    store: Any,
+    impact: dict[str, Any],
+    links: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Impacted nodes for detect_changes: cross-stack targets, then the radius.
+
+    A changed page depends on the bean it renders, but impact walks from a
+    changed target back to its sources, so the radius alone never names the
+    bean. Outgoing cross-stack links are listed first with ``via``.
+    """
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in links:
+        if link.get("direction") != "outgoing" or link["target"] in seen:
+            continue
+        seen.add(link["target"])
+        node = store.get_node(link["target"])
+        entry: dict[str, Any] = {
+            "name": _sanitize_name(node.name) if node else link["target"],
+            "qualified_name": link["target"],
+            "kind": node.kind if node else None,
+            "file_path": node.file_path if node else None,
+            "via": link["kind"],
+        }
+        entries.append(entry)
+    scores = impact.get("impact_scores", {})
+    for node in impact["impacted_nodes"]:
+        qn = _sanitize_name(node.qualified_name)
+        if qn in seen:
+            continue
+        seen.add(qn)
+        entries.append({
+            "name": _sanitize_name(node.name),
+            "qualified_name": qn,
+            "kind": node.kind,
+            "file_path": node.file_path,
+            "impact_score": scores.get(node.qualified_name),
+        })
+    return entries
 
 
 def _project(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -567,25 +609,31 @@ def detect_changes_func(
             root).  Auto-detected from git diff if omitted.
         include_source: If True, include source code snippets for changed
             functions.  Default: False.
-        max_depth: Impact radius depth for BFS traversal.  Default: 2.
+        max_depth: Impact radius depth (hops) for ``impacted_nodes``.
+            Default: 2; 0 lists only cross-stack targets of changed pages.
         repo_root: Repository root path.  Auto-detected if omitted.
         detail_level: Output detail level.  "standard" returns full analysis;
             "minimal" returns only summary, risk_score, changed_file_count,
-            test_gap_count, and top 3 review priorities (text only).
-            Default: "standard".
-        max_results: Maximum changed functions and test gaps to return
-            (default 25, capped at 200). ``changed_functions_total`` and
-            ``test_gaps_total`` report the untruncated counts.
+            test_gap_count, impacted_count and top 3 review priorities
+            (text only). Default: "standard".
+        max_results: Maximum changed functions, test gaps and impacted
+            nodes to return (default 25, capped at 100 for functions and
+            gaps, 100 for impacted nodes). ``*_total`` fields report the
+            untruncated counts.
         max_flows: Maximum affected flows to embed (default 20, capped at
             200). The embedded flows carry per-flow metadata only; use
             get_affected_flows_tool for step detail. See #849.
 
     Returns:
         Risk-scored analysis with changed functions, affected flows,
-        test gaps, and review priorities, plus ``truncated``.
+        test gaps, review priorities, ``impacted_nodes`` (cross-stack
+        targets carry ``via``; radius nodes carry ``impact_score``) and
+        ``cross_stack_links``, plus ``truncated``.
     """
     _validate_positive_int(max_results, "max_results")
     _validate_positive_int(max_flows, "max_flows")
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+        raise ValueError("max_depth must be an integer greater than or equal to 0")
 
     store, root = _get_store(repo_root)
     try:
@@ -604,6 +652,7 @@ def detect_changes_func(
                 "affected_flows": [],
                 "test_gaps": [],
                 "review_priorities": [],
+                "impacted_nodes": [],
             }
             return _git_unavailable(empty) if git_failed else empty
 
@@ -616,17 +665,36 @@ def detect_changes_func(
         # Parse diff ranges for line-level mapping.
         diff_ranges = parse_diff_ranges(str(root), base)
         # Remap to absolute paths so they match graph file_paths.
+        # Explicit changed_files narrow the diff: ranges of other files would
+        # otherwise replace the requested files in the analysis.
+        requested = set(abs_files)
         abs_ranges: dict[str, list[tuple[int, int]]] = {}
         for rel_path, ranges in diff_ranges.items():
             abs_path = normalize_file_path(root / rel_path)
-            abs_ranges[abs_path] = ranges
+            if abs_path in requested:
+                abs_ranges[abs_path] = ranges
 
         analysis = analyze_changes(
             store,
             changed_files=abs_files,
-            changed_ranges=abs_ranges if abs_ranges else None,
+            changed_ranges=abs_ranges,
             repo_root=str(root),
             base=base,
+        )
+
+        impact_limit = min(max_results, _MAX_REVIEW_NODES)
+        impact = store.get_impact_radius(
+            _resolve_graph_file_paths(store, root, changed_files),
+            max_depth=max_depth, max_nodes=impact_limit,
+        )
+        impacted = _impacted_entries(
+            store, impact, analysis.get("cross_stack_links", []),
+        )
+        extra_links = len(impacted) - len(impact["impacted_nodes"])
+        impacted_total = impact.get("total_impacted", 0) + max(0, extra_links)
+        impacted = impacted[:impact_limit]
+        analysis["summary"] = analysis.get("summary", "") + (
+            f"\n  - {impacted_total} impacted node(s) within {max_depth} hop(s)"
         )
 
         # Optionally include source snippets for changed functions, spending a
@@ -669,6 +737,7 @@ def detect_changes_func(
                 "risk_score": analysis.get("risk_score", 0.0),
                 "changed_file_count": len(changed_files),
                 "test_gap_count": len(analysis.get("test_gaps", [])),
+                "impacted_count": impacted_total,
                 "review_priorities": top_priorities,
             }
         else:
@@ -687,14 +756,16 @@ def detect_changes_func(
             files, files_total, files_cut = _bounded(
                 changed_files, max_results, _MAX_REVIEW_FILES,
             )
-            any_cut = funcs_cut or gaps_cut or flows_cut or files_cut
+            impacted_cut = impacted_total > len(impacted)
+            any_cut = funcs_cut or gaps_cut or flows_cut or files_cut or impacted_cut
             summary = analysis.get("summary", "")
             if any_cut:
                 summary += (
                     "\n  - Response bounded: "
                     f"{len(funcs)} of {funcs_total} changed function(s), "
                     f"{len(gaps)} of {gaps_total} test gap(s), "
-                    f"{len(flows)} of {flows_total} flow(s) shown"
+                    f"{len(flows)} of {flows_total} flow(s), "
+                    f"{len(impacted)} of {impacted_total} impacted node(s) shown"
                 )
             result = {
                 "status": "ok",
@@ -708,6 +779,9 @@ def detect_changes_func(
                 "test_gaps_total": gaps_total,
                 "affected_flows": _project(flows, _DETECT_FLOW_FIELDS),
                 "affected_flows_total": flows_total,
+                "impacted_nodes": impacted,
+                "impacted_nodes_total": impacted_total,
+                "max_depth": max_depth,
                 "truncated": any_cut,
             }
         result["_hints"] = generate_hints(

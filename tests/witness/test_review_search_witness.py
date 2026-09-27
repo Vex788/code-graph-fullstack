@@ -4,15 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from .conftest import build, git
 
 ORDER_VIEW_JSP = "web/WEB-INF/jsp/order/view.jsp"
 
 
-@pytest.mark.xfail(strict=True, reason="W5b: a JSP-only change scores risk 0")
 def test_jsp_only_change_has_nonzero_risk(fixture_repo: Path):
+    # Red before W5b: a File-only JSP change scored risk 0 and named nothing.
     from code_review_graph.tools.review import detect_changes_func
 
     build(fixture_repo)
@@ -29,6 +27,16 @@ def test_jsp_only_change_has_nonzero_risk(fixture_repo: Path):
     assert result["status"] == "ok"
     # view.jsp renders OrderActionBean, so the change reaches Java.
     assert result["risk_score"] > 0, result["summary"]
+    impacted = [n["qualified_name"] for n in result["impacted_nodes"]]
+    assert any(qn.endswith("OrderActionBean.java::OrderActionBean") for qn in impacted), (
+        impacted
+    )
+
+    minimal = detect_changes_func(
+        base="HEAD~1", changed_files=[ORDER_VIEW_JSP], repo_root=str(fixture_repo),
+        detail_level="minimal",
+    )
+    assert minimal["risk_score"] == result["risk_score"]
 
 
 def test_fts_control_finds_exact_class_name(built_fixture: Path):

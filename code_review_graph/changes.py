@@ -16,7 +16,8 @@ from typing import Any
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .constants import env_int
 from .flows import get_affected_flows
-from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
+from .graph import GraphEdge, GraphNode, GraphStore, _sanitize_name, node_to_dict
+from .kinds import edge_kinds_where
 from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,22 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "setup_method", "teardown_method", "setUpClass", "tearDownClass",
     "__construct", "__init__", "__destruct",
 })
+
+# Incoming edges whose sources depend on the node: callers plus cross-stack
+# links (a page that renders, requests or includes it). From the kinds
+# registry, so new cross-stack producers count without a change here.
+_CROSS_STACK_KINDS = edge_kinds_where(cross_stack=True)
+_DEPENDENT_KINDS = edge_kinds_where(risk_counts=True) | _CROSS_STACK_KINDS
+# A web file is also depended on by pages that load it as an asset.
+_FILE_DEPENDENT_KINDS = _DEPENDENT_KINDS | {"REFERENCES", "IMPORTS_FROM"}
+
+# A change that touches only the File node of these languages (markup,
+# top-level script, stylesheet) is scored from the file's links.
+_WEB_LANGUAGES = frozenset({
+    "jsp", "html", "css", "scss", "javascript", "typescript", "tsx", "vue", "svelte",
+})
+_STYLE_LANGUAGES = frozenset({"css", "scss"})
+_MAX_CROSS_STACK_LINKS = 50
 
 _GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds, configurable
 
@@ -337,7 +354,13 @@ def compute_risk_score(
       - Caller count: callers / 20, capped at 0.10
       - Change frequency (opt-in): commits touching the file / 10, capped
         at 0.15
+
+    Callers are incoming edges of every ``risk_counts`` or ``cross_stack``
+    kind in :mod:`kinds`. CSS selectors get neither the test-coverage term
+    nor the security bonus: stylesheets have no unit tests and selector
+    names like ``.login-form`` are not security code.
     """
+    selector = is_css_selector(node)
     score = 0.0
 
     # --- Flow participation (cap 0.25), weighted by criticality ---
@@ -350,7 +373,7 @@ def compute_risk_score(
 
     # --- Community crossing (cap 0.15) ---
     callers = store.get_edges_by_target(node.qualified_name)
-    caller_edges = [e for e in callers if e.kind == "CALLS"]
+    caller_edges = [e for e in callers if e.kind in _DEPENDENT_KINDS]
 
     cross_community = 0
     node_cid = store.get_node_community_id(node.id)
@@ -364,14 +387,17 @@ def compute_risk_score(
     score += min(cross_community * 0.05, 0.15)
 
     # --- Test coverage (direct + transitive) ---
-    transitive_tests = store.get_transitive_tests(node.qualified_name)
-    test_count = len(transitive_tests)
-    score += 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
+    if not selector:
+        transitive_tests = store.get_transitive_tests(node.qualified_name)
+        test_count = len(transitive_tests)
+        score += 0.30 - (min(test_count / 5.0, 1.0) * 0.25)
 
     # --- Security sensitivity ---
     name_lower = node.name.lower()
     qn_lower = node.qualified_name.lower()
-    if any(kw in name_lower or kw in qn_lower for kw in _SECURITY_KEYWORDS):
+    if not selector and any(
+        kw in name_lower or kw in qn_lower for kw in _SECURITY_KEYWORDS
+    ):
         score += 0.20
 
     # --- Caller count (cap 0.10) ---
@@ -381,6 +407,80 @@ def compute_risk_score(
     # --- Change frequency (opt-in, cap 0.15) ---
     if churn_counts and node.file_path:
         commit_count = churn_counts.get(node.file_path, 0)
+        score += min(commit_count / _CHURN_SATURATION, 1.0) * _CHURN_WEIGHT
+
+    return round(min(max(score, 0.0), 1.0), 4)
+
+
+def is_css_selector(node: GraphNode) -> bool:
+    """A stylesheet rule node (stored as ``Class``), not the stylesheet file."""
+    return node.kind != "File" and (node.language or "") in _STYLE_LANGUAGES
+
+
+def file_links(
+    store: GraphStore, file_node: GraphNode,
+) -> tuple[list[GraphEdge], list[GraphEdge]]:
+    """Cross-stack edges leaving a file and dependency edges entering it.
+
+    Both sides cover the File node and every node inside the file; edges
+    between two nodes of the same file are ignored.
+    """
+    own = {file_node.qualified_name} | {
+        n.qualified_name for n in store.get_nodes_by_file(file_node.file_path)
+    }
+    outgoing: list[GraphEdge] = []
+    incoming: list[GraphEdge] = []
+    for qn in sorted(own):
+        for e in store.get_edges_by_source(qn):
+            if e.kind in _CROSS_STACK_KINDS and e.target_qualified not in own:
+                outgoing.append(e)
+        for e in store.get_edges_by_target(qn):
+            if (
+                e.kind in _FILE_DEPENDENT_KINDS
+                and e.source_qualified not in own
+                and e.file_path != file_node.file_path
+            ):
+                incoming.append(e)
+    return outgoing, incoming
+
+
+def compute_web_file_risk(
+    store: GraphStore,
+    file_node: GraphNode,
+    outgoing: list[GraphEdge],
+    incoming: list[GraphEdge],
+    churn_counts: dict[str, int] | None = None,
+) -> float:
+    """Risk (0.0 - 1.0) of a change that touches only a web file's File node.
+
+    Scoring factors:
+      - Flow participation: as in :func:`compute_risk_score`
+      - Cross-stack reach: 0.10 per distinct target of an outgoing
+        cross-stack edge (rendered bean, requested route, include), cap 0.30
+      - Dependents: 0.05 per distinct other file that includes, requests,
+        references or imports it, capped at 0.20
+      - Security sensitivity: 0.20 if the file name matches a security
+        keyword (not for stylesheets)
+      - Change frequency (opt-in): as in :func:`compute_risk_score`
+    """
+    score = 0.0
+    flow_criticalities = store.get_flow_criticalities_for_node(file_node.id)
+    if flow_criticalities:
+        score += min(sum(flow_criticalities), 0.25)
+    else:
+        score += min(store.count_flow_memberships(file_node.id) * 0.05, 0.25)
+
+    score += min(len({e.target_qualified for e in outgoing}) * 0.10, 0.30)
+    score += min(len({e.file_path for e in incoming}) * 0.05, 0.20)
+
+    base_name = Path(file_node.file_path).name.lower()
+    if (file_node.language or "") not in _STYLE_LANGUAGES and any(
+        kw in base_name for kw in _SECURITY_KEYWORDS
+    ):
+        score += 0.20
+
+    if churn_counts and file_node.file_path:
+        commit_count = churn_counts.get(file_node.file_path, 0)
         score += min(commit_count / _CHURN_SATURATION, 1.0) * _CHURN_WEIGHT
 
     return round(min(max(score, 0.0), 1.0), 4)
@@ -415,7 +515,11 @@ def analyze_changes(
 
     Returns:
         Dict with ``summary``, ``risk_score``, ``changed_functions``,
-        ``affected_flows``, ``test_gaps``, and ``review_priorities``.
+        ``affected_flows``, ``test_gaps``, ``review_priorities`` and
+        ``cross_stack_links``. A web file (JSP, HTML, JS, CSS) whose change
+        touches no function or selector is scored as a ``File`` entry in
+        ``changed_functions``; ``cross_stack_links`` lists the edges that
+        connect it to the rest of the stack.
     """
     # Compute changed ranges if not provided.
     if changed_ranges is None and repo_root is not None:
@@ -485,6 +589,35 @@ def analyze_changes(
             "risk_score": risk,
         })
 
+    # Web files whose change touched only the File node: a JSP edit has no
+    # function to score, but reaches the beans it renders and the pages
+    # that include it.
+    files_with_symbols = {n.file_path for n in changed_funcs}
+    cross_stack_links: list[dict[str, Any]] = []
+    web_file_count = 0
+    for node in changed_nodes:
+        if (
+            node.kind != "File"
+            or (node.language or "") not in _WEB_LANGUAGES
+            or node.file_path in files_with_symbols
+        ):
+            continue
+        outgoing, incoming = file_links(store, node)
+        risk = compute_web_file_risk(store, node, outgoing, incoming, churn_counts)
+        node_risks.append({**node_to_dict(node), "risk_score": risk})
+        web_file_count += 1
+        for direction, edges in (("outgoing", outgoing), ("incoming", incoming)):
+            for e in edges:
+                cross_stack_links.append({
+                    "file": node.file_path,
+                    "direction": direction,
+                    "kind": e.kind,
+                    "source": _sanitize_name(e.source_qualified),
+                    "target": _sanitize_name(e.target_qualified),
+                })
+    links_total = len(cross_stack_links)
+    cross_stack_links = cross_stack_links[:_MAX_CROSS_STACK_LINKS]
+
     # Overall risk score: max of individual risks, or 0.
     overall_risk = max((nr["risk_score"] for nr in node_risks), default=0.0)
 
@@ -494,7 +627,7 @@ def analyze_changes(
     # Detect test gaps: changed functions without TESTED_BY edges.
     test_gaps: list[dict[str, Any]] = []
     for node in changed_funcs:
-        if node.is_test:
+        if node.is_test or is_css_selector(node):
             continue
         if node.name in _TEST_GAP_EXEMPT_NAMES:
             continue
@@ -518,6 +651,13 @@ def analyze_changes(
     summary_parts = [
         f"Analyzed {len(changed_files)} changed file(s):",
         f"  - {len(changed_funcs)} changed function(s)/class(es)",
+    ]
+    if web_file_count:
+        summary_parts.append(
+            f"  - {web_file_count} changed web file(s) scored from "
+            f"{links_total} cross-stack link(s)"
+        )
+    summary_parts += [
         f"  - {affected['total']} affected flow(s)",
         f"  - {len(test_gaps)} test gap(s)",
         f"  - Overall risk score: {overall_risk:.2f}",
@@ -555,4 +695,6 @@ def analyze_changes(
         "test_gaps": test_gaps,
         "review_priorities": review_priorities,
         "functions_truncated": funcs_truncated,
+        "cross_stack_links": cross_stack_links,
+        "cross_stack_links_total": links_total,
     }
