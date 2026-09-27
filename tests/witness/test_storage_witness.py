@@ -9,8 +9,6 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
-
 from .conftest import build, copy_fixture
 
 # Child writer A: a slow first file store keeps SQLite's write lock for longer
@@ -45,7 +43,6 @@ def _child_env(tmp_path: Path) -> dict[str, str]:
     return env
 
 
-@pytest.mark.xfail(strict=True, reason="W1/W2a: two writers collide on 'database is locked'")
 def test_two_writer_processes_do_not_hit_database_locked(fixture_repo: Path, tmp_path: Path):
     build(fixture_repo, postprocess="none")
     marker = tmp_path / "writer-a-holding"

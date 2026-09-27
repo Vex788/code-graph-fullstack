@@ -11,19 +11,25 @@ endpoint cannot be driven cross-origin (e.g. via DNS rebinding); see
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
 from typing_extensions import TypedDict  # pydantic rejects typing.TypedDict below 3.12
 
 from . import incremental as _incremental
 from .cli import _get_version
+from .constants import env_float, env_int
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
+from .jobs import DEFAULT_WAIT_SECONDS, build_job_status, run_build_job
+from .migrations import SchemaMigrationPending, SchemaTooNewError
 from .prompts import (
     Message,
     architecture_map_prompt,
@@ -35,7 +41,6 @@ from .prompts import (
 from .tools import (
     apply_refactor_func,
     batch_query,
-    build_or_update_graph,
     coverage_report,
     cross_repo_search_func,
     detect_changes_func,
@@ -67,6 +72,7 @@ from .tools import (
     traverse_graph_func,
     with_provenance,
 )
+from .tools._common import _resolve_root, building_response, schema_error_response
 from .tools.navigation import common_callers_of, orient, shortest_path_between
 
 logger = logging.getLogger(__name__)
@@ -111,6 +117,40 @@ mcp = FastMCP(
 )
 
 
+def _schema_error_payload(exc: BaseException) -> Optional[dict]:
+    """Contract shape for a schema exception anywhere in *exc*'s chain."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SchemaTooNewError):
+            return schema_error_response(current)
+        if isinstance(current, SchemaMigrationPending):
+            return building_response()
+        current = current.__cause__ or current.__context__
+    return None
+
+
+class _SchemaStateMiddleware(Middleware):
+    """Tools that open the graph answer ``building`` or ``schema_too_new``
+    instead of failing when the schema is mid-migration or too new."""
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except Exception as exc:
+            payload = _schema_error_payload(exc)
+            if payload is None:
+                raise
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(payload))],
+                structured_content=payload,
+            )
+
+
+mcp.add_middleware(_SchemaStateMiddleware())
+
+
 @mcp.tool()
 async def build_or_update_graph_tool(
     full_rebuild: bool = False,
@@ -121,6 +161,7 @@ async def build_or_update_graph_tool(
     embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
     status_only: bool = False,
+    wait_seconds: Optional[float] = None,
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -128,12 +169,12 @@ async def build_or_update_graph_tool(
     By default performs an incremental update (only changed files).
     Set full_rebuild=True to re-parse every file.
 
-    Runs the blocking full_build / incremental_update work in a thread
-    via ``asyncio.to_thread`` so the stdio event loop stays responsive.
-    Without this wrapper, long builds deadlocked on Windows because
-    ``ProcessPoolExecutor`` (used by parallel parsing) interacted badly
-    with the sync handler blocking the only event-loop thread. See:
-    #46, #136.
+    The build runs as a background job (a ``code-review-graph build|update``
+    subprocess, one per repository), never inside the server. The call waits
+    up to ``wait_seconds`` for it; a longer build answers ``status:
+    building`` with a ``job_id``, and a repeat call joins the running job.
+    The wait runs in a thread via ``asyncio.to_thread`` so the stdio event
+    loop stays responsive (#46, #136).
 
     Args:
         full_rebuild: If True, re-parse all files. Default: False (incremental).
@@ -150,19 +191,41 @@ async def build_or_update_graph_tool(
             refresh. Must be supplied with embedding_model. Default: disabled.
         embedding_model: Exact model for an explicit post-build embedding
             refresh. Must be supplied with embedding_provider. Default: disabled.
-        status_only: If True, report the background build job for this root
-            without building. Default: False.
+        status_only: If True, report the build job for this root (progress
+            while running, the result or error once finished) without
+            starting one. Default: False.
+        wait_seconds: How long to wait for the job before answering
+            ``building``. Default: CRG_BUILD_WAIT_SECONDS, else 25.
     """
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(build_or_update_graph(
-            full_rebuild=full_rebuild, repo_root=root, base=base,
-            postprocess=postprocess, recurse_submodules=recurse_submodules,
-            embedding_provider=embedding_provider,
-            embedding_model=embedding_model,
-            status_only=status_only,
-        ), root)
+        try:
+            resolved = str(_resolve_root(root))
+        except ValueError as exc:
+            return {
+                "status": "error", "error_code": "invalid_repo_root",
+                "message": str(exc), "error": str(exc), "summary": str(exc),
+            }
+        if status_only:
+            return with_provenance(build_job_status(resolved), resolved)
+        wait = (
+            wait_seconds if wait_seconds is not None
+            else env_float("CRG_BUILD_WAIT_SECONDS", DEFAULT_WAIT_SECONDS)
+        )
+        try:
+            result = run_build_job(
+                resolved, full_rebuild=full_rebuild, base=base,
+                postprocess=postprocess, recurse_submodules=recurse_submodules,
+                embedding_provider=embedding_provider,
+                embedding_model=embedding_model, wait_seconds=wait,
+            )
+        except ValueError as exc:
+            return {
+                "status": "error", "error_code": "invalid_argument",
+                "message": str(exc), "error": str(exc), "summary": str(exc),
+            }
+        return with_provenance(result, resolved)
 
     return await asyncio.to_thread(_run)
 
@@ -810,7 +873,7 @@ async def detect_changes_tool(
         ), root)
 
     coro = asyncio.to_thread(_run)
-    tool_timeout = int(os.environ.get("CRG_TOOL_TIMEOUT", "0"))
+    tool_timeout = env_int("CRG_TOOL_TIMEOUT", 0)
     if tool_timeout > 0:
         try:
             return await asyncio.wait_for(coro, timeout=tool_timeout)

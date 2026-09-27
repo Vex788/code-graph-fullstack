@@ -126,9 +126,12 @@ STATUS_JSON_SCHEMA: dict[str, Any] = {
         "svn_branch": _NULLABLE_STRING,
         "svn_revision": _NULLABLE_STRING,
         "readiness": READINESS_SCHEMA,
-        "schema_version": {"type": "integer"},
+        "repo_root": {"type": "string"},
+        "schema_version": {"type": ["integer", "null"]},
         "index_generation": {"type": ["integer", "null"]},
         "contract_version": {"type": "string"},
+        "failed_files": {"type": "integer", "minimum": 0},
+        "resolver_failures": {"type": "integer", "minimum": 0},
         "source_identity": _SOURCE_IDENTITY_SCHEMA,
     },
 }
@@ -240,6 +243,12 @@ def tool_specs() -> list[dict[str, Any]]:
     return specs
 
 
+def cli_command_specs() -> list[dict[str, Any]]:
+    from .cli import cli_commands
+
+    return cli_commands()
+
+
 def build_contract() -> dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION,
@@ -254,6 +263,7 @@ def build_contract() -> dict[str, Any]:
         "exit_codes": dict(EXIT_CODES),
         "kinds": kinds_as_dict(),
         "tools": tool_specs(),
+        "cli_commands": cli_command_specs(),
         "schemas": SCHEMAS,
     }
 

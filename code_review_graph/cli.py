@@ -39,6 +39,7 @@ if sys.version_info < (3, 10):
     sys.exit(1)
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import logging
@@ -280,8 +281,12 @@ def _match_files_to_forget(
     return sorted(matched)
 
 
-def _handle_init(args: argparse.Namespace) -> None:
-    """Set up MCP config for detected AI coding platforms."""
+def _handle_init(args: argparse.Namespace) -> int:
+    """Set up MCP config for detected AI coding platforms.
+
+    Returns 1 when a settings file was left unchanged (unsafe to rewrite);
+    every other step still runs.
+    """
     from .incremental import ensure_repo_gitignore_excludes_crg, find_repo_root
     from .skills import install_platform_configs
 
@@ -315,7 +320,7 @@ def _handle_init(args: argparse.Namespace) -> None:
     if dry_run:
         print("\n[dry-run] Would ensure .gitignore ignores .code-review-graph/.")
         print("[dry-run] No files were modified.")
-        return
+        return 0
 
     gitignore_state = ensure_repo_gitignore_excludes_crg(repo_root)
     if gitignore_state == "created":
@@ -334,6 +339,7 @@ def _handle_init(args: argparse.Namespace) -> None:
 
     from .skills import (
         PLATFORMS,
+        SettingsNotWrittenError,
         generate_skills,
         inject_instruction_files,
         install_codebuddy_hooks,
@@ -348,6 +354,8 @@ def _handle_init(args: argparse.Namespace) -> None:
         install_opencode_plugin,
         install_qoder_skills,
     )
+
+    exit_code = 0
 
     if not skip_skills:
         # Claude Code skills are only relevant for Claude (or full install).
@@ -410,19 +418,29 @@ def _handle_init(args: argparse.Namespace) -> None:
         try:
             codebuddy_settings = install_codebuddy_hooks(repo_root)
             print(f"Installed CodeBuddy hooks in {codebuddy_settings}")
+        except SettingsNotWrittenError as exc:
+            print(exc.render(), file=sys.stderr)
+            exit_code = 1
         except Exception as exc:
             logger.warning("Could not install CodeBuddy hooks: %s", exc)
     if not skip_hooks and target in ("codex", "all"):
-        hooks_path = install_codex_hooks(repo_root)
-        print(f"Installed Codex hooks in {hooks_path}")
+        try:
+            hooks_path = install_codex_hooks(repo_root)
+            print(f"Installed Codex hooks in {hooks_path}")
+        except SettingsNotWrittenError as exc:
+            print(exc.render(), file=sys.stderr)
+            exit_code = 1
         git_hook = install_git_hook(repo_root)
         if git_hook:
             print(f"Installed git pre-commit hook in {git_hook}")
     if not skip_hooks and target in ("claude", "qoder", "all"):
         platforms_to_install = [target] if target != "all" else ["claude", "qoder"]
         for plat in platforms_to_install:
-            install_hooks(repo_root, platform=plat)
-            print(f"Installed hooks in {repo_root / f'.{plat}' / 'settings.json'}")
+            # 1: left unchanged; the reason and patch are already on stderr.
+            if install_hooks(repo_root, platform=plat) == 0:
+                print(f"Installed hooks in {repo_root / f'.{plat}' / 'settings.json'}")
+            else:
+                exit_code = 1
         git_hook = install_git_hook(repo_root)
         if git_hook:
             print(f"Installed git pre-commit hook in {git_hook}")
@@ -432,6 +450,9 @@ def _handle_init(args: argparse.Namespace) -> None:
         try:
             hooks_path = install_cursor_hooks()
             print(f"Installed Cursor hooks in {hooks_path}")
+        except SettingsNotWrittenError as exc:
+            print(exc.render(), file=sys.stderr)
+            exit_code = 1
         except Exception as exc:
             logger.warning("Could not install Cursor hooks: %s", exc)
 
@@ -439,6 +460,9 @@ def _handle_init(args: argparse.Namespace) -> None:
         try:
             gemini_settings = install_gemini_cli_hooks(repo_root)
             print(f"Installed Gemini CLI hooks in {gemini_settings}")
+        except SettingsNotWrittenError as exc:
+            print(exc.render(), file=sys.stderr)
+            exit_code = 1
         except Exception as exc:
             logger.warning("Could not install Gemini CLI hooks: %s", exc)
 
@@ -454,6 +478,7 @@ def _handle_init(args: argparse.Namespace) -> None:
     print("Next steps:")
     print("  1. code-review-graph build    # build the knowledge graph")
     print("  2. Restart your AI coding tool to pick up the new config")
+    return exit_code
 
 
 def _handle_data_dir_option(args, repo_root: Path) -> None:
@@ -538,6 +563,150 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+# CLI writers wait this long for the graph writer lock unless told otherwise.
+_DEFAULT_LOCK_WAIT_SECONDS = 120.0
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not parsed >= 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def _add_lock_args(command) -> None:
+    """``--if-locked`` / ``--lock-wait`` for commands that write the graph."""
+    command.add_argument(
+        "--if-locked",
+        choices=("skip", "wait", "fail"),
+        default="wait",
+        help="When another writer holds the graph lock: skip (exit 75, silent), "
+             "wait up to --lock-wait seconds, or fail at once (exit 75). Default: wait",
+    )
+    command.add_argument(
+        "--lock-wait",
+        type=_non_negative_float,
+        default=_DEFAULT_LOCK_WAIT_SECONDS,
+        metavar="SECONDS",
+        help=f"Seconds to wait for the writer lock (default {_DEFAULT_LOCK_WAIT_SECONDS:g})",
+    )
+
+
+def _enter_writer_lock(stack: contextlib.ExitStack, args, db_path: Path) -> None:
+    """Hold the writer lock for the whole command, per ``--if-locked``.
+
+    Inner code that locks again nests re-entrantly (same thread or an
+    inherited ``CRG_WRITER_LOCK_TOKEN``).
+    """
+    from .locking import EXIT_LOCK_BUSY, LockBusyError, writer_lock
+
+    mode = getattr(args, "if_locked", "wait")
+    wait = getattr(args, "lock_wait", _DEFAULT_LOCK_WAIT_SECONDS) if mode == "wait" else 0.0
+    try:
+        stack.enter_context(writer_lock(db_path, wait=wait))
+    except LockBusyError as exc:
+        if mode != "skip":
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(EXIT_LOCK_BUSY) from None
+
+
+def _is_rebuild_required(result: dict) -> bool:
+    return result.get("status") == "rebuild_required" or result.get("rebuild_required") is True
+
+
+def _exit_rebuild_required(result: dict, progress) -> None:
+    """The graph cannot be updated incrementally; exit 4 (rebuild_required)."""
+    from .locking import EXIT_REBUILD_REQUIRED
+
+    message = result.get("summary") or result.get("message") or (
+        "The graph needs a full rebuild: run `code-review-graph build`."
+    )
+    if progress is not None:
+        progress.update(
+            status="rebuild_required", exit_code=EXIT_REBUILD_REQUIRED, result=result,
+            message=str(message)[:2000],
+        )
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(EXIT_REBUILD_REQUIRED)
+
+
+def _open_store_or_exit(args, db_path: Path):
+    """Open the graph, mapping schema errors to the contract error shape."""
+    from .graph import GraphStore
+    from .locking import EXIT_ERROR, EXIT_LOCK_BUSY
+    from .migrations import SchemaMigrationPending, SchemaTooNewError
+
+    try:
+        return GraphStore(db_path)
+    except (SchemaTooNewError, SchemaMigrationPending) as exc:
+        too_new = isinstance(exc, SchemaTooNewError)
+        code = "schema_too_new" if too_new else "schema_migration_pending"
+        if getattr(args, "json_output", False):
+            print(json.dumps({"status": "error", "error_code": code, "message": str(exc)}))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(EXIT_ERROR if too_new else EXIT_LOCK_BUSY) from None
+
+
+def _run_locked_command(args) -> int:
+    """``lock -- CMD``: run CMD holding the writer lock, token exported."""
+    from .incremental import find_project_root, get_db_path
+    from .locking import EXIT_LOCK_BUSY, EXIT_USAGE, LockBusyError, writer_lock
+
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print("usage: code-review-graph lock [--wait N] -- <command...>", file=sys.stderr)
+        return EXIT_USAGE
+    repo_root = Path(args.repo) if args.repo else find_project_root()
+    db_path = get_db_path(repo_root)
+    import subprocess
+
+    try:
+        with writer_lock(db_path, wait=args.wait):
+            # writer_lock exported CRG_WRITER_LOCK_TOKEN; the child inherits it.
+            try:
+                return subprocess.run(cmd, check=False).returncode  # nosec B603
+            except OSError as exc:
+                print(f"Error: cannot run {cmd[0]}: {exc}", file=sys.stderr)
+                return 127
+    except LockBusyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_LOCK_BUSY
+
+
+def _run_clone_graph(args) -> int:
+    from .clone_graph import clone_graph
+    from .locking import EXIT_ERROR, EXIT_LOCK_BUSY, LockBusyError
+
+    try:
+        result = clone_graph(
+            args.source, args.target, seed_root=args.seed_root, force=args.force,
+            update=not args.no_update, lock_wait=args.lock_wait,
+        )
+    except LockBusyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_LOCK_BUSY
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json_output:
+        print(json.dumps(result, default=str))
+        return 0
+    print(
+        f"Cloned graph {result['seed_db']} -> {result['target_db']} "
+        f"({result['fts_rows']} FTS rows)"
+    )
+    update = result.get("update")
+    if update:
+        print(update.get("summary", "Update done."))
+    return 0
+
+
 _GRAPH_TOOL_COMMANDS = {
     "query",
     "impact",
@@ -570,6 +739,7 @@ _PATH_REPO_COMMANDS = frozenset({
     "coverage",
     "serve",
     "mcp",
+    "lock",
     *_GRAPH_TOOL_COMMANDS,
 })
 
@@ -689,9 +859,8 @@ def _run_graph_tool_command(args, repo_root: Path) -> None:
     print(json.dumps(result, indent=2, default=str))
 
 
-def main() -> None:
-    """Main CLI entry point."""
-    _configure_utf8_stdio()
+def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    """The CLI parser, plus the sub-parsers ``main`` reports usage errors on."""
     ap = argparse.ArgumentParser(
         prog="code-review-graph",
         description="Persistent incremental knowledge graph for code reviews",
@@ -836,6 +1005,11 @@ def main() -> None:
         action="store_true",
         help="Skip all post-processing (raw parse only)",
     )
+    _add_lock_args(build_cmd)
+    build_cmd.add_argument(
+        "--progress-file", default=None, metavar="PATH",
+        help="Write JSON progress and the final result to PATH (the MCP build job reads it)",
+    )
     build_cmd.add_argument(
         "--data-dir",
         default=None,
@@ -881,6 +1055,11 @@ def main() -> None:
              "second row to the panel with the real token counts. Requires "
              "`pip install tiktoken`.",
     )
+    _add_lock_args(update_cmd)
+    update_cmd.add_argument(
+        "--progress-file", default=None, metavar="PATH",
+        help="Write JSON progress and the final result to PATH (the MCP build job reads it)",
+    )
     update_cmd.add_argument(
         "--data-dir",
         default=None,
@@ -898,6 +1077,7 @@ def main() -> None:
     pp_cmd.add_argument("--no-flows", action="store_true", help="Skip flow detection")
     pp_cmd.add_argument("--no-communities", action="store_true", help="Skip community detection")
     pp_cmd.add_argument("--no-fts", action="store_true", help="Skip FTS rebuild")
+    _add_lock_args(pp_cmd)
     pp_cmd.add_argument(
         "--data-dir",
         default=None,
@@ -924,6 +1104,7 @@ def main() -> None:
         help="Embedding model. For local: HuggingFace ID (default all-MiniLM-L6-v2); "
              "for openai/google/minimax/voyage: provider-specific model ID.",
     )
+    _add_lock_args(embed_cmd)
     embed_cmd.add_argument(
         "--data-dir",
         default=None,
@@ -1271,6 +1452,56 @@ def main() -> None:
     refactor_cmd.add_argument("--path", default=None, help="File-path substring filter")
     refactor_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
+    # contract / lock / clone-graph
+    contract_cmd = sub.add_parser(
+        "contract", help="Print the machine-readable consumer contract (JSON)",
+    )
+    contract_cmd.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output JSON (the only format; accepted for symmetry)",
+    )
+
+    lock_cmd = sub.add_parser(
+        "lock",
+        help="Run a command while holding the graph writer lock "
+             "(exports CRG_WRITER_LOCK_TOKEN to it)",
+    )
+    lock_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    lock_cmd.add_argument(
+        "--wait", type=_non_negative_float, default=_DEFAULT_LOCK_WAIT_SECONDS,
+        metavar="SECONDS",
+        help=f"Seconds to wait for the lock (default {_DEFAULT_LOCK_WAIT_SECONDS:g}); "
+             "exit 75 when it stays busy",
+    )
+    lock_cmd.add_argument("cmd", nargs=argparse.REMAINDER, help="-- command [args...]")
+
+    clone_cmd = sub.add_parser(
+        "clone-graph",
+        help="Seed a checkout's graph from another checkout's graph (re-rooted, FTS rebuilt)",
+    )
+    clone_cmd.add_argument(
+        "--from", dest="source", required=True,
+        help="Seed repository root, or a graph.db path",
+    )
+    clone_cmd.add_argument("--to", dest="target", required=True, help="Target checkout root")
+    clone_cmd.add_argument(
+        "--seed-root", default=None,
+        help="Seed repository root when --from is a graph.db outside <root>/.code-review-graph",
+    )
+    clone_cmd.add_argument(
+        "--force", action="store_true", help="Replace an existing graph at the target",
+    )
+    clone_cmd.add_argument(
+        "--no-update", action="store_true",
+        help="Skip the incremental update from the seed's build commit",
+    )
+    clone_cmd.add_argument(
+        "--lock-wait", type=_non_negative_float, default=_DEFAULT_LOCK_WAIT_SECONDS,
+        metavar="SECONDS", help="Seconds to wait for the target's writer lock",
+    )
+    clone_cmd.add_argument("--json", action="store_true", dest="json_output",
+                           help="Print the result as JSON")
+
     # serve / mcp
     serve_cmd = sub.add_parser(
         "serve",
@@ -1393,6 +1624,40 @@ def main() -> None:
         help="Repository path or alias to remove",
     )
 
+    _register_harness(sub)
+    return ap, {"refactor": refactor_cmd, "serve": serve_cmd, "daemon": daemon_cmd}
+
+
+def _register_harness(sub) -> None:
+    """Add the graph-kit ``harness`` commands when that package is installed."""
+    try:
+        from .harness.cli import register
+    except ImportError:
+        return
+    register(sub)
+
+
+def cli_commands() -> list[dict[str, object]]:
+    """Top-level commands and their options, for the contract."""
+    ap, _ = build_parser()
+    commands: list[dict[str, object]] = []
+    for action in ap._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        helps = {choice.dest: choice.help for choice in action._choices_actions}
+        for name, parser in sorted(action.choices.items()):
+            options = sorted(
+                opt for sub_action in parser._actions for opt in sub_action.option_strings
+                if opt.startswith("--") and opt != "--help"
+            )
+            commands.append({"name": name, "help": helps.get(name) or "", "options": options})
+    return commands
+
+
+def main() -> None:
+    """Main CLI entry point."""
+    _configure_utf8_stdio()
+    ap, parsers = build_parser()
     args = ap.parse_args()
 
     if args.version:
@@ -1410,13 +1675,29 @@ def main() -> None:
         and args.mode == "rename"
         and (not args.old_name or not args.new_name)
     ):
-        refactor_cmd.error("rename requires --old-name and --new-name")
+        parsers["refactor"].error("rename requires --old-name and --new-name")
 
     if args.command == "enrich":
         from .enrich import run_hook
 
         run_hook()
         return
+
+    if args.command == "contract":
+        from .contract import render_contract_json
+
+        sys.stdout.write(render_contract_json())
+        return
+
+    if args.command == "lock":
+        sys.exit(_run_locked_command(args))
+
+    if args.command == "clone-graph":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+        sys.exit(_run_clone_graph(args))
+
+    if args.command == "harness":
+        sys.exit(args.harness_run(args))
 
     if args.command in _GRAPH_TOOL_COMMANDS:
         from .incremental import find_project_root, get_db_path
@@ -1455,9 +1736,9 @@ def main() -> None:
         auto_watch = getattr(args, "auto_watch", False)
         if args.command == "serve":
             if args.port is not None and not args.http:
-                serve_cmd.error("--port requires --http")
+                parsers["serve"].error("--port requires --http")
             if args.host is not None and not args.http:
-                serve_cmd.error("--host requires --http")
+                parsers["serve"].error("--host requires --http")
             if args.http:
                 host = args.host if args.host is not None else "127.0.0.1"
                 port = args.port if args.port is not None else 5555
@@ -1477,7 +1758,7 @@ def main() -> None:
 
     if args.command == "daemon":
         if not args.daemon_command:
-            daemon_cmd.print_help()
+            parsers["daemon"].print_help()
             return
         from .daemon_cli import (
             _handle_add,
@@ -1610,7 +1891,9 @@ def main() -> None:
         return
 
     if args.command in ("init", "install"):
-        _handle_init(args)
+        code = _handle_init(args)
+        if code:
+            sys.exit(code)
         return
 
     if args.command in ("register", "unregister", "repos"):
@@ -1655,7 +1938,6 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    from .graph import GraphStore
     from .incremental import (
         find_project_root,
         find_repo_root,
@@ -1667,8 +1949,10 @@ def main() -> None:
         repo_root = Path(args.repo) if args.repo else find_project_root()
         _handle_data_dir_option(args, repo_root)
         db_path = get_db_path(repo_root)
-        store = GraphStore(db_path)
-        try:
+        with contextlib.ExitStack() as pp_lock:
+            _enter_writer_lock(pp_lock, args, db_path)
+            store = _open_store_or_exit(args, db_path)
+            pp_lock.callback(store.close)
             from .tools.build import run_postprocess
 
             result = run_postprocess(
@@ -1686,8 +1970,6 @@ def main() -> None:
             if result.get("fts_indexed"):
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
-        finally:
-            store.close()
         return
 
     if args.command == "embed":
@@ -1695,11 +1977,13 @@ def main() -> None:
         _handle_data_dir_option(args, repo_root)
         from .tools.docs import embed_graph
 
-        result = embed_graph(
-            repo_root=str(repo_root),
-            model=args.model,
-            provider=args.provider,
-        )
+        with contextlib.ExitStack() as embed_lock:
+            _enter_writer_lock(embed_lock, args, get_db_path(repo_root))
+            result = embed_graph(
+                repo_root=str(repo_root),
+                model=args.model,
+                provider=args.provider,
+            )
         if result.get("status") == "error":
             logging.error(result.get("error", "embed_graph failed"))
             sys.exit(1)
@@ -1778,7 +2062,26 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    store = GraphStore(db_path)
+
+    from .jobs import progress_reporting
+
+    # Held until the command returns; progress records its outcome.
+    command_stack = contextlib.ExitStack()
+    progress = None
+    try:
+        if args.command in ("build", "update"):
+            progress = command_stack.enter_context(
+                progress_reporting(getattr(args, "progress_file", None), args.command),
+            )
+            if progress is not None:
+                progress.update(phase="waiting_for_lock")
+            _enter_writer_lock(command_stack, args, db_path)
+            if progress is not None:
+                progress.update(phase="building")
+        store = _open_store_or_exit(args, db_path)
+    except BaseException:
+        if not command_stack.__exit__(*sys.exc_info()):
+            raise
 
     try:
         if args.command == "dead-code":
@@ -1823,6 +2126,10 @@ def main() -> None:
                 )
             finally:
                 logging.disable(previous_disable)
+            if _is_rebuild_required(result):
+                _exit_rebuild_required(result, progress)
+            if progress is not None:
+                progress.update(status="ok", exit_code=0, phase="done", result=result)
             parsed = result.get("files_parsed", 0)
             nodes = result.get("total_nodes", 0)
             edges = result.get("total_edges", 0)
@@ -1854,10 +2161,16 @@ def main() -> None:
                     **embedding_refresh_kwargs,
                 )
             except RuntimeError as exc:
+                if progress is not None:
+                    progress.update(message=str(exc)[:2000])
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
             finally:
                 logging.disable(previous_disable)
+            if _is_rebuild_required(result):
+                _exit_rebuild_required(result, progress)
+            if progress is not None:
+                progress.update(status="ok", exit_code=0, phase="done", result=result)
             nodes = result.get("total_nodes", 0)
             edges = result.get("total_edges", 0)
             if not args.quiet:
@@ -1951,6 +2264,10 @@ def main() -> None:
             stored_rev = store.get_metadata("svn_revision")
 
             if args.json_output:
+                from .contract import CONTRACT_VERSION
+                from .readiness_facts import gather_report
+
+                readiness_report = gather_report(repo_root, db_path)
                 print(json.dumps({
                     "nodes": stats.total_nodes,
                     "edges": stats.total_edges,
@@ -1964,6 +2281,14 @@ def main() -> None:
                     "current_sha": current_sha,
                     "svn_branch": stored_svn_branch,
                     "svn_revision": stored_rev,
+                    "repo_root": str(repo_root),
+                    "contract_version": CONTRACT_VERSION,
+                    "schema_version": readiness_report.schema_version,
+                    "index_generation": readiness_report.facts.index_generation,
+                    "readiness": readiness_report.readiness.to_dict(),
+                    "failed_files": readiness_report.facts.failed_files,
+                    "resolver_failures": readiness_report.facts.resolver_failures,
+                    "source_identity": readiness_report.source_identity,
                 }))
             elif not args.quiet:
                 print(f"Nodes: {stats.total_nodes}")
@@ -1986,6 +2311,11 @@ def main() -> None:
                         print(f"SVN branch: {stored_svn_branch}")
                     if stored_rev:
                         print(f"SVN revision at build: {stored_rev}")
+                from .readiness_facts import gather_report
+
+                readiness = gather_report(repo_root, db_path).readiness
+                reasons = f" ({', '.join(readiness.reasons)})" if readiness.reasons else ""
+                print(f"Readiness: {readiness.status.value}{reasons}")
 
         elif args.command == "coverage":
             from .tools.coverage import coverage_report, format_coverage_text
@@ -2194,5 +2524,10 @@ def main() -> None:
                 else:
                     print(json.dumps(result, indent=2, default=str))
 
-    finally:
+    except BaseException:
         store.close()
+        if not command_stack.__exit__(*sys.exc_info()):
+            raise
+    else:
+        store.close()
+        command_stack.close()

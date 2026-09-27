@@ -85,14 +85,18 @@ def test_serve_ignores_non_project_cwd_as_default_root(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_build_tool_passes_status_only(monkeypatch):
+async def test_build_tool_status_only_reads_the_job_without_starting_one(monkeypatch):
     calls = []
 
-    def fake_build(**kwargs):
-        calls.append(kwargs)
+    def fake_status(root):
+        calls.append(root)
         return {"status": "idle"}
 
-    monkeypatch.setattr(crg_main, "build_or_update_graph", fake_build)
+    def no_build(*args, **kwargs):
+        raise AssertionError("status_only must not start a build")
+
+    monkeypatch.setattr(crg_main, "build_job_status", fake_status)
+    monkeypatch.setattr(crg_main, "run_build_job", no_build)
     monkeypatch.setattr(crg_main, "with_provenance", lambda result, root=None: result)
     tool = getattr(crg_main.build_or_update_graph_tool, "fn", None)
     underlying = tool or crg_main.build_or_update_graph_tool
@@ -100,7 +104,7 @@ async def test_build_tool_passes_status_only(monkeypatch):
     result = await underlying(status_only=True)
 
     assert result == {"status": "idle"}
-    assert calls[0]["status_only"] is True
+    assert len(calls) == 1
 
 
 def test_docs_wrapper_falls_back_to_packaged_docs_with_resolved_repo(
@@ -205,7 +209,7 @@ class TestLongRunningToolsAreAsync:
     }
 
     HEAVY_TOOL_IMPLS = {
-        "build_or_update_graph_tool": "build_or_update_graph",
+        "build_or_update_graph_tool": "run_build_job",
         "run_postprocess_tool": "run_postprocess",
         "embed_graph_tool": "embed_graph",
         "detect_changes_tool": "detect_changes_func",

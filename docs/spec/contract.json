@@ -493,6 +493,12 @@
           "type": "boolean",
           "required": false,
           "default": false
+        },
+        {
+          "name": "wait_seconds",
+          "type": "number|null",
+          "required": false,
+          "default": null
         }
       ]
     },
@@ -1468,6 +1474,385 @@
       ]
     }
   ],
+  "cli_commands": [
+    {
+      "name": "architecture",
+      "help": "Show architecture overview",
+      "options": [
+        "--detail-level",
+        "--repo"
+      ]
+    },
+    {
+      "name": "build",
+      "help": "Full graph build (re-parse all files)",
+      "options": [
+        "--data-dir",
+        "--embedding-model",
+        "--embedding-provider",
+        "--if-locked",
+        "--lock-wait",
+        "--progress-file",
+        "--quiet",
+        "--repo",
+        "--skip-flows",
+        "--skip-postprocess"
+      ]
+    },
+    {
+      "name": "clone-graph",
+      "help": "Seed a checkout's graph from another checkout's graph (re-rooted, FTS rebuilt)",
+      "options": [
+        "--force",
+        "--from",
+        "--json",
+        "--lock-wait",
+        "--no-update",
+        "--seed-root",
+        "--to"
+      ]
+    },
+    {
+      "name": "communities",
+      "help": "List graph communities",
+      "options": [
+        "--min-size",
+        "--repo",
+        "--sort"
+      ]
+    },
+    {
+      "name": "community",
+      "help": "Show one graph community",
+      "options": [
+        "--id",
+        "--members",
+        "--name",
+        "--repo"
+      ]
+    },
+    {
+      "name": "contract",
+      "help": "Print the machine-readable consumer contract (JSON)",
+      "options": [
+        "--json"
+      ]
+    },
+    {
+      "name": "coverage",
+      "help": "Disk-vs-graph completeness report (missing, stale, excluded files)",
+      "options": [
+        "--json",
+        "--no-fail"
+      ]
+    },
+    {
+      "name": "daemon",
+      "help": "Multi-repo watch daemon (start/stop/status/add/remove)",
+      "options": []
+    },
+    {
+      "name": "dead-code",
+      "help": "Find functions/classes with no callers or test references",
+      "options": [
+        "--data-dir",
+        "--file-pattern",
+        "--json",
+        "--kind",
+        "--limit",
+        "--repo"
+      ]
+    },
+    {
+      "name": "detect-changes",
+      "help": "Analyze change impact against the existing graph (read-only). Does NOT re-parse files \u2014 for that, use 'update --brief'.",
+      "options": [
+        "--base",
+        "--brief",
+        "--churn",
+        "--repo",
+        "--verify"
+      ]
+    },
+    {
+      "name": "embed",
+      "help": "Compute vector embeddings for semantic search",
+      "options": [
+        "--data-dir",
+        "--if-locked",
+        "--lock-wait",
+        "--model",
+        "--provider",
+        "--repo"
+      ]
+    },
+    {
+      "name": "enrich",
+      "help": "Enrich hook input with graph context",
+      "options": []
+    },
+    {
+      "name": "eval",
+      "help": "Run evaluation benchmarks",
+      "options": [
+        "--all",
+        "--benchmark",
+        "--embed",
+        "--embed-model",
+        "--embed-provider",
+        "--output-dir",
+        "--repo",
+        "--report"
+      ]
+    },
+    {
+      "name": "flow",
+      "help": "Show one stored execution flow",
+      "options": [
+        "--id",
+        "--name",
+        "--repo",
+        "--source"
+      ]
+    },
+    {
+      "name": "flows",
+      "help": "List stored execution flows",
+      "options": [
+        "--kind",
+        "--limit",
+        "--repo",
+        "--sort"
+      ]
+    },
+    {
+      "name": "forget",
+      "help": "Remove already-parsed files from the graph without a full rebuild",
+      "options": [
+        "--data-dir",
+        "--dry-run",
+        "--repo"
+      ]
+    },
+    {
+      "name": "harness",
+      "help": "Graph kit files and config fragment",
+      "options": []
+    },
+    {
+      "name": "impact",
+      "help": "Analyze the blast radius of changes",
+      "options": [
+        "--base",
+        "--depth",
+        "--files",
+        "--max-results",
+        "--repo"
+      ]
+    },
+    {
+      "name": "init",
+      "help": "Alias for install",
+      "options": [
+        "--all",
+        "--dry-run",
+        "--hooks",
+        "--no-hooks",
+        "--no-instructions",
+        "--no-skills",
+        "--platform",
+        "--repo",
+        "--skills",
+        "--yes"
+      ]
+    },
+    {
+      "name": "install",
+      "help": "Register MCP server with AI coding platforms",
+      "options": [
+        "--all",
+        "--dry-run",
+        "--hooks",
+        "--no-hooks",
+        "--no-instructions",
+        "--no-skills",
+        "--platform",
+        "--repo",
+        "--skills",
+        "--yes"
+      ]
+    },
+    {
+      "name": "large-functions",
+      "help": "Find oversized graph nodes",
+      "options": [
+        "--kind",
+        "--limit",
+        "--min-lines",
+        "--path",
+        "--repo"
+      ]
+    },
+    {
+      "name": "lock",
+      "help": "Run a command while holding the graph writer lock (exports CRG_WRITER_LOCK_TOKEN to it)",
+      "options": [
+        "--repo",
+        "--wait"
+      ]
+    },
+    {
+      "name": "mcp",
+      "help": "Alias for serve",
+      "options": [
+        "--auto-watch",
+        "--repo"
+      ]
+    },
+    {
+      "name": "postprocess",
+      "help": "Run post-processing on existing graph (flows, communities, FTS)",
+      "options": [
+        "--data-dir",
+        "--embedding-model",
+        "--embedding-provider",
+        "--if-locked",
+        "--lock-wait",
+        "--no-communities",
+        "--no-flows",
+        "--no-fts",
+        "--repo"
+      ]
+    },
+    {
+      "name": "query",
+      "help": "Query graph relationships",
+      "options": [
+        "--repo"
+      ]
+    },
+    {
+      "name": "refactor",
+      "help": "Preview graph-backed refactors",
+      "options": [
+        "--kind",
+        "--new-name",
+        "--old-name",
+        "--path",
+        "--repo"
+      ]
+    },
+    {
+      "name": "register",
+      "help": "Register a repository in the multi-repo registry",
+      "options": [
+        "--alias"
+      ]
+    },
+    {
+      "name": "repos",
+      "help": "List registered repositories",
+      "options": []
+    },
+    {
+      "name": "search",
+      "help": "Search graph entities",
+      "options": [
+        "--kind",
+        "--limit",
+        "--repo"
+      ]
+    },
+    {
+      "name": "serve",
+      "help": "Start MCP server (stdio by default, or HTTP on localhost with --http)",
+      "options": [
+        "--auto-watch",
+        "--host",
+        "--http",
+        "--port",
+        "--repo",
+        "--tools"
+      ]
+    },
+    {
+      "name": "status",
+      "help": "Show graph statistics",
+      "options": [
+        "--data-dir",
+        "--json",
+        "--quiet",
+        "--repo"
+      ]
+    },
+    {
+      "name": "uninstall",
+      "help": "Safely remove code-review-graph data, configs, hooks, and generated skills",
+      "options": [
+        "--all-repos",
+        "--dry-run",
+        "--keep-data",
+        "--keep-user-configs",
+        "--platform",
+        "--repo",
+        "--yes"
+      ]
+    },
+    {
+      "name": "unregister",
+      "help": "Remove a repository from the multi-repo registry",
+      "options": []
+    },
+    {
+      "name": "update",
+      "help": "Incremental update (only changed files)",
+      "options": [
+        "--base",
+        "--brief",
+        "--data-dir",
+        "--embedding-model",
+        "--embedding-provider",
+        "--if-locked",
+        "--lock-wait",
+        "--progress-file",
+        "--quiet",
+        "--repo",
+        "--skip-flows",
+        "--skip-postprocess",
+        "--verify"
+      ]
+    },
+    {
+      "name": "visualize",
+      "help": "Generate interactive HTML graph visualization",
+      "options": [
+        "--data-dir",
+        "--format",
+        "--mode",
+        "--repo",
+        "--serve"
+      ]
+    },
+    {
+      "name": "watch",
+      "help": "Watch for changes and auto-update",
+      "options": [
+        "--data-dir",
+        "--embedding-model",
+        "--embedding-provider",
+        "--repo"
+      ]
+    },
+    {
+      "name": "wiki",
+      "help": "Generate markdown wiki from community structure",
+      "options": [
+        "--data-dir",
+        "--force",
+        "--repo"
+      ]
+    }
+  ],
   "schemas": {
     "error": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1741,8 +2126,14 @@
             }
           }
         },
+        "repo_root": {
+          "type": "string"
+        },
         "schema_version": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "index_generation": {
           "type": [
@@ -1752,6 +2143,14 @@
         },
         "contract_version": {
           "type": "string"
+        },
+        "failed_files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resolver_failures": {
+          "type": "integer",
+          "minimum": 0
         },
         "source_identity": {
           "type": "object",
