@@ -311,8 +311,6 @@ def graph_status(binary: str, root: Path) -> str:
         if doc.get("status") == "error":
             return "unavailable"
         return "ok" if doc.get("files") else "missing_graph"
-    if "No graph found" in (result.stdout + result.stderr):
-        return "missing_graph"
     return "unavailable"
 
 

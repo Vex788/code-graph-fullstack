@@ -326,12 +326,17 @@ def _hook(tmp_path: Path, target: str = "claude") -> Path:
     return hook
 
 
+# What ``status --json`` prints for a root with no graph: JSON, exit 0.
+_MISSING_GRAPH_JSON = (
+    '{"nodes": 0, "files": 0, "last_updated": null, "built_at_commit": null, '
+    '"readiness": {"status": "missing_graph", "embeddings": "off", '
+    '"reasons": ["missing_graph"]}}'
+)
+
+
 def _stub(tmp_path: Path, update_rc: int, status_json: str | None) -> tuple[Path, Path]:
     log = tmp_path / f"calls-{update_rc}.log"
-    status = (
-        f"printf '%s\\n' '{status_json}'; exit 0" if status_json is not None
-        else 'echo "No graph found at x. Run `code-review-graph build` first." >&2; exit 1'
-    )
+    status = f"printf '%s\\n' '{status_json or _MISSING_GRAPH_JSON}'; exit 0"
     stub = tmp_path / f"stub-{update_rc}"
     stub.write_text(
         f'#!/bin/sh\necho "$*" >> "{log}"\n'
@@ -450,6 +455,31 @@ def test_hook_never_builds_a_missing_graph(tmp_path: Path):
     assert calls == [f"status --repo {repo} --json"]  # the second event is short-circuited
     notices = (tmp_path / "logs" / "crg-update.jsonl").read_text(encoding="utf-8")
     assert "crg_update_skipped_missing_graph" in notices
+
+
+def _load_hook(tmp_path: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("crg_update_hook", _hook(tmp_path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@skip_windows
+def test_hook_reads_missing_graph_from_status_json_not_stderr_text(tmp_path: Path):
+    hook = _load_hook(tmp_path)
+    stub, _ = _stub(tmp_path, 0, None)
+    assert hook.graph_status(str(stub), tmp_path) == "missing_graph"
+    text_only = tmp_path / "text-only"
+    text_only.write_text(
+        '#!/bin/sh\necho "No graph found at x. Run `code-review-graph build` first." >&2\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    text_only.chmod(0o755)
+    # Prose is not a contract: only readiness.status from the JSON is.
+    assert hook.graph_status(str(text_only), tmp_path) == "unavailable"
 
 
 @skip_windows
