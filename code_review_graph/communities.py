@@ -799,18 +799,13 @@ def _load_graph(store: GraphStore) -> tuple[list[GraphEdge], list[GraphNode]]:
     conn = store._conn
     cursor = conn.cursor()
     cursor.row_factory = None  # plain tuples sort natively
+    # Detection reads endpoints and kind only; rows equal on those are
+    # interchangeable, so they need no further tie-break.
     rows = cursor.execute(
-        "SELECT source_qualified, target_qualified, kind, COALESCE(line, 0), "
-        "COALESCE(file_path, ''), id FROM edges"
+        "SELECT source_qualified, target_qualified, kind FROM edges"
     ).fetchall()
     rows.sort()
-    edges = [
-        GraphEdge(
-            id=row[5], kind=row[2], source_qualified=row[0], target_qualified=row[1],
-            file_path=row[4], line=row[3], extra={},
-        )
-        for row in rows
-    ]
+    edges = [GraphEdge(0, kind, source, target, "", 0, {}) for source, target, kind in rows]
     nodes = [
         GraphNode(
             id=row[0], kind=row[1], name=row[2], qualified_name=row[3], file_path=row[4],
@@ -846,9 +841,6 @@ def detect_communities(
     # Gather all nodes (exclude File nodes to focus on code entities).
     all_edges, unique_nodes = _load_graph(store)
 
-    # Build adjacency index once for fast cohesion computation
-    adj = _build_adjacency(all_edges)
-
     logger.info(
         "Loaded %d unique nodes, %d edges",
         len(unique_nodes), len(all_edges),
@@ -856,10 +848,10 @@ def detect_communities(
 
     if IGRAPH_AVAILABLE:
         logger.info("Detecting communities with Leiden algorithm (igraph)")
-        results = _detect_leiden(unique_nodes, all_edges, min_size, adj=adj)
+        results = _detect_leiden(unique_nodes, all_edges, min_size)
     else:
         logger.info("igraph not available, using file-based community detection")
-        results = _detect_file_based(unique_nodes, all_edges, min_size, adj=adj)
+        results = _detect_file_based(unique_nodes, all_edges, min_size)
 
     # Split oversized communities
     results = _split_oversized(
