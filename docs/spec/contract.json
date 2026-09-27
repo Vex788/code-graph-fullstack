@@ -2008,6 +2008,10 @@
                 "type": "string"
               }
             },
+            "edited_indexed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
             "check": {
               "enum": [
                 "full",
@@ -2186,6 +2190,10 @@
               "items": {
                 "type": "string"
               }
+            },
+            "edited_indexed_count": {
+              "type": "integer",
+              "minimum": 0
             },
             "check": {
               "enum": [

@@ -177,20 +177,21 @@ def get_minimal_context(
             )
 
         # Commit identity says nothing about uncommitted work. A file the graph
-        # has never seen is the one drift that makes a query answer "no such
-        # symbol", so it blocks; edited-but-indexed files only warn, because
+        # has never seen, or an indexed one that is gone, makes a query lie about
+        # what exists, so it blocks; edited-but-indexed files only warn, because
         # going red there would paint every active editing session red and send
         # agents to grep.
         drift = report.drift or {
             "missing": [], "mismatched": [], "deleted": [], "check": "unavailable",
         }
-        if drift["missing"]:
+        drifted = drift["missing"] + drift["deleted"]
+        if drifted:
             return _not_ready(
                 "stale_worktree",
-                f"{len(drift['missing'])} file(s) on disk have no node in the graph; "
-                "update it before asking what exists.",
-                drifted_files=[_short(root, p) for p in drift["missing"][:10]],
-                drifted_file_count=len(drift["missing"]),
+                f"{len(drifted)} file(s) on disk have no node in the graph or were "
+                "deleted after indexing; update it before asking what exists.",
+                drifted_files=[_short(root, p) for p in drifted[:10]],
+                drifted_file_count=len(drifted),
                 readiness=status_block,
             )
 
@@ -287,7 +288,7 @@ def get_minimal_context(
         )
         # The graph still finds these symbols; their bodies and line numbers may
         # be behind the working tree. A label, not a refusal.
-        edited = drift["mismatched"] + drift["deleted"]
+        edited = drift["mismatched"]
         if edited:
             response["stale_files"] = [_short(root, p) for p in edited[:10]]
             response["stale_file_count"] = len(edited)

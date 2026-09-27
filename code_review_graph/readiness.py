@@ -5,8 +5,8 @@ facts (metadata rows, git state, lock probe); this module does no I/O, so the
 precedence and the ``ok`` invariant are testable exhaustively.
 
 ``ok`` holds exactly when the write epoch is closed, nothing failed, the
-index generation is current, HEAD matches the build and the working tree
-matches the build.
+index generation is current, HEAD matches the build and no file on disk lacks
+a node or indexed file is gone. Edited indexed files are reported, not stale.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class ReadinessFacts:
     git_state: str = GIT_OK
     head_commit: Optional[str] = None
     built_at_commit: Optional[str] = None
-    # None: not checked, so it cannot prove a match.
+    # No missing or deleted indexed files; edits don't count. None: not checked.
     source_matches: Optional[bool] = None
     embeddings_enabled: bool = False
     embeddings_provider_available: bool = True

@@ -114,6 +114,42 @@ def test_untracked_file_is_not_a_source_match(tmp_path):
     assert _gather(repo, db).source_matches is False
 
 
+def test_edited_indexed_file_is_ok_and_reported(tmp_path):
+    """Edited bytes keep every symbol findable: ok, with the file listed."""
+    from code_review_graph.readiness_facts import gather_report
+
+    repo, db = _repo(tmp_path)
+    (repo / "app.py").write_text("def handle():\n    return 2\n", encoding="utf-8")
+    report = gather_report(repo, db)
+    assert report.facts.source_matches is True
+    assert report.readiness.status.value == "ok"
+    identity = report.source_identity
+    assert identity["source_matches_build"] is True
+    assert identity["mismatched_indexed_paths"] == [str(repo / "app.py")]
+    assert identity["edited_indexed_count"] == 1
+
+
+def test_new_untracked_java_file_is_stale_worktree(tmp_path):
+    from code_review_graph.readiness_facts import gather_report
+
+    repo, db = _repo(tmp_path)
+    (repo / "Fresh.java").write_text("class Fresh {}\n", encoding="utf-8")
+    report = gather_report(repo, db)
+    assert report.readiness.status.value == "stale_worktree"
+    assert report.source_identity["missing_indexed_paths"] == [str(repo / "Fresh.java")]
+
+
+def test_deleted_indexed_file_is_stale_worktree(tmp_path):
+    from code_review_graph.readiness_facts import gather_report
+
+    repo, db = _repo(tmp_path)
+    (repo / "app.py").unlink()
+    report = gather_report(repo, db)
+    assert report.readiness.status.value == "stale_worktree"
+    assert report.source_identity["deleted_indexed_paths"] == [str(repo / "app.py")]
+    assert report.source_identity["source_matches_build"] is False
+
+
 def test_git_timeout_is_unavailable_never_clean(tmp_path, monkeypatch):
     from code_review_graph.readiness import compute_readiness
 

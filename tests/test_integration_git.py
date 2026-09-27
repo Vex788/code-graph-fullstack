@@ -1319,10 +1319,24 @@ def test_edited_indexed_file_warns_but_stays_usable(tmp_path: Path) -> None:
     (repo / "a.py").write_text("def alpha():\n    return 99\n")
 
     result = _readiness(repo)
-    # Labelled, not refused: the answer carries the stale files.
-    assert result["status"] == result["readiness"]["status"] == "stale_worktree"
+    # Every symbol is still findable, so ok; the answer carries the stale files.
+    assert result["status"] == result["readiness"]["status"] == "ok"
     assert result["stale_files"] == ["a.py"]
     assert result["stale_file_count"] == 1
+
+
+def test_deleted_indexed_file_makes_readiness_not_ready(tmp_path: Path) -> None:
+    """The graph would still answer for symbols that no longer exist."""
+    repo = _init_repo(tmp_path)
+    _build(repo)
+
+    (repo / "a.py").unlink()
+
+    result = _readiness(repo)
+    assert result["status"] == "not_ready"
+    assert result["reason"] == "stale_worktree"
+    assert result["drifted_files"] == ["a.py"]
+    assert result["readiness"]["status"] == "stale_worktree"
 
 
 def test_an_edited_file_never_hides_a_missing_one(tmp_path: Path) -> None:

@@ -256,6 +256,7 @@ def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
             "source_matches_build": facts.source_matches is True,
             "index_matches_runtime": facts.schema_current and generation_current(facts),
             "runtime_matches_source": _runtime_matches_source(),
+            "edited_indexed_count": len((report.drift or {}).get("mismatched", [])),
         },
     })
     if git_ok and facts.built_at_commit:
@@ -265,6 +266,7 @@ def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
         facts.write_epoch_open, facts.write_epoch_closed, facts.index_generation,
         report.schema_version, facts.head_commit, readiness.status.value,
         facts.failed_files, facts.resolver_failures,
+        receipt["source_identity"]["edited_indexed_count"],
     ])
     return receipt
 

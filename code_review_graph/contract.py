@@ -70,6 +70,8 @@ _SOURCE_IDENTITY_SCHEMA: dict[str, Any] = {
         "missing_indexed_paths": {"type": "array", "items": {"type": "string"}},
         "deleted_indexed_paths": {"type": "array", "items": {"type": "string"}},
         "mismatched_indexed_paths": {"type": "array", "items": {"type": "string"}},
+        # Edited indexed files: reported, never part of source_matches_build.
+        "edited_indexed_count": {"type": "integer", "minimum": 0},
         "check": {"enum": ["full", "partial", "unavailable"]},
     },
 }

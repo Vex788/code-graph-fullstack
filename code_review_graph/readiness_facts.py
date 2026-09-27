@@ -66,8 +66,19 @@ class ReadinessReport:
             "missing_indexed_paths": list(drift.get("missing", [])),
             "deleted_indexed_paths": list(drift.get("deleted", [])),
             "mismatched_indexed_paths": list(drift.get("mismatched", [])),
+            "edited_indexed_count": len(drift.get("mismatched", [])),
             "check": drift.get("check", "unavailable"),
         }
+
+
+def source_matches_build(drift: dict[str, Any]) -> bool:
+    """No indexable file lacks a node and no indexed file is gone.
+
+    Edited (mismatched) files do not count: their symbols are still found, so
+    they are reported, not treated as drift. The hash cap (``partial``) only
+    limits the edited check; ``unavailable`` cannot rule out a hidden deletion.
+    """
+    return drift["check"] != "unavailable" and not (drift["missing"] or drift["deleted"])
 
 
 def _int_or_none(value: Optional[str]) -> Optional[int]:
@@ -196,10 +207,7 @@ def gather_report(
                 dirty = None
             if dirty is not None:
                 drift = working_tree_drift_conn(root, conn, dirty)
-                source_matches = (
-                    drift["check"] == "full"
-                    and not (drift["missing"] or drift["mismatched"] or drift["deleted"])
-                )
+                source_matches = source_matches_build(drift)
     except sqlite3.OperationalError as exc:
         logger.warning("Graph database %s busy while reading readiness: %s", db, exc)
         building = True

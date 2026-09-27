@@ -70,6 +70,7 @@ def test_receipt_carries_contract_fields_and_keeps_legacy_ones(repo):
         "source_matches_build": True,
         "index_matches_runtime": True,
         "runtime_matches_source": True,
+        "edited_indexed_count": 0,
     }
     # Legacy provenance fields stay.
     assert receipt["updated_at"] == "2026-01-01T00:00:00"
@@ -92,6 +93,21 @@ def test_receipt_etag_changes_with_the_graph(repo):
     store.commit()
     store.close()
     assert common_module.graph_receipt(str(repo))["etag"] != before
+
+
+def test_receipt_is_ok_for_an_edited_file_and_counts_it(repo):
+    (repo / "app.py").write_text("def handle():\n    return 2\n", encoding="utf-8")
+    receipt = common_module.graph_receipt(str(repo))
+    assert receipt["status"] == "ok"
+    assert receipt["source_identity"]["source_matches_build"] is True
+    assert receipt["source_identity"]["edited_indexed_count"] == 1
+
+
+def test_receipt_is_stale_worktree_for_a_deleted_file(repo):
+    (repo / "app.py").unlink()
+    receipt = common_module.graph_receipt(str(repo))
+    assert receipt["status"] == "stale_worktree"
+    assert receipt["source_identity"]["source_matches_build"] is False
 
 
 def test_receipt_git_timeout_is_stale_not_ok(repo, monkeypatch):

@@ -93,6 +93,13 @@ def test_status_json_keeps_legacy_keys_and_adds_readiness(repo):
     schema = SCHEMAS["status_json"]
     jsonschema.validators.validator_for(schema)(schema).validate(payload)
 
+    (repo / "app.py").write_text("def handle():\n    return 2\n", encoding="utf-8")
+    edited = json.loads(_cli("status", "--json", "--repo", str(repo)).stdout)
+    assert edited["readiness"]["status"] == "ok", edited["readiness"]
+    assert edited["source_identity"]["source_matches_build"] is True
+    assert edited["source_identity"]["mismatched_indexed_paths"] == [str(repo / "app.py")]
+    assert edited["source_identity"]["edited_indexed_count"] == 1
+
     (repo / "new.py").write_text("def fresh():\n    pass\n", encoding="utf-8")
     (repo / "app.py").unlink()
     stale = json.loads(_cli("status", "--json", "--repo", str(repo)).stdout)
