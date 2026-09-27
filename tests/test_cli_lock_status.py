@@ -273,6 +273,34 @@ def test_status_text_without_graph_still_exits_1(repo):
     assert "No graph found" in completed.stderr
 
 
+@pytest.mark.parametrize("command", ["build", "update"])
+@pytest.mark.parametrize(
+    ("result_status", "expected"), [("partial", 3), ("ok", 0)],
+)
+def test_build_result_status_maps_to_exit_code(
+    repo, tmp_path, monkeypatch, command, result_status, expected,
+):
+    from code_review_graph import cli
+    from code_review_graph.tools import build as build_module
+
+    assert _cli("build", "--repo", str(repo), "-q").returncode == 0
+    result = {"status": result_status, "total_nodes": 1, "total_edges": 0}
+    monkeypatch.setattr(build_module, "build_or_update_graph", lambda **kw: result)
+    progress = tmp_path / "p.json"
+    monkeypatch.setattr(sys, "argv", [
+        "code-review-graph", command, "--repo", str(repo), "-q",
+        "--progress-file", str(progress),
+    ])
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+        raise SystemExit(0)
+    assert exc_info.value.code == expected
+    state = json.loads(progress.read_text())
+    # The job reader surfaces the result; the exit code carries the degradation.
+    assert (state["status"], state["exit_code"]) == ("ok", expected)
+    assert state["result"]["status"] == result_status
+
+
 def test_harness_subcommand_dispatches():
     completed = _cli("harness", "fragment", "--target", "claude", "--json")
     assert completed.returncode == 0, completed.stderr

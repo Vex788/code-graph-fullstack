@@ -656,6 +656,17 @@ def _print_missing_graph_status(repo_root: Path, db_path: Path) -> None:
     }))
 
 
+def _finish_build(result: dict, progress) -> int:
+    """Record a finished build; a ``partial`` result exits 3 (degraded)."""
+    from .locking import EXIT_DEGRADED, EXIT_OK
+
+    code = EXIT_DEGRADED if result.get("status") == "partial" else EXIT_OK
+    if progress is not None:
+        # status stays "ok" so the job reader returns the result, which says partial.
+        progress.update(status="ok", exit_code=code, phase="done", result=result)
+    return code
+
+
 def _open_store_or_exit(args, db_path: Path):
     """Open the graph, mapping schema errors to the contract error shape."""
     from .graph import GraphStore
@@ -2155,8 +2166,7 @@ def main() -> None:
                 logging.disable(previous_disable)
             if _is_rebuild_required(result):
                 _exit_rebuild_required(result, progress)
-            if progress is not None:
-                progress.update(status="ok", exit_code=0, phase="done", result=result)
+            exit_code = _finish_build(result, progress)
             parsed = result.get("files_parsed", 0)
             nodes = result.get("total_nodes", 0)
             edges = result.get("total_edges", 0)
@@ -2167,6 +2177,8 @@ def main() -> None:
                 )
                 if result.get("errors"):
                     print(f"Errors: {len(result['errors'])}")
+            if exit_code:
+                sys.exit(exit_code)
 
         elif args.command == "update":
             pp = (
@@ -2196,8 +2208,7 @@ def main() -> None:
                 logging.disable(previous_disable)
             if _is_rebuild_required(result):
                 _exit_rebuild_required(result, progress)
-            if progress is not None:
-                progress.update(status="ok", exit_code=0, phase="done", result=result)
+            exit_code = _finish_build(result, progress)
             nodes = result.get("total_nodes", 0)
             edges = result.get("total_edges", 0)
             if not args.quiet:
@@ -2275,6 +2286,8 @@ def main() -> None:
                     )
                     if panel:
                         print(panel)
+            if exit_code:
+                sys.exit(exit_code)
 
         elif args.command == "status":
             stats = store.get_stats()
