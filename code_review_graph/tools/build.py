@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -255,6 +256,45 @@ def _run_postprocess(
     store.set_metadata("postprocess_level", postprocess)
 
     return warnings
+
+
+_EMBED_THREADS: list[threading.Thread] = []
+
+
+def embed_changed_nodes(
+    store: Any,
+    root: Any,
+    delta: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> None:
+    """Queue embeddings for what *delta* changed, after the stamp.
+
+    A no-op while embeddings are off. The work runs on a background thread;
+    a one-shot process calls :func:`wait_for_embeddings` before it exits.
+    """
+    try:
+        from ..repo_settings import load_embedding_settings
+
+        if not load_embedding_settings(root).enabled:
+            return
+        from ..embeddings import embed_changed
+
+        names = None if delta is None or delta.get("full") else delta.get("nodes", [])
+        worker = embed_changed(store, names, repo_root=root, wait=False)
+    except Exception as exc:  # embeddings never fail a build
+        logger.warning("Embedding update failed: %s", exc)
+        result["embeddings"] = {"state": "stale", "error": f"{type(exc).__name__}: {exc}"}
+        return
+    if isinstance(worker, threading.Thread):
+        _EMBED_THREADS[:] = [thread for thread in _EMBED_THREADS if thread.is_alive()]
+        _EMBED_THREADS.append(worker)
+    result["embeddings"] = {"state": "queued"}
+
+
+def wait_for_embeddings(timeout: float | None = None) -> None:
+    """Join the embedding threads this process started."""
+    while _EMBED_THREADS:
+        _EMBED_THREADS.pop().join(timeout)
 
 
 def _compute_signatures(store: Any) -> int:
@@ -625,7 +665,8 @@ def _build_locked(
             ),
         }
 
-    # Pass changed_files for incremental flow/community detection
+    # Read before post-processing consumes it: embeddings follow the stamp.
+    pending = read_flows_stale(store)
     changed = result.get("changed_files") if not full_rebuild else None
     warnings = _run_postprocess(
         store,
@@ -640,6 +681,7 @@ def _build_locked(
     if warnings:
         build_result["warnings"] = warnings
     finish_write(store, build_result)
+    embed_changed_nodes(store, root, pending, build_result)
     if build_result["status"] == "partial":
         build_result["summary"] += (
             f" Partial: {len(build_result.get('failed_files') or [])} file(s) failed "

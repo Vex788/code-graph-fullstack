@@ -334,3 +334,80 @@ def test_cli_watch_uses_the_pending_postprocess(tmp_path: Path, monkeypatch) -> 
     cli.main()
     assert seen["callback"].func is run_pending_post_processing
 
+
+class _EmbedRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(self, store, names, *, repo_root=None, wait=True, env=None):
+        import threading
+
+        from code_review_graph.incremental import write_epoch_is_open
+
+        self.calls.append({
+            "names": None if names is None else sorted(names),
+            "wait": wait,
+            "stamped": not write_epoch_is_open(store),
+        })
+        worker = threading.Thread(target=lambda: None)
+        worker.start()
+        return worker
+
+
+def _enable_embeddings(monkeypatch, enabled: bool) -> _EmbedRecorder:
+    from types import SimpleNamespace
+
+    from code_review_graph import embeddings, repo_settings
+
+    recorder = _EmbedRecorder()
+    monkeypatch.setattr(embeddings, "embed_changed", recorder)
+    monkeypatch.setattr(
+        repo_settings, "load_embedding_settings",
+        lambda root, env=None: SimpleNamespace(enabled=enabled),
+    )
+    return recorder
+
+
+def test_embeddings_off_are_never_queued(tmp_path: Path, monkeypatch) -> None:
+    recorder = _enable_embeddings(monkeypatch, False)
+    repo = copy_fixture(tmp_path / "app")
+    assert "embeddings" not in build(repo)
+    assert recorder.calls == []
+
+
+def test_embeddings_follow_the_stamp_with_changed_nodes(tmp_path: Path, monkeypatch) -> None:
+    from code_review_graph.tools.build import _EMBED_THREADS, wait_for_embeddings
+
+    recorder = _enable_embeddings(monkeypatch, True)
+    repo = copy_fixture(tmp_path / "app")
+    full = build(repo)
+    assert full["embeddings"] == {"state": "queued"}
+    assert recorder.calls[-1] == {"names": None, "wait": False, "stamped": True}
+
+    _Editor(repo, 5).add_method()
+    git(repo, "commit", "-qam", "edit")
+    update = build(repo, full=False)
+    assert update["status"] == "ok"
+    call = recorder.calls[-1]
+    assert call["stamped"] and call["wait"] is False
+    assert any(name.endswith(".edited1") for name in call["names"]), call["names"]
+    wait_for_embeddings()
+    assert _EMBED_THREADS == []
+
+
+def test_cli_update_waits_for_queued_embeddings(tmp_path: Path, monkeypatch) -> None:
+    from code_review_graph import cli
+    from code_review_graph.tools import build as build_tool
+
+    repo = copy_fixture(tmp_path / "app")
+    build(repo)
+    waited = []
+    monkeypatch.setattr(build_tool, "wait_for_embeddings", lambda: waited.append(True))
+    monkeypatch.setattr(
+        "sys.argv", ["code-review-graph", "update", "--repo", str(repo), "--quiet"],
+    )
+    try:
+        cli.main()
+    except SystemExit as exc:
+        assert not exc.code
+    assert waited == [True]

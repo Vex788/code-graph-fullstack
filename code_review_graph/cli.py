@@ -2162,7 +2162,7 @@ def main() -> None:
                 if getattr(args, "skip_postprocess", False)
                 else ("minimal" if getattr(args, "skip_flows", False) else "full")
             )
-            from .tools.build import build_or_update_graph
+            from .tools.build import build_or_update_graph, wait_for_embeddings
 
             previous_disable = logging.root.manager.disable
             if args.quiet:
@@ -2176,6 +2176,8 @@ def main() -> None:
                 )
             finally:
                 logging.disable(previous_disable)
+            # A one-shot run keeps the graph open until its embeddings land.
+            wait_for_embeddings()
             if _is_rebuild_required(result):
                 _exit_rebuild_required(result, progress)
             exit_code = _finish_build(result, progress)
@@ -2198,7 +2200,7 @@ def main() -> None:
                 if getattr(args, "skip_postprocess", False)
                 else ("minimal" if getattr(args, "skip_flows", False) else "full")
             )
-            from .tools.build import build_or_update_graph
+            from .tools.build import build_or_update_graph, wait_for_embeddings
 
             previous_disable = logging.root.manager.disable
             if args.quiet:
@@ -2218,6 +2220,7 @@ def main() -> None:
                 sys.exit(1)
             finally:
                 logging.disable(previous_disable)
+            wait_for_embeddings()
             if _is_rebuild_required(result):
                 _exit_rebuild_required(result, progress)
             exit_code = _finish_build(result, progress)

@@ -78,9 +78,15 @@ def run_pending_post_processing(
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> dict[str, Any]:
-    """Post-process after a watch batch: flows and communities follow the pending delta."""
-    from .tools.build import _run_postprocess
+    """Post-process after a watch batch: flows and communities follow the pending delta.
 
+    The batch's update already stamped readiness; embeddings of the changed
+    nodes are queued afterwards on a background thread.
+    """
+    from .incremental import read_flows_stale
+    from .tools.build import _run_postprocess, embed_changed_nodes
+
+    pending = read_flows_stale(store)
     result: dict[str, Any] = {}
     warnings = _run_postprocess(
         store,
@@ -92,6 +98,8 @@ def run_pending_post_processing(
     )
     if warnings:
         result["warnings"] = warnings
+    if repo_root is not None:
+        embed_changed_nodes(store, repo_root, pending, result)
     return result
 
 
