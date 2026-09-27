@@ -10,6 +10,8 @@ from code_review_graph.incremental import full_build, incremental_update
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.postprocessing import run_post_processing
 
+from ._watch_sleep import watch_loop_sleep
+
 
 def _get_signature(store, qualified_name):
     row = store._conn.execute(
@@ -491,7 +493,7 @@ class TestWatchCallbackIntegration:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                watch_loop_sleep(KeyboardInterrupt),
             ):
                 watch(tmp_path, store, on_files_updated=callback)
 
@@ -540,7 +542,7 @@ class TestWatchCallbackIntegration:
 
             with (
                 patch("watchdog.observers.Observer", return_value=observer),
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                watch_loop_sleep(KeyboardInterrupt),
             ):
                 watch(tmp_path, store, on_files_updated=run_post_processing)
 

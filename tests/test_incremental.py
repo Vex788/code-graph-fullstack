@@ -35,6 +35,8 @@ from code_review_graph.incremental import (
     watch,
 )
 
+from ._watch_sleep import watch_loop_sleep
+
 
 class TestParseExecutorSelection:
     def test_stdio_mcp_uses_threads_on_unix(self, monkeypatch):
@@ -1551,7 +1553,7 @@ class TestWatchReconciliation:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                watch_loop_sleep(KeyboardInterrupt),
             ):
                 watch(tmp_path, store, on_files_updated=on_files_updated)
             assert callback_count == 1
@@ -1573,7 +1575,7 @@ class TestWatchReconciliation:
         try:
             with (
                 patch("watchdog.observers.Observer") as observer,
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                watch_loop_sleep(KeyboardInterrupt),
                 # Triggers keep FTS in sync; force the rebuild path to fail it.
                 patch(
                     "code_review_graph.postprocessing.fts_triggers_installed",
