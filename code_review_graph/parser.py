@@ -1346,6 +1346,8 @@ _SPRING_SCHEDULED_ANNOTATIONS = frozenset({"Scheduled", "Schedules"})
 _SPRING_EVENT_LISTENER_ANNOTATIONS = frozenset({"EventListener"})
 _SPRING_EVENT_PUBLISH_METHODS = frozenset({"publishEvent"})
 _JAVA_PACKAGE_KEY = "__crg_java_package__"
+# ``import static a.B.m;`` maps this key + ``m`` to the owner class ``a.B``.
+_JAVA_STATIC_IMPORT_KEY = "__crg_java_static__:"
 _SPRING_REQUEST_PREFIX_KEY = "__crg_spring_request_prefix__:"
 _JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
 _SPRING_REQUEST_MAPPINGS = {
@@ -4998,6 +5000,22 @@ class CodeParser:
             ):
                 entries = candidate_entries(edge.target, edge.kind)
                 candidates = [qualified for qualified, _ in entries]
+                static_owner = edge.extra.get("static_import_owner")
+                if is_java and not entries and isinstance(static_owner, str):
+                    # A same-file method shadows the static import; none here.
+                    owner = self._resolve_java_type_target(static_owner, file_path, {}, set())
+                    if "::" in owner:
+                        owner_file, _, owner_class = owner.partition("::")
+                        simple = owner_class.rsplit(".", 1)[-1]
+                        resolved.append(EdgeInfo(
+                            kind=edge.kind,
+                            source=edge.source,
+                            target=f"{owner_file}::{simple}.{edge.target}",
+                            file_path=edge.file_path,
+                            line=edge.line,
+                            extra=edge.extra,
+                        ))
+                        continue
                 if (
                     is_java
                     and len(entries) > 1
@@ -11229,6 +11247,9 @@ class CodeParser:
                             1 for arg in arguments.named_children
                             if arg.type not in ("line_comment", "block_comment")
                         )
+                static_owner = (import_map or {}).get(f"{_JAVA_STATIC_IMPORT_KEY}{call_name}")
+                if language == "java" and not receiver and static_owner:
+                    call_extra["static_import_owner"] = static_owner
                 if language == "java" and not receiver and child.type == "method_invocation":
                     obj = child.child_by_field_name("object")
                     # ``verify(s).save()`` / ``super.save()``: the method is not
@@ -13933,6 +13954,11 @@ class CodeParser:
             if not text.startswith("import "):
                 return
             imported = text[len("import "):].rstrip(";").strip()
+            if language == "java" and imported.startswith("static "):
+                owner, _, member = imported[len("static "):].strip().rpartition(".")
+                if owner and member and member != "*":
+                    import_map[f"{_JAVA_STATIC_IMPORT_KEY}{member}"] = owner
+                return
             if imported.startswith("static ") or imported.endswith(".*"):
                 return
             original, separator, alias = imported.partition(" as ")
@@ -15996,7 +16022,11 @@ class CodeParser:
             # import/using package.Class
             parts = text.split()
             if len(parts) >= 2:
-                imports.append(parts[-1].rstrip(";"))
+                target = parts[-1].rstrip(";")
+                # ``import static a.B.*`` depends on class ``a.B`` itself.
+                if language == "java" and "static" in parts and target.endswith(".*"):
+                    target = target[:-2]
+                imports.append(target)
         elif language == "kotlin":
             # tree-sitter-kotlin folds any comment that follows the LAST import
             # into that import_header node, so the node text is not a module

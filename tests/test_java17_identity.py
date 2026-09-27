@@ -347,3 +347,44 @@ def test_java_fqn_candidates_are_not_capped_by_search_limit(tmp_path, monkeypatc
         store.commit()
         matches = _java_fqn_candidates(store, "com.acme.gen.Target.save")
     assert [m.parent_name for m in matches] == ["Target"]
+
+
+def test_static_imports_resolve_to_the_owner_class(tmp_path, monkeypatch):
+    from code_review_graph.graph import GraphStore
+    from code_review_graph.incremental import full_build, get_db_path
+
+    monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+    strings = _write(tmp_path, f"{SRC}/util/Strings.java", (
+        "package com.acme.util;\n"
+        "public final class Strings {\n"
+        "    public static boolean isBlank(String s) { return s == null; }\n"
+        "    public static String upper(String s) { return s; }\n"
+        "}\n"
+    ))
+    service = _write(tmp_path, f"{SRC}/service/Svc.java", (
+        "package com.acme.service;\n"
+        "import static com.acme.util.Strings.isBlank;\n"
+        "import static com.acme.util.Strings.*;\n"
+        "public class Svc {\n"
+        "    void a(String s) { isBlank(s); upper(s); trim(s); }\n"
+        "    void b(String s) { }\n"
+        "    static void trim(String s) { }\n"
+        "}\n"
+    ))
+    _, edges = _parse(tmp_path, service)
+    calls = {e.target for e in edges if e.kind == "CALLS" and e.source.endswith("Svc.a")}
+    assert _qn(strings.resolve(), "Strings.isBlank") in calls
+    assert _qn(service, "Svc.trim") in calls  # a class method shadows static imports
+
+    db = get_db_path(tmp_path)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with GraphStore(db) as store:
+        full_build(tmp_path, store)
+        store.resolve_bare_call_targets()
+        store.commit()
+        callers = {
+            e.source_qualified
+            for e in store.get_edges_by_target(_qn(strings.resolve(), "Strings.upper"))
+            if e.kind == "CALLS"
+        }
+    assert callers == {_qn(service.resolve(), "Svc.a")}
