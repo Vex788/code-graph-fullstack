@@ -2,8 +2,9 @@
 
 Each resolver adds cross-file edges the per-file parser cannot see on its own
 (Python imports, Spring DI, Spring events, Temporal, HCL module references,
-scoped calls). Every resolver is best-effort: a failure is logged as a
-warning and swallowed so it never fails the build that runs it.
+scoped calls). Each resolver runs in one write transaction: a failure rolls
+its delete-and-reinsert back to the previous edges, is logged, and is
+recorded for readiness instead of failing the build that runs it.
 
 Adding a resolver means adding one entry to [RESOLVERS] — no other file needs
 to change.
@@ -16,7 +17,7 @@ import logging
 from typing import Callable, Optional
 
 from ..event_resolver import resolve_spring_events
-from ..graph import GraphStore
+from ..graph import GraphStore, is_locked_error
 from ..hcl_resolver import resolve_hcl_module_references
 from ..python_resolver import resolve_python_imports
 from ..rescript_resolver import resolve_rescript_cross_module
@@ -95,16 +96,35 @@ def _accepts_repo_root(resolver: Resolver) -> bool:
     return len(params) >= 2
 
 
-def run_resolver(name: str, store: GraphStore, repo_root) -> Optional[dict]:
-    """Run the named resolver, swallowing any failure so it never fails the build.
+def run_resolver(
+    name: str,
+    store: GraphStore,
+    repo_root,
+    failures: Optional[dict[str, str]] = None,
+) -> Optional[dict]:
+    """Run the named resolver atomically; a failure never fails the build.
 
-    Returns the resolver's stats dict, or None if it raised.
+    Returns the resolver's stats dict, or None if it raised. A raising
+    resolver's writes are rolled back and, when *failures* is given, its
+    error is recorded there under *name*.
     """
     resolver, label, _languages = RESOLVERS[name]
+    transaction = getattr(store, "transaction", None)
     try:
-        if _accepts_repo_root(resolver):
-            return resolver(store, repo_root)
-        return resolver(store)
+        if transaction is None:
+            return _call(resolver, store, repo_root)
+        with transaction():
+            return _call(resolver, store, repo_root)
     except Exception as exc:  # noqa: BLE001 - best-effort post-pass
+        if is_locked_error(exc):
+            raise
         logger.warning("%s failed: %s", label, exc)
+        if failures is not None:
+            failures[name] = f"{type(exc).__name__}: {exc}"[:500]
         return None
+
+
+def _call(resolver: Resolver, store: GraphStore, repo_root) -> Optional[dict]:
+    if _accepts_repo_root(resolver):
+        return resolver(store, repo_root)
+    return resolver(store)

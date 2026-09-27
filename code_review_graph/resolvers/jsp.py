@@ -328,8 +328,14 @@ def resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
 
     Every edge is re-derived from the nodes currently in the graph: an older
     database without jsp File nodes, or a repository without any pages, is a
-    clean no-op that still clears this resolver's stale edges.
+    clean no-op that still clears this resolver's stale edges. The delete and
+    the re-insert commit together, so a failure keeps the previous edges.
     """
+    with store.transaction():
+        return _resolve_jsp_links(store, repo_root)
+
+
+def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     repo_root = Path(repo_root).resolve()
     config = load_jsp_resolver_config(repo_root)
     if config is not None and not config.enabled:
