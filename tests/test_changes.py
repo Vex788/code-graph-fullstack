@@ -603,6 +603,16 @@ class TestAnalyzeChangesFunctionCap:
         assert len(result["changed_functions"]) == 5
         assert result["functions_truncated"] is False
 
+    def test_malformed_cap_falls_back_to_default(self, monkeypatch):
+        """A typo in CRG_MAX_CHANGED_FUNCS must not crash detect-changes."""
+        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "lots")
+        self._add_funcs(5)
+
+        result = analyze_changes(self.store, changed_files=["app.py"])
+
+        assert len(result["changed_functions"]) == 5
+        assert result["functions_truncated"] is False
+
 
 class TestAnalyzeChangesInternalParseRemap:
     """Regression tests for #528: CLI detect-changes mapped 0 functions.

@@ -463,7 +463,7 @@ def analyze_changes(
     ]
 
     # Cap to prevent O(N*M) query explosion on large PRs.
-    _max_funcs = int(os.environ.get("CRG_MAX_CHANGED_FUNCS", "500"))
+    _max_funcs = env_int("CRG_MAX_CHANGED_FUNCS", 500, minimum=1)
     funcs_truncated = len(changed_funcs) > _max_funcs
     if funcs_truncated:
         changed_funcs = changed_funcs[:_max_funcs]
