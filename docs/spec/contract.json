@@ -939,6 +939,18 @@
           "type": "string",
           "required": false,
           "default": "standard"
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 100
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
         }
       ]
     },
@@ -1046,7 +1058,7 @@
           "name": "max_results",
           "type": "integer",
           "required": false,
-          "default": 100
+          "default": 50
         },
         {
           "name": "max_files",
@@ -1154,6 +1166,12 @@
           "type": "integer",
           "required": false,
           "default": 10
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
         }
       ]
     },
@@ -1190,6 +1208,12 @@
           "type": "string|null",
           "required": false,
           "default": null
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
         }
       ]
     },
@@ -1276,6 +1300,12 @@
           "type": "integer",
           "required": false,
           "default": 100
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
         }
       ]
     },
@@ -1419,6 +1449,12 @@
           "type": "string",
           "required": false,
           "default": "standard"
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
         }
       ]
     },

@@ -1415,7 +1415,7 @@ def test_worktree_without_a_graph_is_pointed_at_the_main_checkout(
     assert result["status"] == "not_ready"
     assert result["reason"] == "worktree_no_graph"
     assert result["graph_repo_root"] == str(repo)
-    assert "build_or_update_graph" not in result["next_tool_suggestions"]
+    assert "build_or_update_graph_tool" not in result["next_tool_suggestions"]
 
 
 def test_plain_repo_without_a_graph_still_says_missing_graph(tmp_path: Path) -> None:

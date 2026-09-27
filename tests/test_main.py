@@ -526,6 +526,135 @@ class TestApplyToolFilter:
         remaining = await self._tool_names()
         assert remaining == {"query_graph_tool", "semantic_search_nodes_tool"}
 
+    @pytest.mark.asyncio
+    async def test_agent_preset_keeps_the_agent_working_set(self):
+        crg_main._apply_tool_filter("agent")
+        remaining = await self._tool_names()
+        assert remaining == set(crg_main.TOOL_PRESETS["agent"])
+        assert len(remaining) == 14
+
+    @pytest.mark.asyncio
+    async def test_agent_preset_via_env_combines_with_names(self, monkeypatch):
+        monkeypatch.setenv("CRG_TOOLS", "agent,embed_graph_tool")
+        crg_main._apply_tool_filter(None)
+        remaining = await self._tool_names()
+        assert remaining == set(crg_main.TOOL_PRESETS["agent"]) | {"embed_graph_tool"}
+
+    @pytest.mark.asyncio
+    async def test_all_preset_keeps_every_tool(self):
+        before = await self._tool_names()
+        crg_main._apply_tool_filter("all")
+        assert await self._tool_names() == before
+
+    @pytest.mark.asyncio
+    async def test_preset_names_are_registered_tools(self):
+        registered = await self._tool_names()
+        for names in crg_main.TOOL_PRESETS.values():
+            assert set(names) <= registered
+
+
+def test_serve_tools_agent_reaches_the_filter(monkeypatch):
+    from code_review_graph import cli
+
+    seen: dict = {}
+    monkeypatch.setattr(crg_main, "main", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(cli.sys, "argv", ["code-review-graph", "serve", "--tools", "agent"])
+    try:
+        cli.main()
+    except SystemExit as exc:
+        assert not exc.code
+    assert seen.get("tools") == "agent"
+
+
+class TestMcpErrorShape:
+    """Tool errors reach MCP clients as {status: error, error_code, message}."""
+
+    @staticmethod
+    async def _call(name: str, args: dict) -> dict:
+        from fastmcp import Client
+
+        async with Client(crg_main.mcp) as client:
+            result = await client.call_tool(name, args, raise_on_error=False)
+        return result.structured_content
+
+    @pytest.mark.asyncio
+    async def test_rejected_argument_is_invalid_argument(self, monkeypatch):
+        def reject(**_kwargs):
+            raise ValueError("max_results must be an integer greater than or equal to 1")
+
+        monkeypatch.setattr(crg_main, "get_impact_radius", reject)
+        payload = await self._call("get_impact_radius_tool", {"max_results": 0})
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "invalid_argument"
+        assert "max_results" in payload["message"]
+
+    @pytest.mark.asyncio
+    async def test_bad_repo_root_is_invalid_repo_root(self, tmp_path):
+        payload = await self._call(
+            "list_graph_stats_tool", {"repo_root": str(tmp_path / "missing")},
+        )
+        assert (payload["status"], payload["error_code"]) == ("error", "invalid_repo_root")
+
+    @pytest.mark.asyncio
+    async def test_legacy_error_result_gains_error_code(self, monkeypatch):
+        monkeypatch.setattr(
+            crg_main, "list_flows", lambda **_kw: {"status": "error", "error": "boom"},
+        )
+        monkeypatch.setattr(crg_main, "with_provenance", lambda result, _root: result)
+        payload = await self._call("list_flows_tool", {})
+        assert payload["error_code"] == "tool_error"
+        assert payload["message"] == "boom" and payload["error"] == "boom"
+
+    @pytest.mark.asyncio
+    async def test_batch_query_invalid_root_is_per_item(self, tmp_path):
+        payload = await self._call("batch_query_tool", {
+            "queries": [{"pattern": "callers_of", "target": "x"}],
+            "repo_root": str(tmp_path / "missing"),
+        })
+        assert payload["status"] == "ok"
+        assert payload["results"][0]["error_code"] == "invalid_repo_root"
+
+
+def test_new_paging_params_are_forwarded(monkeypatch):
+    seen: dict = {}
+
+    def capture(name):
+        def fake(**kwargs):
+            seen[name] = kwargs
+            return {"status": "ok"}
+        return fake
+
+    monkeypatch.setattr(crg_main, "with_provenance", lambda result, _root: result)
+    for name in ("get_impact_radius", "query_graph", "semantic_search_nodes",
+                 "list_flows", "list_communities_func"):
+        monkeypatch.setattr(crg_main, name, capture(name))
+
+    def fn(tool):
+        return getattr(tool, "fn", tool)
+
+    fn(crg_main.get_impact_radius_tool)(offset=5)
+    fn(crg_main.query_graph_tool)("pages_for", "X", offset=2)
+    fn(crg_main.semantic_search_nodes_tool)("x", offset=3)
+    fn(crg_main.list_flows_tool)(offset=4)
+    fn(crg_main.list_communities_tool)(offset=6)
+    assert seen["get_impact_radius"]["max_results"] == 100
+    assert seen["get_impact_radius"]["offset"] == 5
+    assert seen["query_graph"]["offset"] == 2
+    assert seen["semantic_search_nodes"]["offset"] == 3
+    assert seen["list_flows"]["offset"] == 4
+    assert seen["list_communities_func"]["offset"] == 6
+
+
+def test_review_context_default_matches_docstring():
+    import inspect
+
+    from code_review_graph.tools.review import get_review_context
+
+    tool = getattr(crg_main.get_review_context_tool, "fn", crg_main.get_review_context_tool)
+    default = inspect.signature(tool).parameters["max_results"].default
+    assert default == inspect.signature(get_review_context).parameters["max_results"].default
+    assert f"Default: {default}." in inspect.getdoc(tool)
+
 
 def test_orient_tool_forwards_provider_limit_and_detail_level(monkeypatch):
     seen: dict = {}

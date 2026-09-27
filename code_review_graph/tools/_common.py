@@ -53,7 +53,7 @@ def building_response(readiness: dict[str, Any] | None = None) -> dict[str, Any]
         "status": "building",
         "reason": "building",
         "summary": message,
-        "next_tool_suggestions": ["build_or_update_graph"],
+        "next_tool_suggestions": ["build_or_update_graph_tool"],
     }
     if readiness is not None:
         response["readiness"] = readiness

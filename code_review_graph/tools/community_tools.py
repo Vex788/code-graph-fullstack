@@ -55,6 +55,7 @@ def list_communities_func(
     detail_level: str = "standard",
     max_results: int = 50,
     max_members: int = 10,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """List detected code communities in the codebase.
 
@@ -75,21 +76,26 @@ def list_communities_func(
         max_members: Maximum member names listed per community in standard
                      mode (default 10, capped at 100). Each community's
                      ``size`` still reports its true member count.
+        offset: Communities to skip in sort order (default 0); pass the
+                previous response's ``next_offset`` for the next page.
 
     Returns:
-        Communities with size and cohesion scores, plus ``total`` and
-        ``truncated``.
+        Communities with size and cohesion scores, plus ``total``,
+        ``truncated`` and ``next_offset`` (None on the last page).
     """
     _validate_positive_int(max_results, "max_results")
     _validate_positive_int(max_members, "max_members")
+    if isinstance(offset, bool) or offset < 0:
+        raise ValueError("offset must be an integer greater than or equal to 0")
 
     store, root = _get_store(repo_root)
     try:
-        communities, total, truncated = _bounded(
-            get_communities(store, sort_by=sort_by, min_size=min_size),
-            max_results,
-            _MAX_COMMUNITIES,
-        )
+        every = get_communities(store, sort_by=sort_by, min_size=min_size)
+        total = len(every)
+        communities, _, _ = _bounded(every[offset:], max_results, _MAX_COMMUNITIES)
+        end = offset + len(communities)
+        next_offset = end if end < total else None
+        truncated = next_offset is not None
         if detail_level == "minimal":
             communities = [
                 {"name": c["name"], "size": c["size"], "cohesion": c["cohesion"]}
@@ -106,6 +112,7 @@ def list_communities_func(
             "communities": communities,
             "total": total,
             "truncated": truncated,
+            "next_offset": next_offset,
         }
         result["_hints"] = generate_hints(
             "list_communities", result, get_session()

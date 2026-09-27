@@ -45,7 +45,7 @@ def _not_ready(
         "status": "not_ready",
         "reason": reason,
         "summary": summary,
-        "next_tool_suggestions": next_tool_suggestions or ["build_or_update_graph"],
+        "next_tool_suggestions": next_tool_suggestions or ["build_or_update_graph_tool"],
     }
     response.update(extra)
     return response
@@ -66,7 +66,7 @@ def missing_graph_response(root: Path) -> dict[str, Any] | None:
             "Query that root: it is authoritative for everything this branch did "
             "not touch, and silent about symbols the branch adds -- take those "
             "from the diff, not from an empty graph result.",
-            next_tool_suggestions=["orient", "query_graph", "get_impact_radius"],
+            next_tool_suggestions=["orient_tool", "query_graph_tool", "get_impact_radius_tool"],
             graph_repo_root=str(sibling),
             graph_provenance=graph_provenance(str(sibling)),
         )
@@ -253,19 +253,24 @@ def get_minimal_context(
         # 5. Suggest next tools based on task keywords
         task_lower = task.lower()
         if any(w in task_lower for w in ("review", "pr", "merge", "diff")):
-            suggestions = ["detect_changes", "get_affected_flows", "get_review_context"]
+            suggestions = [
+                "detect_changes_tool", "get_affected_flows_tool", "get_review_context_tool",
+            ]
         elif any(w in task_lower for w in ("debug", "bug", "error", "fix")):
-            suggestions = ["semantic_search_nodes", "query_graph", "get_flow"]
+            suggestions = ["semantic_search_nodes_tool", "query_graph_tool", "get_flow_tool"]
         elif any(w in task_lower for w in ("refactor", "rename", "dead", "clean")):
-            suggestions = ["refactor", "find_large_functions", "get_architecture_overview"]
+            suggestions = [
+                "refactor_tool", "find_large_functions_tool",
+                "get_architecture_overview_tool",
+            ]
         elif any(w in task_lower for w in ("onboard", "understand", "explore", "arch")):
             suggestions = [
-                "get_architecture_overview", "list_communities", "list_flows",
+                "get_architecture_overview_tool", "list_communities_tool", "list_flows_tool",
             ]
         else:
             suggestions = [
-                "detect_changes", "semantic_search_nodes",
-                "get_architecture_overview",
+                "detect_changes_tool", "semantic_search_nodes_tool",
+                "get_architecture_overview_tool",
             ]
 
         # Build summary

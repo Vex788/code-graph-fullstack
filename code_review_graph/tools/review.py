@@ -262,9 +262,9 @@ def get_review_context(
                 "key_entities": key_entities,
                 "test_gaps": test_gap_count,
                 "next_tool_suggestions": [
-                    "detect_changes",
-                    "get_affected_flows",
-                    "get_impact_radius",
+                    "detect_changes_tool",
+                    "get_affected_flows_tool",
+                    "get_impact_radius_tool",
                 ],
             }
             attach_context_savings(result, original_tokens=original_tokens)
@@ -577,7 +577,9 @@ def get_affected_flows_func(
         )
         return out
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        logger.error("review tool failed: %s", exc)
+        return {"status": "error", "error_code": "internal_error",
+                "message": str(exc), "error": str(exc)}
     finally:
         store.close()
 
@@ -790,6 +792,8 @@ def detect_changes_func(
         attach_context_savings(result, original_tokens=original_tokens)
         return result
     except Exception as exc:
-        return {"status": "error", "error": str(exc)}
+        logger.error("review tool failed: %s", exc)
+        return {"status": "error", "error_code": "internal_error",
+                "message": str(exc), "error": str(exc)}
     finally:
         store.close()
