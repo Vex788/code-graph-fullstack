@@ -1351,9 +1351,9 @@ class GraphStore:
                 or edge_extra.get("receiver_expression")
             ):
                 # A member call belongs to its receiver's type. Library types
-                # never bind; a known type binds only to its own methods; in
-                # languages whose parser tracks declared types, no type means
-                # no evidence at all.
+                # never bind; a known type binds only to its own methods. The
+                # Java parser records every receiver type it can see, so a
+                # Java receiver without one carries no evidence at all.
                 receiver_type = edge_extra.get("receiver_type")
                 if edge_extra.get("receiver_external"):
                     candidates = []
@@ -1367,7 +1367,7 @@ class GraphStore:
                     # A module/namespace receiver: only its imported files qualify.
                     imported = import_targets.get(edge["file_path"], set())
                     candidates = [c for c in candidates if c[1] in imported]
-                elif edge["file_path"].endswith((".java", ".kt", ".kts", ".cs")):
+                elif edge["file_path"].endswith(".java"):
                     candidates = []
 
             context_file = edge["file_path"]

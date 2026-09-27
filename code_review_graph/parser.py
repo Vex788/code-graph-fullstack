@@ -2526,6 +2526,8 @@ class CodeParser:
         # referrer resolves exactly as it would in a build where the forgotten
         # files never existed on disk. See ``forget.forget_files``.
         self._excluded_files: set[str] = set()
+        # Per-file sequence numbers for anonymous JS callbacks (``ready$1``).
+        self._js_callback_seq: dict[str, int] = {}
         self._export_symbol_cache: dict[str, Optional[str]] = {}
         self._tsconfig_resolver = TsconfigResolver()
         # Per-parse cache of Dart pubspec root lookups; see #87
@@ -2703,8 +2705,7 @@ class CodeParser:
         language = self.detect_language(path, source)
         if not language:
             return [], []
-        # Per-file sequence numbers for anonymous JS callbacks (``ready$1``).
-        self._js_callback_seq: dict[str, int] = {}
+        self._js_callback_seq = {}
 
         parser = None
         tree = None
@@ -8926,9 +8927,8 @@ class CodeParser:
                 label = label.strip("_")
                 if label:
                     base = f"{base}_{label}"
-        seq = getattr(self, "_js_callback_seq", {})
+        seq = self._js_callback_seq
         seq[base] = seq.get(base, 0) + 1
-        self._js_callback_seq = seq
         name = f"{base}${seq[base]}"
         qualified = self._qualify(name, file_path, enclosing_class)
         line = child.start_point[0] + 1
