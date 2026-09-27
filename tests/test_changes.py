@@ -513,6 +513,28 @@ class TestChanges:
             assert result["test_gaps"] == []
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
+    @pytest.mark.parametrize("tool", [
+        "detect_changes_func", "get_review_context", "get_affected_flows_func",
+    ])
+    @pytest.mark.parametrize("dirty", [None, []])
+    def test_git_unavailable_is_not_reported_as_no_changes(self, tool, dirty):
+        from code_review_graph import tools
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch("code_review_graph.tools.review.get_changed_files", return_value=[]),
+            patch("code_review_graph.tools.review.get_staged_and_unstaged", return_value=dirty),
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+            result = getattr(tools, tool)(base="HEAD~1", repo_root="/fake/repo")
+        if dirty is None:
+            assert result.get("git") == "unavailable", result
+            assert "git" in result["summary"]
+            assert result.get("warning")
+        else:
+            assert "git" not in result and "warning" not in result
+
     def test_detect_changes_tool_with_changes(self):
         """detect_changes_func returns full analysis for changed files."""
         from code_review_graph.tools import detect_changes_func

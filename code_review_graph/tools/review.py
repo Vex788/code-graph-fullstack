@@ -23,6 +23,25 @@ from ._common import (
 
 logger = logging.getLogger(__name__)
 
+_GIT_UNAVAILABLE_WARNING = (
+    "git could not report changed files, so zero changes is unknown, not clean. "
+    "Fix git or pass changed_files explicitly."
+)
+
+
+def _auto_changed_files(root: Path, base: str) -> list[str] | None:
+    """Changed files from git; None when git could not answer."""
+    changed = get_changed_files(root, base)
+    return changed or get_staged_and_unstaged(root)
+
+
+def _git_unavailable(response: dict[str, Any]) -> dict[str, Any]:
+    """Mark an empty auto-detected result as git failure, not a clean tree."""
+    response["summary"] = "No changed files: git unavailable. " + _GIT_UNAVAILABLE_WARNING
+    response["git"] = "unavailable"
+    response["warning"] = _GIT_UNAVAILABLE_WARNING
+    return response
+
 # Hard ceilings shared by the review tools. All three walk the full impact
 # radius of a change set, so on a whole-repo diff every list below is
 # proportional to the repository, not to the change. The numbers are set
@@ -141,17 +160,18 @@ def get_review_context(
     store, root = _get_store(repo_root)
     try:
         # Get impact radius first
+        git_failed = False
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files = _auto_changed_files(root, base)
+            git_failed = changed_files is None
 
         if not changed_files:
-            return {
+            empty: dict[str, Any] = {
                 "status": "ok",
                 "summary": "No changes detected. Nothing to review.",
                 "context": {},
             }
+            return _git_unavailable(empty) if git_failed else empty
 
         graph_files = _resolve_graph_file_paths(store, root, changed_files)
         original_tokens = estimate_file_tokens(root, changed_files)
@@ -462,18 +482,19 @@ def get_affected_flows_func(
     """
     store, root = _get_store(repo_root)
     try:
+        git_failed = False
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files = _auto_changed_files(root, base)
+            git_failed = changed_files is None
 
         if not changed_files:
-            return {
+            empty: dict[str, Any] = {
                 "status": "ok",
                 "summary": "No changed files detected.",
                 "affected_flows": [],
                 "total": 0,
             }
+            return _git_unavailable(empty) if git_failed else empty
 
         # Convert to absolute paths for graph lookup. Graph identity uses
         # POSIX separators (#774), so normalize the joined paths.
@@ -569,13 +590,13 @@ def detect_changes_func(
     store, root = _get_store(repo_root)
     try:
         # Detect changed files if not provided.
+        git_failed = False
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            changed_files = _auto_changed_files(root, base)
+            git_failed = changed_files is None
 
         if not changed_files:
-            return {
+            empty: dict[str, Any] = {
                 "status": "ok",
                 "summary": "No changed files detected.",
                 "risk_score": 0.0,
@@ -584,6 +605,7 @@ def detect_changes_func(
                 "test_gaps": [],
                 "review_priorities": [],
             }
+            return _git_unavailable(empty) if git_failed else empty
 
         original_tokens = estimate_file_tokens(root, changed_files)
 
