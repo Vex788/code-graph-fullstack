@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import sqlite3
 import subprocess
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from ..constants import env_float
 from ..graph import GraphStore
 from ..incremental import GitUnavailableError, find_project_root, get_db_path
 from ..parser import normalize_file_path
@@ -17,6 +21,8 @@ _PROVENANCE_READ_TIMEOUT_SECONDS = 0.05
 _PROVENANCE_GIT_TIMEOUT_SECONDS = 1.0
 # git status on every tool call; slower than this reads as git unavailable.
 _RECEIPT_GIT_TIMEOUT_SECONDS = 5.0
+# Rapid successive tool calls reuse one receipt; see _receipt_cache_key.
+_RECEIPT_TTL_DEFAULT_SECONDS = 2.0
 
 logger = logging.getLogger(__name__)
 
@@ -206,22 +212,127 @@ def _receipt_etag(parts: list[Any]) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+_receipt_cache: dict[str, tuple[float, tuple[Any, ...], dict[str, Any]]] = {}
+_receipt_cache_lock = threading.Lock()
+
+
+def clear_receipt_cache() -> None:
+    with _receipt_cache_lock:
+        _receipt_cache.clear()
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _read_small(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _git_dirs(root: Path) -> tuple[Path, Path] | None:
+    """``(git_dir, common_dir)``; a linked worktree's ``.git`` is a pointer file."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git, dot_git
+    pointer = _read_small(dot_git)
+    if not pointer or not pointer.startswith("gitdir:"):
+        return None
+    git_dir = Path(pointer[len("gitdir:"):].strip())
+    if not git_dir.is_absolute():
+        git_dir = root / git_dir
+    common = _read_small(git_dir / "commondir")
+    common_dir = (git_dir / common) if common else git_dir
+    return git_dir, common_dir
+
+
+_INDEX_KEY_POS = 4
+
+
+def _receipt_cache_key(root: Path, db_path: Path) -> tuple[Any, ...]:
+    """Everything cheap whose change must drop a cached receipt at once.
+
+    Graph writes land in the WAL before a checkpoint touches the database file,
+    so both are stat'ed. Edits to untracked files are only seen after the TTL.
+    """
+    from ..locking import probe
+
+    wal = _stat_key(Path(f"{db_path}-wal"))
+    key: list[Any] = [
+        # A reader's open creates an empty WAL; empty holds nothing the db lacks.
+        str(root), _stat_key(db_path), wal if wal and wal[1] else None,
+        probe(db_path).held,
+    ]
+    dirs = _git_dirs(root)
+    if dirs is not None:
+        git_dir, common_dir = dirs
+        head = _read_small(git_dir / "HEAD")
+        ref = None
+        if head and head.startswith("ref:"):
+            name = head[len("ref:"):].strip()
+            ref = _read_small(git_dir / name) or _read_small(common_dir / name)
+        key += [_stat_key(git_dir / "index"), head, ref,
+                _stat_key(common_dir / "packed-refs")]
+    return tuple(key)
+
+
 def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
     """The contract ``_graph`` receipt: legacy provenance plus readiness.
 
     Never raises. A database newer than this build yields an error-shaped
-    receipt (``status: error``, ``error_code: schema_too_new``).
+    receipt (``status: error``, ``error_code: schema_too_new``). Receipts are
+    reused for ``CRG_RECEIPT_TTL`` seconds (default 2, 0 disables) while the
+    graph, the writer lock, the git index and HEAD are unchanged.
     """
-    from ..contract import CONTRACT_VERSION
-    from ..migrations import SchemaTooNewError
-    from ..readiness import GIT_OK, generation_current, head_matches
-    from ..readiness_facts import gather_report
-
     try:
         root = _resolve_root(repo_root)
         db_path = get_db_path(root, read_only=True)
     except Exception:
         return None
+    ttl = env_float("CRG_RECEIPT_TTL", _RECEIPT_TTL_DEFAULT_SECONDS)
+    if ttl <= 0:
+        return _compute_graph_receipt(root, db_path)
+    try:
+        key = _receipt_cache_key(root, db_path)
+    except OSError:
+        logger.warning("Could not key the graph receipt cache for %s", root, exc_info=True)
+        return _compute_graph_receipt(root, db_path)
+    now = time.monotonic()
+    with _receipt_cache_lock:
+        hit = _receipt_cache.get(str(root))
+        if hit is not None and hit[1] == key and now - hit[0] < ttl:
+            return copy.deepcopy(hit[2])
+    receipt = _compute_graph_receipt(root, db_path)
+    if receipt is None:
+        return None
+    try:
+        after = _receipt_cache_key(root, db_path)
+    except OSError:
+        return receipt
+    # git status refreshes the index stat cache itself; anything else moving
+    # meanwhile means the receipt may already be old, so it is not kept.
+    if _without_index(after) == _without_index(key):
+        with _receipt_cache_lock:
+            _receipt_cache[str(root)] = (now, after, copy.deepcopy(receipt))
+    return receipt
+
+
+def _without_index(key: tuple[Any, ...]) -> tuple[Any, ...]:
+    return key[:_INDEX_KEY_POS] + key[_INDEX_KEY_POS + 1:]
+
+
+def _compute_graph_receipt(root: Path, db_path: Path) -> dict[str, Any] | None:
+    from ..contract import CONTRACT_VERSION
+    from ..migrations import SchemaTooNewError
+    from ..readiness import GIT_OK, generation_current, head_matches
+    from ..readiness_facts import gather_report
+
     try:
         report = gather_report(root, db_path, git_timeout=_RECEIPT_GIT_TIMEOUT_SECONDS)
     except SchemaTooNewError as exc:

@@ -214,3 +214,85 @@ def test_minimal_context_partial_index_still_answers(repo):
     assert result["status"] == "partial_index"
     assert result["readiness"]["status"] == "partial_index"
     assert result["failed_files"] == 1
+
+
+@pytest.fixture
+def git_status_calls(monkeypatch) -> list[Path]:
+    """Count the ``git status`` reads behind each uncached receipt."""
+    calls: list[Path] = []
+    real = common_module.read_dirty_paths
+
+    def counting(root, timeout=None):
+        calls.append(root)
+        return real(root, timeout=timeout)
+
+    monkeypatch.delenv("CRG_RECEIPT_TTL", raising=False)
+    monkeypatch.setattr(common_module, "read_dirty_paths", counting)
+    common_module.clear_receipt_cache()
+    yield calls
+    common_module.clear_receipt_cache()
+
+
+def test_receipt_reuses_git_facts_within_the_ttl(repo, git_status_calls):
+    first = common_module.graph_receipt(str(repo))
+    first["status"] = "mutated by a caller"
+    second = common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 1
+    assert second["status"] == "ok"
+
+
+def test_receipt_cache_expires_after_the_ttl(repo, git_status_calls, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(common_module.time, "monotonic", lambda: now[0])
+    common_module.graph_receipt(str(repo))
+    now[0] += 1.9
+    common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 1
+    now[0] += 0.2
+    common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 2
+
+
+def test_receipt_ttl_zero_disables_the_cache(repo, git_status_calls, monkeypatch):
+    monkeypatch.setenv("CRG_RECEIPT_TTL", "0")
+    common_module.graph_receipt(str(repo))
+    common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 2
+
+
+def test_graph_write_invalidates_the_receipt_cache(repo, git_status_calls):
+    before = common_module.graph_receipt(str(repo))["etag"]
+    store = GraphStore(_db(repo))
+    try:
+        store.set_metadata("last_updated", "2026-02-02T00:00:00")
+        store.commit()
+    finally:
+        store.close()
+    after = common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 2
+    assert after["etag"] != before
+
+
+def test_index_touch_invalidates_the_receipt_cache(repo, git_status_calls):
+    import os
+
+    common_module.graph_receipt(str(repo))
+    index = repo / ".git" / "index"
+    stat = index.stat()
+    os.utime(index, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 2
+
+
+def test_commit_invalidates_the_receipt_cache(repo, git_status_calls):
+    first = common_module.graph_receipt(str(repo))
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "next")
+    second = common_module.graph_receipt(str(repo))
+    assert len(git_status_calls) == 2
+    assert second["current_sha"] != first["current_sha"]
+
+
+def test_writer_lock_invalidates_the_receipt_cache(repo, git_status_calls):
+    assert common_module.graph_receipt(str(repo))["status"] == "ok"
+    with writer_lock(_db(repo)):
+        assert common_module.graph_receipt(str(repo))["status"] == "building"
