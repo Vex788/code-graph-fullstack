@@ -31,13 +31,15 @@ HCL) own REFERENCES edges of their own.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
+import os
 import posixpath
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..repo_config import JspResolverConfig, load_jsp_resolver_config
 
@@ -108,8 +110,17 @@ def _read(path: Path) -> str:
         return ""
 
 
-def _line_of(text: str, index: int) -> int:
-    return text.count("\n", 0, index) + 1
+class _Lines:
+    """1-based line of a character offset, by bisecting the newline offsets."""
+
+    def __init__(self, text: str) -> None:
+        self._newlines = [match.start() for match in _NEWLINE.finditer(text)]
+
+    def of(self, index: int) -> int:
+        return bisect.bisect_left(self._newlines, index) + 1
+
+
+_NEWLINE = re.compile("\n")
 
 
 def _route_annotation_pattern(route_annotations: tuple[str, ...]) -> re.Pattern[str]:
@@ -145,27 +156,92 @@ def _normalize_url(raw: str, dead_url_suffixes: tuple[str, ...]) -> str:
     return url if len(url) > 1 else ""
 
 
-def _binding_map(repo_root: Path, config: JspResolverConfig) -> dict[str, str]:
-    """URL path -> fully qualified Java class, from route-annotated classes."""
+def _java_sources(repo_root: Path, source_root: Path) -> list[Path]:
+    """``.java`` files under *source_root*, skipping ignored and symlinked trees."""
+    from ..incremental import _load_ignore_patterns, _should_ignore
+
+    patterns = _load_ignore_patterns(repo_root)
+    found: list[Path] = []
+    for directory, dirnames, filenames in os.walk(source_root):
+        base = Path(directory)
+        relative = base.relative_to(repo_root) if base.is_relative_to(repo_root) else None
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not (base / name).is_symlink()
+            and (relative is None or not _should_ignore((relative / name).as_posix(), patterns))
+        )
+        for name in sorted(filenames):
+            if not name.endswith(".java"):
+                continue
+            if relative is not None and _should_ignore((relative / name).as_posix(), patterns):
+                continue
+            found.append(base / name)
+    return found
+
+
+def _file_key(path: str, hashes: dict[str, str | None]) -> str | None:
+    """Cache key for one file's content: the graph's hash, else its stat."""
+    graph_hash = hashes.get(path)
+    if graph_hash:
+        return graph_hash
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _binding_map(
+    repo_root: Path,
+    config: JspResolverConfig,
+    hashes: dict[str, str | None],
+    cache: dict[str, Any],
+    fresh: dict[str, Any],
+) -> dict[str, str]:
+    """URL path -> fully qualified Java class, from route-annotated classes.
+
+    Each file's bindings are cached under its content key in *cache*; the
+    entries still in use are copied to *fresh*.
+    """
     route_pattern = _route_annotation_pattern(config.route_annotations)
     bindings: dict[str, str] = {}
     source_root = repo_root / config.source_root
     if not source_root.is_dir():
         return bindings
-    for java in source_root.rglob("*.java"):
-        text = _read(java)
-        if not any(f"@{name}" in text for name in config.route_annotations):
-            continue
-        package = PACKAGE_DECL.search(text)
-        klass = CLASS_DECL.search(text)
-        if not package or not klass:
-            continue
-        fqn = f"{package.group(1)}.{klass.group(1)}"
-        for match in route_pattern.finditer(text):
-            key = _normalize_url(match.group(1), config.dead_url_suffixes)
-            if key:
-                bindings.setdefault(key, fqn)
+    # The graph's Java files already follow the ignore policy; a graph that
+    # holds no Java File node (hand-seeded) falls back to walking the tree.
+    prefix = source_root.as_posix().rstrip("/") + "/"
+    indexed = sorted(qn for qn in hashes if qn.endswith(".java") and qn.startswith(prefix))
+    for path in indexed or [java.as_posix() for java in _java_sources(repo_root, source_root)]:
+        key = _file_key(path, hashes)
+        cached = cache.get(path)
+        if key is not None and cached is not None and cached[0] == key:
+            found = cached[1]
+        else:
+            found = _java_bindings(_read(Path(path)), config, route_pattern)
+        if key is not None:
+            fresh[path] = [key, found]
+        for route, fqn in found:
+            bindings.setdefault(route, fqn)
     return bindings
+
+
+def _java_bindings(
+    text: str, config: JspResolverConfig, route_pattern: re.Pattern[str],
+) -> list[list[str]]:
+    if not any(f"@{name}" in text for name in config.route_annotations):
+        return []
+    package = PACKAGE_DECL.search(text)
+    klass = CLASS_DECL.search(text)
+    if not package or not klass:
+        return []
+    fqn = f"{package.group(1)}.{klass.group(1)}"
+    found = []
+    for match in route_pattern.finditer(text):
+        key = _normalize_url(match.group(1), config.dead_url_suffixes)
+        if key:
+            found.append([key, fqn])
+    return found
 
 
 def _graph_pages(conn, language: str) -> list[str]:
@@ -335,6 +411,67 @@ def resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
         return _resolve_jsp_links(store, repo_root)
 
 
+# Per-file extraction cache, kept with the graph and invalidated with the
+# config or this format.
+_STATE_KEY = "jsp_resolver_state"
+_STATE_VERSION = 1
+# Pre-binding link records: (tag, raw text, line).
+_Raw = list
+
+
+def _extract_page(text: str, kind: str, bean_pattern: re.Pattern[str]) -> list[_Raw]:
+    """The raw links of one page or script, in the order edges are emitted.
+
+    Tags: B bean class, R request URL, I include, S script src, C stylesheet,
+    P page link.
+    """
+    lines = _Lines(text)
+    found: list[_Raw] = []
+    if kind == "jsp":
+        for match in bean_pattern.finditer(text):
+            found.append(["B", match.group(1), lines.of(match.start())])
+    request_patterns = (
+        (HREF_URL, AJAX_URL, FETCH_URL) if kind == "jsp"
+        else (AJAX_URL, FETCH_URL) if kind == "javascript" else ()
+    )
+    for pattern in request_patterns:
+        for match in pattern.finditer(text):
+            found.append(["R", match.group(1), lines.of(match.start())])
+    if kind == "jsp":
+        for pattern in (INCLUDE_DIRECTIVE, INCLUDE_TAG):
+            for match in pattern.finditer(text):
+                found.append(["I", match.group(1), lines.of(match.start())])
+    if kind in ("jsp", "html"):
+        for match in SCRIPT_TAG.finditer(text):
+            source_attr = _tag_attributes(match.group(0)).get("src")
+            if source_attr:
+                found.append(["S", source_attr, lines.of(match.start())])
+        for match in LINK_TAG.finditer(text):
+            attributes = _tag_attributes(match.group(0))
+            href = attributes.get("href")
+            if href and "stylesheet" in attributes.get("rel", "").lower():
+                found.append(["C", href, lines.of(match.start())])
+        for pattern in (ANCHOR_HREF, FORM_ACTION):
+            for match in pattern.finditer(text):
+                found.append(["P", match.group(1), lines.of(match.start())])
+    return found
+
+
+def _load_state(store: GraphStore, fingerprint: str) -> dict[str, Any]:
+    raw = store.get_metadata(_STATE_KEY)
+    try:
+        state = json.loads(raw) if raw else None
+    except ValueError:
+        state = None
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != _STATE_VERSION
+        or state.get("config") != fingerprint
+    ):
+        return {"pages": {}, "java": {}}
+    return state
+
+
 def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     repo_root = Path(repo_root).resolve()
     config = load_jsp_resolver_config(repo_root)
@@ -345,17 +482,8 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
 
     conn = store._conn  # intentional: bounded post-build maintenance pass
 
-    # Idempotent rebuild: clear this resolver's own rows before recomputing
-    # them. RENDERS/REQUESTS/INCLUDES have no other producer; REFERENCES
-    # does (Blade, HCL), so its deletion is scoped to page-file sources —
-    # including edges whose page File node is already gone, which would
-    # otherwise survive every rebuild as stale rows.
-    conn.execute("DELETE FROM edges WHERE kind IN ('RENDERS', 'REQUESTS', 'INCLUDES')")
-    conn.execute(
-        "DELETE FROM edges WHERE kind = 'REFERENCES' AND source_qualified IN ("
-        "SELECT qualified_name FROM nodes "
-        "WHERE kind = 'File' AND language IN ('jsp', 'html'))"
-    )
+    # REFERENCES edges whose page File node is already gone would otherwise
+    # survive every rebuild as stale rows.
     stale_page_refs = " OR ".join(
         f"file_path LIKE '%{suffix}'" for suffix in PAGE_SUFFIXES
     )
@@ -369,20 +497,38 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     html_pages = _graph_pages(conn, "html")
     scripts = _graph_scripts(conn)
     if not jsp_pages and not html_pages and not scripts:
+        _write_edges(conn, [])
         store._invalidate_cache()
         return dict(_STATS_ZERO)
 
-    file_index = {
-        row["qualified_name"]
+    hashes: dict[str, str | None] = {
+        row["qualified_name"]: row["file_hash"]
         for row in conn.execute(
-            "SELECT qualified_name FROM nodes WHERE kind = 'File'"
+            "SELECT qualified_name, file_hash FROM nodes WHERE kind = 'File'"
         ).fetchall()
     }
+    file_index = set(hashes)
+    fingerprint = repr((config, _STATE_VERSION))
+    state = _load_state(store, fingerprint)
+    fresh: dict[str, Any] = {"version": _STATE_VERSION, "config": fingerprint,
+                             "pages": {}, "java": {}}
     classes = _class_index(conn)
     endpoints = _endpoint_map(conn, config.dead_url_suffixes)
-    bindings = _binding_map(repo_root, config)
+    bindings = _binding_map(repo_root, config, hashes, state["java"], fresh["java"])
     bean_pattern = _bean_attribute_pattern(config)
     web_root = (repo_root / config.web_root).resolve()
+
+    def _links(qualified: str, kind: str) -> list[_Raw]:
+        key = _file_key(qualified, hashes)
+        cached = state["pages"].get(qualified)
+        if key is not None and cached is not None and cached[0] == key:
+            found = cached[1]
+        else:
+            text = _read(Path(qualified))
+            found = _extract_page(text, kind, bean_pattern) if text else []
+        if key is not None:
+            fresh["pages"][qualified] = [key, found]
+        return found
 
     renders: list[_Link] = []
     requests: list[_Link] = []
@@ -414,117 +560,51 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
         unresolved_targets += 1
         return fqn, {"resolution": "raw", "fqn": fqn, "unresolved": True}
 
-    def _collect_requests(source_qn: str, text: str, patterns: tuple[re.Pattern[str], ...]) -> None:
-        for pattern in patterns:
-            for match in pattern.finditer(text):
-                route = _normalize_url(match.group(1), config.dead_url_suffixes)
-                if not route:
-                    continue
-                bound = _bind_route(route)
-                if bound is None:
-                    continue
-                target, binding_extra = bound
-                extra = {"route": route, "url": match.group(1), **binding_extra}
-                requests.append(
-                    ("REQUESTS", source_qn, target, _line_of(text, match.start()), extra)
-                )
-
-    def _collect_references(source_qn: str, text: str) -> None:
+    def _bind(source_qn: str, found: list[_Raw]) -> None:
         nonlocal unresolved_references
-
-        def _record_miss(countable: bool) -> None:
-            nonlocal unresolved_references
-            if countable:
-                unresolved_references += 1
-
-        def _page_link(raw: str, index: int) -> None:
-            resolved, countable = _resolve_reference(
-                source_qn, raw, web_root, config.context_paths, file_index,
-            )
-            if resolved is None:
-                _record_miss(countable)
-                return
-            if not resolved.endswith(PAGE_SUFFIXES):
-                return
-            references.append((
-                "REFERENCES", source_qn, resolved, _line_of(text, index),
-                {"asset": "page", "href": raw},
-            ))
-
-        for match in SCRIPT_TAG.finditer(text):
-            source_attr = _tag_attributes(match.group(0)).get("src")
-            if not source_attr:
-                continue
-            resolved, countable = _resolve_reference(
-                source_qn, source_attr, web_root, config.context_paths, file_index,
-            )
-            if resolved is None:
-                _record_miss(countable)
-                continue
-            references.append((
-                "REFERENCES", source_qn, resolved, _line_of(text, match.start()),
-                {"asset": "script", "href": source_attr},
-            ))
-
-        for match in LINK_TAG.finditer(text):
-            attributes = _tag_attributes(match.group(0))
-            href = attributes.get("href")
-            if not href or "stylesheet" not in attributes.get("rel", "").lower():
-                continue
-            resolved, countable = _resolve_reference(
-                source_qn, href, web_root, config.context_paths, file_index,
-            )
-            if resolved is None:
-                _record_miss(countable)
-                continue
-            references.append((
-                "REFERENCES", source_qn, resolved, _line_of(text, match.start()),
-                {"asset": "stylesheet", "href": href},
-            ))
-
-        for match in ANCHOR_HREF.finditer(text):
-            _page_link(match.group(1), match.start())
-
-        for match in FORM_ACTION.finditer(text):
-            _page_link(match.group(1), match.start())
-
-    for page_qn in jsp_pages:
-        text = _read(Path(page_qn))
-        if not text:
-            continue
-
-        for match in bean_pattern.finditer(text):
-            target, binding_extra = _bind_bean(match.group(1))
-            renders.append((
-                "RENDERS", page_qn, target, _line_of(text, match.start()), binding_extra,
-            ))
-
-        _collect_requests(page_qn, text, (HREF_URL, AJAX_URL, FETCH_URL))
-
-        for pattern in (INCLUDE_DIRECTIVE, INCLUDE_TAG):
-            for match in pattern.finditer(text):
-                target, _countable = _resolve_reference(
-                    page_qn, match.group(1), web_root, config.context_paths, file_index,
+        for tag, raw, line in found:
+            if tag == "B":
+                target, binding_extra = _bind_bean(raw)
+                renders.append(("RENDERS", source_qn, target, line, binding_extra))
+            elif tag == "R":
+                route = _normalize_url(raw, config.dead_url_suffixes)
+                bound = _bind_route(route) if route else None
+                if bound is not None:
+                    target, binding_extra = bound
+                    extra = {"route": route, "url": raw, **binding_extra}
+                    requests.append(("REQUESTS", source_qn, target, line, extra))
+            else:
+                resolved, countable = _resolve_reference(
+                    source_qn, raw, web_root, config.context_paths, file_index,
                 )
-                if target is not None and target.endswith(PAGE_SUFFIXES):
-                    includes.append((
-                        "INCLUDES", page_qn, target, _line_of(text, match.start()),
-                        {"href": match.group(1)},
+                if tag == "I":
+                    if resolved is not None and resolved.endswith(PAGE_SUFFIXES):
+                        includes.append(("INCLUDES", source_qn, resolved, line, {"href": raw}))
+                elif resolved is None:
+                    if countable:
+                        unresolved_references += 1
+                elif tag == "S":
+                    references.append((
+                        "REFERENCES", source_qn, resolved, line,
+                        {"asset": "script", "href": raw},
+                    ))
+                elif tag == "C":
+                    references.append((
+                        "REFERENCES", source_qn, resolved, line,
+                        {"asset": "stylesheet", "href": raw},
+                    ))
+                elif resolved.endswith(PAGE_SUFFIXES):
+                    references.append((
+                        "REFERENCES", source_qn, resolved, line,
+                        {"asset": "page", "href": raw},
                     ))
 
-        _collect_references(page_qn, text)
-
+    for page_qn in jsp_pages:
+        _bind(page_qn, _links(page_qn, "jsp"))
     for page_qn in html_pages:
-        text = _read(Path(page_qn))
-        if not text:
-            continue
-        _collect_references(page_qn, text)
-
+        _bind(page_qn, _links(page_qn, "html"))
     for script_qn in scripts:
-        text = _read(Path(script_qn))
-        if not text:
-            continue
-        _collect_requests(script_qn, text, (AJAX_URL, FETCH_URL))
+        _bind(script_qn, _links(script_qn, "javascript"))
 
     deduped = {
         "RENDERS": _dedupe(renders),
@@ -532,18 +612,13 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
         "INCLUDES": _dedupe(includes),
         "REFERENCES": _dedupe(references, by_asset=True),
     }
-    now = time.time()
-    edge_rows = [
-        (kind, source, target, source, line, json.dumps(extra, sort_keys=True), now)
+    _write_edges(conn, [
+        (kind, source, target, source, line, json.dumps(extra, sort_keys=True))
         for kind, links in deduped.items()
         for _kind, source, target, line, extra in links
-    ]
-    conn.executemany(
-        """INSERT INTO edges (kind, source_qualified, target_qualified,
-           file_path, line, extra, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        edge_rows,
-    )
+    ])
+    if fresh != state:
+        store.set_metadata(_STATE_KEY, json.dumps(fresh, separators=(",", ":")))
     store._invalidate_cache()
 
     result = {
@@ -559,3 +634,40 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     }
     logger.info("JSP link resolution: %s", result)
     return result
+
+
+def _write_edges(conn, wanted: list[tuple]) -> None:
+    """Make this resolver's edges exactly *wanted*, touching only the difference.
+
+    RENDERS/REQUESTS/INCLUDES have no other producer; REFERENCES does (Blade,
+    HCL), so only those sourced at a page File node are this resolver's.
+    """
+    existing: dict[tuple, list[int]] = {}
+    for row in conn.execute(
+        "SELECT id, kind, source_qualified, target_qualified, file_path, line, extra "
+        "FROM edges WHERE kind IN ('RENDERS', 'REQUESTS', 'INCLUDES') "
+        "UNION ALL "
+        "SELECT id, kind, source_qualified, target_qualified, file_path, line, extra "
+        "FROM edges WHERE kind = 'REFERENCES' AND source_qualified IN ("
+        "SELECT qualified_name FROM nodes WHERE kind = 'File' AND language IN ('jsp', 'html'))"
+    ):
+        key = (row[1], row[2], row[3], row[4], row[5], row[6])
+        existing.setdefault(key, []).append(row[0])
+    inserts = []
+    for key in wanted:
+        ids = existing.get(key)
+        if ids:
+            ids.pop()
+        else:
+            inserts.append(key)
+    stale = [(edge_id,) for ids in existing.values() for edge_id in ids]
+    if stale:
+        conn.executemany("DELETE FROM edges WHERE id = ?", stale)
+    if inserts:
+        now = time.time()
+        conn.executemany(
+            """INSERT INTO edges (kind, source_qualified, target_qualified,
+               file_path, line, extra, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [(*key, now) for key in inserts],
+        )

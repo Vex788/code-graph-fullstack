@@ -110,9 +110,17 @@ def test_spring_resolver_failure_keeps_previous_edges(built_repo, monkeypatch):
     )
 
 
+def _shift_jsp_edges(store: GraphStore) -> None:
+    """Make the resolver's edges wrong so the rerun must delete and insert."""
+    store._conn.execute(
+        "UPDATE edges SET line = line + 1000 WHERE kind IN ('RENDERS', 'REQUESTS')"
+    )
+
+
 def test_jsp_resolver_failure_keeps_previous_edges(built_repo, monkeypatch):
     _assert_rolled_back(
         built_repo, lambda store: resolve_jsp_links(store, built_repo), monkeypatch,
+        prepare=_shift_jsp_edges,
     )
 
 
