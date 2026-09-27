@@ -1,0 +1,65 @@
+# Where the graph kit lands in each harness. Paths are relative to the target
+# root (``--root``, else ``default_root``). ``command_root`` is how hook
+# commands spell that root at runtime. ``vars`` feed {{var}} in kit templates.
+# ``regions`` fill <!-- crg-kit:begin id --> markers in hand-maintained files.
+
+[targets.claude]
+default_root = "~/.claude"
+command_root = "$HOME/.claude"
+hooks_dir = "hooks"
+skills_dir = "skills"
+data_dir = "hooks"
+edit_matcher = "Edit|Write|MultiEdit"
+regions = []
+
+[targets.claude.events]
+post_tool_use = "PostToolUse"
+session_start = "SessionStart"
+
+[targets.claude.vars]
+rules_file = "CLAUDE.md"
+
+[targets.zcode]
+default_root = "~/.zcode/harness"
+command_root = "$HOME/.zcode/harness"
+hooks_dir = "hooks"
+skills_dir = "skills"
+data_dir = "hooks"
+# ZCode emits ApplyPatch for edits; Claude Code never does.
+edit_matcher = "Edit|Write|MultiEdit|ApplyPatch"
+regions = [
+  { file = "agent-src/blocks/graph-search.md", id = "graph-search", block = "graph-search" },
+]
+
+[targets.zcode.events]
+post_tool_use = "PostToolUse"
+session_start = "SessionStart"
+
+[targets.zcode.vars]
+rules_file = "AGENTS.md"
+
+# The plugin directory has no default; pass --root.
+[targets.bug-hunter]
+command_root = "${CLAUDE_PLUGIN_ROOT}"
+hooks_dir = "hooks"
+skills_dir = "skills"
+data_dir = "hooks"
+edit_matcher = "Edit|Write|MultiEdit|ApplyPatch"
+regions = []
+
+[targets.bug-hunter.events]
+post_tool_use = "PostToolUse"
+session_start = "SessionStart"
+
+[targets.bug-hunter.vars]
+rules_file = "CLAUDE.md"
+
+# laya owns its files; the kit only fills marker regions there.
+[targets.laya]
+regions_only = true
+regions = [
+  { file = "README.md", id = "graph-search", block = "graph-search" },
+]
+
+[targets.laya.vars]
+rules_file = "AGENTS.md"

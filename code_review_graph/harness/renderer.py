@@ -1,0 +1,183 @@
+"""Directive engine shared with zcode-harness ``bin/render-agents``.
+
+Templates use the same syntax in both places, so a kit block renders the
+same whichever tool includes it:
+
+- ``<!-- if:zcode -->`` ... ``<!-- endif -->`` keeps the text only for that
+  target, either as whole lines or inline. ``if:claude|zcode`` matches
+  either target (zcode's engine takes a single name only).
+- ``{{block:name}}`` on its own line includes ``blocks/name.md``.
+- ``{{var}}`` and ``{{var|default}}`` substitute variables.
+
+``render_role`` and ``build_roles`` reproduce render-agents' role output
+byte for byte (a test keeps them in parity). Hand-maintained files instead
+carry marker regions, ``<!-- crg-kit:begin id -->`` ... ``<!-- crg-kit:end id -->``
+(or the ``#`` comment form), and only the text between the markers is ours.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+_TARGETS = r"[\w-]+(?:\|[\w-]+)*"
+BLOCK = re.compile(rf"^<!-- if:({_TARGETS}) -->\n(.*?)^<!-- endif -->\n", re.M | re.S)
+INLINE = re.compile(rf"<!-- if:({_TARGETS}) -->(.*?)<!-- endif -->", re.S)
+INCLUDE = re.compile(r"^\{\{block:([\w-]+)\}\}$", re.M)
+VAR = re.compile(r"\{\{(\w+)(?:\|([^}]*))?\}\}")
+_LEFTOVER = re.compile(r"<!-- (?:if:|endif -->)|\{\{block:")
+_INCLUDE_DEPTH = 4
+
+
+class RenderError(ValueError):
+    """A template could not be rendered (unknown block, unresolved variable)."""
+
+
+class RegionMissingError(LookupError):
+    """A hand-maintained file lacks the begin/end markers of a kit region."""
+
+
+def render_text(
+    text: str,
+    target: str,
+    lookup: Callable[[str], str | None],
+    blocks: Mapping[str, str],
+    name: str = "template",
+) -> str:
+    """Resolve includes, then conditionals, then variables, as render-agents does."""
+    for _ in range(_INCLUDE_DEPTH):
+        text = INCLUDE.sub(lambda m: _block(blocks, m.group(1), name).rstrip("\n"), text)
+
+    def keep(m: re.Match[str]) -> str:
+        return m.group(2) if target in m.group(1).split("|") else ""
+
+    text = substitute_vars(INLINE.sub(keep, BLOCK.sub(keep, text)), lookup, name)
+    if _LEFTOVER.search(text):
+        raise RenderError(f"{name}/{target}: leftover directive")
+    return text
+
+
+def substitute_vars(text: str, lookup: Callable[[str], str | None], name: str) -> str:
+    def var(m: re.Match[str]) -> str:
+        value = lookup(m.group(1))
+        if value is None:
+            value = m.group(2)
+        if value is None:
+            raise RenderError(f"{name}: unresolved {{{{{m.group(1)}}}}}")
+        return value
+
+    return VAR.sub(var, text)
+
+
+def _block(blocks: Mapping[str, str], key: str, name: str) -> str:
+    try:
+        return blocks[key]
+    except KeyError:
+        raise RenderError(f"{name}: unknown block {key!r}") from None
+
+
+def load_blocks(directory: Path) -> dict[str, str]:
+    if not directory.is_dir():
+        return {}
+    return {
+        path.stem: path.read_text(encoding="utf-8")
+        for path in sorted(directory.glob("*.md"))
+    }
+
+
+# --- render-agents role files -------------------------------------------------
+
+
+def parse_role(text: str, name: str = "role") -> tuple[dict[str, str], str]:
+    m = re.match(r"---\n(.*?)\n---\n\n(.*)\Z", text, re.S)
+    if not m:
+        raise RenderError(f"{name}: bad role frontmatter")
+    meta: dict[str, str] = {}
+    for line in m.group(1).split("\n"):
+        key, value = line.split(": ", 1)
+        meta[key] = value
+    return meta, m.group(2)
+
+
+def render_role(
+    role: str,
+    meta: Mapping[str, str],
+    body: str,
+    target: str,
+    cfg: Mapping[str, Any],
+    blocks: Mapping[str, str],
+) -> str:
+    """Render one role for one harness exactly as render-agents' ``render``."""
+    model = cfg["models"][meta["tier"]]
+    effort = cfg["effort_map"][meta["effort"]]
+    names = [s.strip() for s in meta.get("skills", "").split(",") if s.strip()]
+    skills = ", ".join(cfg["skills_prefix"] + n for n in names)
+    computed = {"name": meta["name"], "model": model, "effort": effort}
+    template = cfg["model_line_inherit"] if model == "inherit" else cfg["model_line"]
+    computed["model_line"] = template.format(**computed)
+
+    def lookup(key: str) -> str | None:
+        for source in (
+            meta.get(f"{key}.{target}"), meta.get(key), cfg["vars"].get(key), computed.get(key),
+        ):
+            if source is not None:
+                return source
+        return None
+
+    rendered = render_text(body, target, lookup, blocks, role)
+    desc = substitute_vars(meta["description"], lookup, role)
+    if "<!-- " in rendered or "{{" in rendered:
+        raise RenderError(f"{role}/{target}: leftover directive")
+    front = (
+        f"---\nname: {meta['name']}\ndescription: {desc}\nmodel: {model}\n"
+        f"{cfg['effort_key']}: {effort}\n"
+    )
+    if skills:
+        front += f"skills: {skills}\n"
+    return front + "---\n\n" + rendered
+
+
+def build_roles(src: Path, cfg: Mapping[str, Any] | None = None) -> dict[tuple[str, str], str]:
+    """Render every role in ``src/roles`` for each harness it names."""
+    if cfg is None:
+        cfg = json.loads((src / "harnesses.json").read_text(encoding="utf-8"))
+    blocks = load_blocks(src / "blocks")
+    out: dict[tuple[str, str], str] = {}
+    for path in sorted((src / "roles").glob("*.md")):
+        meta, body = parse_role(path.read_text(encoding="utf-8"), path.name)
+        if meta["name"] != path.stem:
+            raise RenderError(f"{path.name}: name != filename stem")
+        for harness in (h.strip() for h in meta["harnesses"].split(",")):
+            out[(harness, path.name)] = render_role(
+                path.stem, meta, body, harness, cfg[harness], blocks,
+            )
+    return out
+
+
+# --- marker regions -------------------------------------------------------------
+
+
+def _region_pattern(region_id: str) -> re.Pattern[str]:
+    rid = re.escape(region_id)
+    begin = rf"(?:<!-- crg-kit:begin {rid} -->|#+ crg-kit:begin {rid})"
+    end = rf"(?:<!-- crg-kit:end {rid} -->|#+ crg-kit:end {rid})"
+    return re.compile(rf"(^[ \t]*{begin}[ \t]*\r?\n)(.*?)(^[ \t]*{end}[ \t]*$)", re.M | re.S)
+
+
+def read_region(text: str, region_id: str) -> str:
+    m = _region_pattern(region_id).search(text)
+    if not m:
+        raise RegionMissingError(region_id)
+    return m.group(2)
+
+
+def replace_region(text: str, region_id: str, content: str) -> str:
+    """Replace the body between a region's markers; every other byte stays put."""
+    m = _region_pattern(region_id).search(text)
+    if not m:
+        raise RegionMissingError(region_id)
+    if content and not content.endswith("\n"):
+        content += "\n"
+    return text[: m.start(2)] + content + text[m.end(2):]

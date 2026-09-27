@@ -1,0 +1,1 @@
+Code search opens with code-review-graph: check the `_graph` receipt, then use `query_graph_tool`, `semantic_search_nodes_tool` or `get_impact_radius_tool` for the task area. Grep is for exact symbols and literals.
