@@ -297,6 +297,8 @@ def get_minimal_context(
             response["failed_files"] = facts.failed_files
             response["resolver_failures"] = facts.resolver_failures
         response["readiness"] = status_block
+        # ok only when readiness is ok; partial_index is the contract's degraded value.
+        response["status"] = readiness.status.value
         return response
     finally:
         store.close()

@@ -195,6 +195,6 @@ def test_minimal_context_partial_index_still_answers(repo):
     store.commit()
     store.close()
     result = get_minimal_context(repo_root=str(repo))
-    assert result["status"] == "ok"
+    assert result["status"] == "partial_index"
     assert result["readiness"]["status"] == "partial_index"
     assert result["failed_files"] == 1

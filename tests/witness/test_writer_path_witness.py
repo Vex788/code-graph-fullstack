@@ -33,10 +33,6 @@ def _function_names(repo: Path, relative: str) -> set[str]:
         store.close()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="W2b: get_minimal_context returns status ok while readiness is partial_index",
-)
 def test_resolver_failure_is_not_reported_ok(fixture_repo: Path, monkeypatch):
     from code_review_graph import resolvers
     from code_review_graph.tools.context import get_minimal_context
@@ -52,6 +48,7 @@ def test_resolver_failure_is_not_reported_ok(fixture_repo: Path, monkeypatch):
 
     context = get_minimal_context(task="review", repo_root=str(fixture_repo))
     assert context["status"] != "ok", "a build whose resolver crashed reads as ok"
+    assert context["status"] == context["readiness"]["status"] == "partial_index"
 
 
 def test_failed_parse_is_retried_by_next_update(fixture_repo: Path, monkeypatch):

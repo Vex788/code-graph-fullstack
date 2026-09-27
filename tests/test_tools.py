@@ -2101,7 +2101,8 @@ class TestGetMinimalContext:
         result = get_minimal_context(
             task="explore codebase", repo_root=str(self.root),
         )
-        assert result["status"] == "ok"
+        # app.py is indexed but absent on disk: usable, labelled, not "ok".
+        assert result["status"] == result["readiness"]["status"] == "stale_worktree"
         assert "summary" in result
         assert "next_tool_suggestions" in result
 

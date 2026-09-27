@@ -1319,7 +1319,8 @@ def test_edited_indexed_file_warns_but_stays_usable(tmp_path: Path) -> None:
     (repo / "a.py").write_text("def alpha():\n    return 99\n")
 
     result = _readiness(repo)
-    assert result["status"] == "ok"
+    # Labelled, not refused: the answer carries the stale files.
+    assert result["status"] == result["readiness"]["status"] == "stale_worktree"
     assert result["stale_files"] == ["a.py"]
     assert result["stale_file_count"] == 1
 
@@ -1379,7 +1380,7 @@ def test_graph_without_the_dirty_snapshot_says_so_instead_of_hashing_everything(
         store.commit()
 
     result = _readiness(repo)
-    assert result["status"] == "ok"
+    assert result["status"] == result["readiness"]["status"] == "stale_worktree"
     assert result["content_check"] == "unavailable"
 
 
