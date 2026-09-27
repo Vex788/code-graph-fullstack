@@ -23,7 +23,7 @@ import logging
 import sqlite3
 from typing import Any
 
-from .graph import GraphStore
+from .graph import GraphStore, fts_triggers_installed, node_signature
 
 logger = logging.getLogger(__name__)
 
@@ -98,24 +98,12 @@ def _compute_signatures(
     """Compute human-readable signatures for nodes that lack one."""
     try:
         rows = store.get_nodes_without_signature()
-        for row in rows:
-            node_id, name, kind, params, ret = (
-                row[0],
-                row[1],
-                row[2],
-                row[3],
-                row[4],
-            )
-            if kind in ("Function", "Test"):
-                sig = f"def {name}({params or ''})"
-                if ret:
-                    sig += f" -> {ret}"
-            elif kind == "Class":
-                sig = f"class {name}"
-            else:
-                sig = name
-            store.update_node_signature(node_id, sig[:512])
-        store.commit()
+        with store.transaction():
+            for row in rows:
+                node_id, name, kind, params, ret = row[0], row[1], row[2], row[3], row[4]
+                store.update_node_signature(
+                    node_id, node_signature(kind, name, params, ret),
+                )
         result["signatures_computed"] = len(rows)
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
         logger.warning("Signature computation failed: %s", e)
@@ -127,10 +115,15 @@ def _rebuild_fts_index(
     result: dict[str, Any],
     warnings: list[str],
 ) -> None:
-    """Rebuild the FTS5 full-text search index."""
+    """Rebuild the FTS5 index, unless its triggers already keep it in sync."""
     try:
         from .search import rebuild_fts_index
 
+        if fts_triggers_installed(store):
+            result["fts_indexed"] = int(
+                store._conn.execute("SELECT count(*) FROM nodes").fetchone()[0]
+            )
+            return
         fts_count = rebuild_fts_index(store)
         result["fts_indexed"] = fts_count
     except (sqlite3.OperationalError, ImportError) as e:

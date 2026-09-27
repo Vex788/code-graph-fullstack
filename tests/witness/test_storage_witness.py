@@ -11,25 +11,26 @@ from pathlib import Path
 
 from .conftest import build, copy_fixture
 
-# Child writer A: a slow first file store keeps SQLite's write lock for longer
-# than the store's busy_timeout (5 s today), then the build finishes normally.
+# Child writer A: a slow first file store keeps SQLite's write lock (inside the
+# batch transaction) for longer than the old 5 s busy_timeout, then the build
+# finishes normally.
 _SLOW_WRITER = """
 import sys, time
 from pathlib import Path
 from code_review_graph.graph import GraphStore
 
 repo, marker, hold = sys.argv[1], Path(sys.argv[2]), float(sys.argv[3])
-original = GraphStore.upsert_node
+original = GraphStore._store_file_rows
 state = {"slept": False}
 
-def slow_upsert(self, node, file_hash=""):
+def slow_store(self, *args, **kwargs):
     if not state["slept"]:
         state["slept"] = True
         marker.write_text("holding")
         time.sleep(hold)
-    return original(self, node, file_hash=file_hash)
+    return original(self, *args, **kwargs)
 
-GraphStore.upsert_node = slow_upsert
+GraphStore._store_file_rows = slow_store
 sys.argv = ["code-review-graph", "build", "--repo", repo]
 from code_review_graph.cli import main
 main()

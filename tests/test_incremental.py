@@ -700,7 +700,14 @@ class TestGitOperations:
             stderr=b"fatal: not a git repository",
         )
 
-        assert get_staged_and_unstaged(tmp_path) == []
+        # A failed git status is "unavailable", never an empty (clean) tree.
+        assert get_staged_and_unstaged(tmp_path) is None
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_staged_and_unstaged_timeout_is_unavailable(self, mock_run, tmp_path):
+        mock_run.side_effect = subprocess.TimeoutExpired(["git", "status"], 30)
+
+        assert get_staged_and_unstaged(tmp_path) is None
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_all_tracked_files(self, mock_run, tmp_path):
@@ -1567,6 +1574,11 @@ class TestWatchReconciliation:
             with (
                 patch("watchdog.observers.Observer") as observer,
                 patch("time.sleep", side_effect=KeyboardInterrupt),
+                # Triggers keep FTS in sync; force the rebuild path to fail it.
+                patch(
+                    "code_review_graph.postprocessing.fts_triggers_installed",
+                    return_value=False,
+                ),
                 patch(
                     "code_review_graph.search.rebuild_fts_index",
                     side_effect=sqlite3.OperationalError("forced FTS failure"),
@@ -1904,9 +1916,15 @@ class TestWatchReconciliation:
         store = GraphStore(tmp_path / "graph.db")
         handler = _create_watch_handler(tmp_path, store, run_post_processing)
         try:
-            with patch(
-                "code_review_graph.search.rebuild_fts_index",
-                side_effect=sqlite3.OperationalError("forced FTS failure"),
+            with (
+                patch(
+                    "code_review_graph.postprocessing.fts_triggers_installed",
+                    return_value=False,
+                ),
+                patch(
+                    "code_review_graph.search.rebuild_fts_index",
+                    side_effect=sqlite3.OperationalError("forced FTS failure"),
+                ),
             ):
                 handler.process([FileCreatedEvent(str(source))])
 

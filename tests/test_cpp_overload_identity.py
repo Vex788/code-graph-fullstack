@@ -4,9 +4,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import CPP_IDENTITY_VERSION, incremental_update
+from code_review_graph.incremental import full_build, incremental_update
+from code_review_graph.migrations import INDEX_GENERATION
 from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
 from code_review_graph.tools.query import query_graph
+
+
+def _mark_legacy_generation(store: GraphStore) -> None:
+    """Make *store* look like a graph written by an older indexer."""
+    store.set_metadata("index_generation", "0")
 
 
 def _index_source(tmp_path: Path, source: str) -> tuple[Path, GraphStore]:
@@ -618,15 +624,19 @@ def test_incremental_upgrade_rebuilds_cpp_identities_and_removes_stale_edges(
             line=1,
         ))
         store.commit()
+        _mark_legacy_generation(store)
 
         with patch(
             "code_review_graph.incremental.get_all_tracked_files",
             return_value=["callee.cpp", "caller.cpp"],
         ):
             result = incremental_update(tmp_path, store, changed_files=[])
+            assert result["status"] == "rebuild_required"
+            assert "write_epoch" not in result
+            assert store.get_node(legacy_callee) is not None
+            full_build(tmp_path, store)
 
-        assert result["identity_rebuild"] is True
-        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_metadata("index_generation") == str(INDEX_GENERATION)
         assert store.get_node(legacy_callee) is None
         assert store.get_node(f"{callee_path.as_posix()}::run(int)") is not None
         assert all(
@@ -696,6 +706,7 @@ def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path)
             language="cpp",
         ))
         store.commit()
+        _mark_legacy_generation(store)
 
         with (
             patch(
@@ -707,11 +718,11 @@ def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path)
                 side_effect=RuntimeError("simulated parse failure"),
             ),
         ):
-            failed = incremental_update(tmp_path, store, changed_files=[])
+            failed = full_build(tmp_path, store)
 
-        assert failed["identity_rebuild"] is True
-        assert failed["errors"]
-        assert store.get_metadata("cpp_identity_version") is None
+        assert failed["status"] == "partial"
+        assert failed["failed_files"] == ["run.cpp"]
+        assert store.get_metadata("failed_files") == '["run.cpp"]'
         assert store.get_node(legacy_qn) is not None
 
         with patch(
@@ -720,9 +731,10 @@ def test_failed_cpp_identity_upgrade_remains_pending_and_retries(tmp_path: Path)
         ):
             retried = incremental_update(tmp_path, store, changed_files=[])
 
-        assert retried["identity_rebuild"] is True
+        assert retried["status"] == "ok"
         assert retried["errors"] == []
-        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        assert store.get_metadata("failed_files") == "[]"
+        assert store.get_metadata("index_generation") == str(INDEX_GENERATION)
         assert store.get_node(legacy_qn) is None
         assert store.get_node(f"{source_path.as_posix()}::run(int)") is not None
     finally:
@@ -1169,6 +1181,7 @@ def test_non_cpp_failure_does_not_repeat_cpp_identity_migration(tmp_path: Path):
             language="cpp",
         ))
         store.commit()
+        _mark_legacy_generation(store)
 
         with (
             patch(
@@ -1177,17 +1190,19 @@ def test_non_cpp_failure_does_not_repeat_cpp_identity_migration(tmp_path: Path):
             ),
             patch.object(CodeParser, "parse_bytes", new=parse_with_python_failure),
         ):
-            migrated = incremental_update(tmp_path, store, changed_files=[])
+            migrated = full_build(tmp_path, store)
 
-        assert migrated["identity_rebuild"] is True
         assert migrated["errors"] == [
             {"file": "broken.py", "error": "simulated non-C++ parse failure"},
         ]
-        assert store.get_metadata("cpp_identity_version") == CPP_IDENTITY_VERSION
+        # A non-C++ failure is retried as a failed file, not by another rebuild.
+        assert store.get_metadata("index_generation") == str(INDEX_GENERATION)
         assert store.get_node(f"{cpp_path.as_posix()}::run(int)") is not None
 
-        no_retry = incremental_update(tmp_path, store, changed_files=[])
-        assert no_retry.get("identity_rebuild") is None
+        retry = incremental_update(tmp_path, store, changed_files=[])
+        assert retry["status"] == "ok"
+        assert retry["retried_failed_files"] == 1
+        assert store.get_node(f"{python_path.as_posix()}::broken") is not None
     finally:
         store.close()
 

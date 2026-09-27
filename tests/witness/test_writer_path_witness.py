@@ -33,7 +33,10 @@ def _function_names(repo: Path, relative: str) -> set[str]:
         store.close()
 
 
-@pytest.mark.xfail(strict=True, reason="W2a: readiness is stamped before resolvers run")
+@pytest.mark.xfail(
+    strict=True,
+    reason="W2b: get_minimal_context returns status ok while readiness is partial_index",
+)
 def test_resolver_failure_is_not_reported_ok(fixture_repo: Path, monkeypatch):
     from code_review_graph import resolvers
     from code_review_graph.tools.context import get_minimal_context
@@ -43,13 +46,14 @@ def test_resolver_failure_is_not_reported_ok(fixture_repo: Path, monkeypatch):
 
     _resolver, label, languages = resolvers.RESOLVERS["jsp"]
     monkeypatch.setitem(resolvers.RESOLVERS, "jsp", (broken, label, languages))
-    assert build(fixture_repo)["status"] == "ok"
+    result = build(fixture_repo)
+    assert result["status"] == "partial", result["status"]
+    assert list(result["resolver_failures"]) == ["jsp"]
 
     context = get_minimal_context(task="review", repo_root=str(fixture_repo))
     assert context["status"] != "ok", "a build whose resolver crashed reads as ok"
 
 
-@pytest.mark.xfail(strict=True, reason="W2a: a file that failed to parse is never retried")
 def test_failed_parse_is_retried_by_next_update(fixture_repo: Path, monkeypatch):
     from code_review_graph.parser import CodeParser
 
@@ -112,7 +116,6 @@ def test_git_timeout_is_not_a_clean_worktree(fixture_repo: Path, monkeypatch):
     assert drift["check"] == "unavailable", f"git timed out but drift reads {drift}"
 
 
-@pytest.mark.xfail(strict=True, reason="W2a: watcher restart does not catch up on edits")
 def test_watcher_restart_catches_up_on_edits_made_while_down(fixture_repo: Path):
     from code_review_graph.incremental import watch
 

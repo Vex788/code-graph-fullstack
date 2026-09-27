@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..graph import GraphStore
-from ..incremental import find_project_root, get_db_path
+from ..incremental import GitUnavailableError, find_project_root, get_db_path
 from ..parser import normalize_file_path
 
 _PROVENANCE_READ_TIMEOUT_SECONDS = 0.05
@@ -52,10 +52,6 @@ def building_response(readiness: dict[str, Any] | None = None) -> dict[str, Any]
     if readiness is not None:
         response["readiness"] = readiness
     return response
-
-
-class GitUnavailableError(RuntimeError):
-    """git could not answer; callers must not read this as a clean tree."""
 
 
 def read_git_head_state(root: Path) -> tuple[str, str | None]:
@@ -515,49 +511,23 @@ def working_tree_drift(
     return working_tree_drift_conn(root, store._conn, dirty)
 
 
-def _parse_porcelain_z(output: bytes) -> list[str]:
-    """Paths from ``git status --porcelain=v1 -z``; a rename's source follows it."""
-    import os
-
-    files: list[str] = []
-    records = output.split(b"\0")
-    index = 0
-    while index < len(records):
-        record = records[index]
-        if len(record) > 3:
-            files.append(os.fsdecode(record[3:]))
-            if b"R" in record[:2] or b"C" in record[:2]:
-                index += 1
-        index += 1
-    return files
-
-
 def read_dirty_paths(root: Path, timeout: float | None = None) -> list[str]:
     """Staged, unstaged and untracked paths; raises when git cannot answer.
 
-    ``incremental.get_staged_and_unstaged`` returns ``[]`` on a git failure,
-    which reads as a clean tree. Freshness checks use this strict variant.
+    ``incremental.get_staged_and_unstaged`` returns None on a git failure;
+    freshness checks use this raising variant of the same reader.
     """
-    from ..incremental import _GIT_TIMEOUT, detect_vcs, get_staged_and_unstaged
+    from ..incremental import detect_vcs, get_staged_and_unstaged, read_git_dirty_paths
 
     vcs = detect_vcs(root)
     if vcs == "svn":
-        return get_staged_and_unstaged(root)
+        dirty = get_staged_and_unstaged(root)
+        if dirty is None:
+            raise GitUnavailableError(f"svn status failed: {root}")
+        return dirty
     if vcs != "git":
         raise GitUnavailableError(f"not a git working tree: {root}")
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            capture_output=True,
-            cwd=str(root),
-            timeout=timeout if timeout is not None else _GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise GitUnavailableError(f"git status failed: {exc}") from exc
-    if result.returncode != 0:
-        raise GitUnavailableError(f"git status exited {result.returncode}")
-    return _parse_porcelain_z(result.stdout)
+    return read_git_dirty_paths(root, timeout)
 
 
 def working_tree_drift_conn(

@@ -235,9 +235,15 @@ class TestPostProcessingStepIsolation:
         Path(self.tmp.name).unlink(missing_ok=True)
 
     def test_fts_failure_does_not_block_flows(self):
-        with patch(
-            "code_review_graph.search.rebuild_fts_index",
-            side_effect=ImportError("fts boom"),
+        with (
+            patch(
+                "code_review_graph.postprocessing.fts_triggers_installed",
+                return_value=False,
+            ),
+            patch(
+                "code_review_graph.search.rebuild_fts_index",
+                side_effect=ImportError("fts boom"),
+            ),
         ):
             result = run_post_processing(self.store)
 
