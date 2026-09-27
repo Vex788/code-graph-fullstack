@@ -1659,7 +1659,15 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argument
     )
 
     _register_harness(sub)
+    _register_embeddings(sub)
     return ap, {"refactor": refactor_cmd, "serve": serve_cmd, "daemon": daemon_cmd}
+
+
+def _register_embeddings(sub) -> None:
+    """Add ``embeddings enable|disable|status``."""
+    from .embedding_providers.cli import register
+
+    register(sub, add_lock_args=_add_lock_args, enter_lock=_enter_writer_lock)
 
 
 def _register_harness(sub) -> None:
@@ -1732,6 +1740,10 @@ def main() -> None:
 
     if args.command == "harness":
         sys.exit(args.harness_run(args))
+
+    if args.command == "embeddings":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+        sys.exit(args.embeddings_run(args))
 
     if args.command in _GRAPH_TOOL_COMMANDS:
         from .incremental import find_project_root, get_db_path

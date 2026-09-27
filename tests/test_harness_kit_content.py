@@ -265,7 +265,6 @@ def test_every_mentioned_cli_command_exists_in_contract():
     assert HAS_CLI and not missing, missing
 
 
-@pytest.mark.xfail(strict=True, reason="`code-review-graph embeddings` lands with W4a")
 def test_pending_cli_commands_have_landed():
     known = {c["name"] for c in contract().get("cli_commands", [])}
     assert set(PENDING_CLI) <= known

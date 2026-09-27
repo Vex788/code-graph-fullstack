@@ -1587,6 +1587,11 @@
       ]
     },
     {
+      "name": "embeddings",
+      "help": "Turn semantic search on or off and show its state",
+      "options": []
+    },
+    {
       "name": "enrich",
       "help": "Enrich hook input with graph context",
       "options": []
