@@ -73,7 +73,6 @@ def test_two_writer_processes_do_not_hit_database_locked(fixture_repo: Path, tmp
     assert writer_b.returncode in (0, 75), output_b[-2000:]
 
 
-@pytest.mark.xfail(strict=True, reason="W2c: installer rewrites a JSONC settings.json from {}")
 def test_hook_install_keeps_jsonc_settings(tmp_path: Path):
     from code_review_graph.skills import _merge_hooks_into_settings
 

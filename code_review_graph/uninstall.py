@@ -28,9 +28,6 @@ _tomllib: Any = importlib.import_module(
 )
 
 _ENTRY_NAME = "code-review-graph"
-_GIT_HOOK_MARKER = (
-    "# Installed by code-review-graph. Remove this file to disable pre-commit graph checks."
-)
 _GITIGNORE_BANNER = "# Added by code-review-graph"
 
 
@@ -676,7 +673,13 @@ def _legacy_codex_hook_commands() -> set[str]:
 def _clean_hook_data(
     data: dict[str, Any],
     owned_commands: set[str],
+    marker: str | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str | int, ...]]]:
+    def owned(command: Any) -> bool:
+        return isinstance(command, str) and (
+            command in owned_commands or (marker is not None and marker in command)
+        )
+
     expected = copy.deepcopy(data)
     hooks_obj = data.get("hooks")
     if not isinstance(hooks_obj, dict):
@@ -694,7 +697,7 @@ def _clean_hook_data(
                 new_entries.append(copy.deepcopy(entry))
                 continue
             direct_command = entry.get("command")
-            if isinstance(direct_command, str) and direct_command in owned_commands:
+            if owned(direct_command):
                 entry_paths.append(("hooks", event, entry_index))
                 continue
 
@@ -706,7 +709,7 @@ def _clean_hook_data(
             nested_paths: list[tuple[str | int, ...]] = []
             for nested_index, hook in enumerate(nested):
                 command = hook.get("command") if isinstance(hook, dict) else None
-                if isinstance(command, str) and command in owned_commands:
+                if owned(command):
                     nested_paths.append(("hooks", event, entry_index, "hooks", nested_index))
                 else:
                     kept_nested.append(copy.deepcopy(hook))
@@ -739,6 +742,7 @@ def _remove_hooks(
     report: UninstallReport,
     *,
     dry_run: bool,
+    marker: str | None = None,
 ) -> None:
     if not path.exists() or not _safe_path(path, boundary, report):
         return
@@ -748,7 +752,7 @@ def _remove_hooks(
     data = _parse_jsonc(path, raw, report)
     if data is None:
         return
-    expected, paths = _clean_hook_data(data, owned_commands)
+    expected, paths = _clean_hook_data(data, owned_commands, marker)
     if not paths:
         return
     try:
@@ -948,21 +952,12 @@ def _remove_git_hook(
     if not path.exists() or not _safe_path(path, repo_root, report):
         return
     raw = _read_text(path, report)
-    if raw is None or _GIT_HOOK_MARKER not in raw:
+    if raw is None:
         return
-    lines = raw.splitlines(keepends=True)
-    rewritten: list[str] = []
-    dropping = False
-    for line in lines:
-        if _GIT_HOOK_MARKER in line:
-            dropping = True
-            continue
-        if dropping:
-            if line.strip() == "fi":
-                dropping = False
-            continue
-        rewritten.append(line)
-    new_text = "".join(rewritten).rstrip() + "\n"
+    stripped, position = skills.remove_git_hook_block(raw)
+    if position is None:
+        return
+    new_text = stripped.rstrip() + "\n"
     meaningful = [
         line
         for line in new_text.splitlines()
@@ -1183,12 +1178,14 @@ def _process_repo(
 
     hook_commands = _commands(skills.generate_hooks_config(repo_root))
     hook_commands.update(_legacy_repo_hook_commands(repo_root))
+    hook_commands.update(skills.legacy_hook_commands(repo_root))
     _remove_hooks(
         repo_root / ".claude" / "settings.json",
         hook_commands,
         repo_root,
         report,
         dry_run=dry_run,
+        marker=skills.CRG_HOOK_MARKER,
     )
     _remove_hooks(
         repo_root / ".qoder" / "settings.json",
@@ -1196,6 +1193,7 @@ def _process_repo(
         repo_root,
         report,
         dry_run=dry_run,
+        marker=skills.CRG_HOOK_MARKER,
     )
     _remove_hooks(
         repo_root / ".codebuddy" / "settings.json",
@@ -1203,6 +1201,7 @@ def _process_repo(
         repo_root,
         report,
         dry_run=dry_run,
+        marker=skills.CRG_HOOK_MARKER,
     )
 
     gemini_script_names = skills._GEMINI_CLI_HOOK_FILENAMES
@@ -1300,10 +1299,12 @@ def _process_user(
     _remove_hooks(
         home / ".codex" / "hooks.json",
         _commands(skills.generate_codex_hooks_config(reference_repo))
-        | _legacy_codex_hook_commands(),
+        | _legacy_codex_hook_commands()
+        | skills.legacy_hook_commands(),
         home,
         report,
         dry_run=dry_run,
+        marker=skills.CRG_HOOK_MARKER,
     )
     _remove_hooks(
         home / ".cursor" / "hooks.json",
