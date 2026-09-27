@@ -1121,6 +1121,12 @@ class TestRealObserver:
             time.sleep(interval)
         return False
 
+    def _watching(self, repo) -> bool:
+        """Wait until the observer runs: the health file exists from the initial build on."""
+        return self._wait_for(
+            lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+        )
+
     def test_new_top_level_directory_is_indexed(self, tmp_path):
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
@@ -1145,9 +1151,7 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(
-                    lambda: watch_health_path(repo).exists()
-                ), "the watch loop never started"
+                assert self._watching(repo), "the watch loop never started"
 
                 # The whole point: this directory did not exist when the
                 # watches were planned.
@@ -1202,7 +1206,7 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                assert self._watching(repo)
 
                 # Delete and recreate back to back, well inside one tick.
                 shutil.rmtree(repo / "src")
@@ -1247,7 +1251,7 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                assert self._watching(repo)
                 shutil.rmtree(repo / "lib")
                 time.sleep(1.0)  # several ticks
                 still_running = thread.is_alive()
