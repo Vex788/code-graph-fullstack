@@ -68,9 +68,9 @@ REFERENCES	web/WEB-INF/jsp/common/header.jspf	web/js/common.js	now
 REFERENCES	web/WEB-INF/jsp/user/list.jsp	web/js/user.js	now
 REFERENCES	web/js/invoice.js::loadInvoice	web/js/invoice.js::renderInvoiceTotal	now
 RENDERS	web/WEB-INF/jsp/order/view.jsp	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	now
-INJECTS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/service/InvoiceService.java::InvoiceService	target
-INJECTS	src/main/java/com/acme/web/action/UserListActionBean.java::UserListActionBean	src/main/java/com/acme/service/UserService.java::UserService	target
-INJECTS	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	src/main/java/com/acme/service/OrderService.java::OrderService	target
+INJECTS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/service/InvoiceService.java::InvoiceService	now
+INJECTS	src/main/java/com/acme/web/action/UserListActionBean.java::UserListActionBean	src/main/java/com/acme/service/UserService.java::UserService	now
+INJECTS	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	src/main/java/com/acme/service/OrderService.java::OrderService	now
 HANDLES	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean.view	route:/vendor/Invoice.action	target
 HANDLES	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean.save	route:/vendor/Invoice.action	target
 HANDLES	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean.load	route:/vendor/Invoice.action	target

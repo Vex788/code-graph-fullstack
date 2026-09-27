@@ -1304,9 +1304,10 @@ _SPRING_STEREOTYPE_ANNOTATIONS = frozenset({
     "EventListener",
 })
 
-# Spring DI injection annotations (field/setter/constructor-level)
+# Spring DI injection annotations (field/setter/constructor-level). Stripes'
+# @SpringBean injects a Spring bean into an ActionBean field.
 _SPRING_INJECT_ANNOTATIONS = frozenset({
-    "Autowired", "Inject", "Resource",
+    "Autowired", "Inject", "Resource", "SpringBean",
 })
 _SPRING_PLACEHOLDER_RE = re.compile(r"\$\{([^{}]+)\}")
 
@@ -10726,9 +10727,22 @@ class CodeParser:
 
         # Spring DI: emit INJECTS edges for injected dependencies
         if language == "java":
+            first_injection = len(edges)
             self._emit_spring_injections(
                 child, name, class_annotations, language, file_path, edges,
             )
+            for index in range(first_injection, len(edges)):
+                injection = edges[index]
+                edges[index] = EdgeInfo(
+                    kind=injection.kind,
+                    source=injection.source,
+                    target=self._resolve_java_type_target(
+                        injection.target, file_path, import_map or {}, defined_names or set(),
+                    ),
+                    file_path=injection.file_path,
+                    line=injection.line,
+                    extra=injection.extra,
+                )
             self._emit_spring_config_edges(
                 child, name, enclosing_class, file_path, edges,
             )
