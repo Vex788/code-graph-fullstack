@@ -633,6 +633,29 @@ def _exit_rebuild_required(result: dict, progress) -> None:
     raise SystemExit(EXIT_REBUILD_REQUIRED)
 
 
+def _print_missing_graph_status(repo_root: Path, db_path: Path) -> None:
+    """``status --json`` for a root with no graph: readiness ``missing_graph``."""
+    from .contract import CONTRACT_VERSION
+    from .readiness_facts import gather_report
+
+    report = gather_report(repo_root, db_path)
+    print(json.dumps({
+        "nodes": 0,
+        "edges": 0,
+        "files": 0,
+        "languages": [],
+        "last_updated": None,
+        "built_at_commit": None,
+        "repo_root": str(repo_root),
+        "contract_version": CONTRACT_VERSION,
+        "schema_version": None,
+        "index_generation": None,
+        "readiness": report.readiness.to_dict(),
+        "failed_files": 0,
+        "resolver_failures": 0,
+    }))
+
+
 def _open_store_or_exit(args, db_path: Path):
     """Open the graph, mapping schema errors to the contract error shape."""
     from .graph import GraphStore
@@ -2057,6 +2080,10 @@ def main() -> None:
         args.command in ("dead-code", "forget", *_read_only_db_cmds)
         and not db_path.exists()
     ):
+        if args.command == "status" and args.json_output:
+            # A status query answers; JSON consumers must not read a missing graph as a crash.
+            _print_missing_graph_status(repo_root, db_path)
+            return
         print(
             f"No graph found at {db_path}. Run `code-review-graph build` first.",
             file=sys.stderr,

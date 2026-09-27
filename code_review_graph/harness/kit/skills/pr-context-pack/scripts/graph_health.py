@@ -64,7 +64,7 @@ def read_status(repo: Path) -> tuple[str, dict, str]:
     """(readiness status, status JSON, diagnostic) from ``status --json``."""
     doc, text = run_json(["status", "--repo", str(repo), "--json"], STATUS_TIMEOUT_SECONDS)
     if doc is None:
-        return ("missing_graph" if "No graph found" in text else "unavailable"), {}, text
+        return "unavailable", {}, text
     if doc.get("status") == "error":
         return "unavailable", doc, str(doc.get("error_code") or text)
     readiness = doc.get("readiness")

@@ -509,7 +509,7 @@ def _graph_stub(tmp_path: Path, status: dict | None, extra: str = "") -> tuple[P
     log = tmp_path / "graph-calls.log"
     status_line = (
         f"printf '%s\\n' '{json.dumps(status)}'; exit 0" if status is not None
-        else "echo 'No graph found' >&2; exit 1"
+        else "echo 'Traceback: boom' >&2; exit 1"
     )
     stub = tmp_path / "code-review-graph"
     stub.write_text(
@@ -558,10 +558,22 @@ def test_graph_health_reads_only_cli_json(tmp_path: Path, readiness, rc, verdict
     assert log.read_text(encoding="utf-8").startswith(f"status --repo {repo} --json")
 
 
+def _real_status_json(repo: Path) -> dict:
+    """What this build's ``status --json`` prints for *repo*."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "code_review_graph", "status", "--json", "--repo", str(repo)],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
 @skip_windows
 def test_graph_health_missing_graph_is_prep_required(tmp_path: Path):
     repo = _git_repo(tmp_path / "repo")
-    stub, _ = _graph_stub(tmp_path, None)
+    missing = _real_status_json(repo)
+    assert missing["readiness"]["status"] == "missing_graph"
+    stub, _ = _graph_stub(tmp_path, missing)
     script = _script(tmp_path, "claude", "skills/pr-context-pack/scripts/graph_health.py")
     result = subprocess.run(
         [sys.executable, str(script), "--repo", str(repo)],
@@ -571,6 +583,20 @@ def test_graph_health_missing_graph_is_prep_required(tmp_path: Path):
     report = json.loads(result.stdout)
     assert report["graph_status"] == "missing_graph" and report["verdict"] == "prep_required"
     assert report["marker"] == PREP_MARKER
+
+
+@skip_windows
+def test_graph_health_cli_crash_is_unavailable_not_missing(tmp_path: Path):
+    repo = _git_repo(tmp_path / "repo")
+    stub, _ = _graph_stub(tmp_path, None)
+    script = _script(tmp_path, "claude", "skills/pr-context-pack/scripts/graph_health.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--repo", str(repo)],
+        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert report["graph_status"] == "unavailable" and report["verdict"] == "unavailable"
 
 
 @skip_windows
@@ -678,6 +704,30 @@ def test_graph_bootstrap_clones_then_checks_readiness(tmp_path, readiness, rc, s
     assert f"clone-graph --from {seed} --to {worktree} --json" in calls
     assert "CRG_EMBEDDINGS=off" in calls
     assert "sqlite" not in script.read_text(encoding="utf-8")
+
+
+@skip_windows
+def test_graph_bootstrap_skips_a_seed_without_graph(tmp_path: Path):
+    seed = _git_repo(tmp_path / "seed")
+    _commit(seed, "seed")
+    worktree = _git_repo(tmp_path / "wt")
+    _commit(worktree, "wt")
+    missing = json.dumps(_real_status_json(seed))
+    stub = tmp_path / "code-review-graph"
+    stub.write_text(
+        f"#!/bin/sh\nif [ \"$1\" = status ]; then printf '%s\\n' '{missing}'; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed)],
+        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    report = json.loads(result.stdout)
+    assert (report["status"], report["seed_readiness"]) == ("skip", "missing_graph")
+    assert result.returncode == 2
 
 
 @skip_windows

@@ -68,8 +68,7 @@ def readiness(stage: str, root: Path, timeout: float) -> tuple[str, dict]:
     except ValueError:
         doc = None
     if not isinstance(doc, dict):
-        text = (result.stderr or result.stdout).strip()
-        return ("missing_graph" if "No graph found" in text else "unavailable"), {}
+        return "unavailable", {}
     status = (doc.get("readiness") or {}).get("status")
     return (status if isinstance(status, str) else "unavailable"), doc
 

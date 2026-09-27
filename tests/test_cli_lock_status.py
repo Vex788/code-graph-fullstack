@@ -251,6 +251,28 @@ def test_update_rebuild_required_result_exits_4(repo, tmp_path, monkeypatch, cap
     assert (state["status"], state["exit_code"]) == ("rebuild_required", EXIT_REBUILD_REQUIRED)
 
 
+def test_status_json_without_graph_is_missing_graph_json(repo):
+    completed = _cli("status", "--json", "--repo", str(repo))
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["readiness"]["status"] == "missing_graph"
+    assert (payload["nodes"], payload["files"]) == (0, 0)
+    assert payload["repo_root"] == str(repo)
+    from code_review_graph.contract import CONTRACT_VERSION, SCHEMAS
+
+    assert payload["contract_version"] == CONTRACT_VERSION
+    assert not _db(repo).parent.exists()
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = SCHEMAS["status_json"]
+    jsonschema.validators.validator_for(schema)(schema).validate(payload)
+
+
+def test_status_text_without_graph_still_exits_1(repo):
+    completed = _cli("status", "--repo", str(repo))
+    assert completed.returncode == 1
+    assert "No graph found" in completed.stderr
+
+
 def test_harness_subcommand_dispatches():
     completed = _cli("harness", "fragment", "--target", "claude", "--json")
     assert completed.returncode == 0, completed.stderr
