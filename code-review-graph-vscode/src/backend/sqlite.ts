@@ -9,6 +9,7 @@
  */
 
 import type BetterSqlite3 from 'better-sqlite3';
+import type { KnownEdgeKind, KnownNodeKind } from '../generated/kinds';
 
 type DatabaseType = BetterSqlite3.Database;
 
@@ -47,16 +48,10 @@ export const SUPPORTED_SCHEMA_VERSION = 10;
 // Interfaces
 // ---------------------------------------------------------------------------
 
-export type NodeKind = 'File' | 'Class' | 'Function' | 'Type' | 'Test';
+// Known kinds come from the registry; newer graphs may carry others.
+export type NodeKind = KnownNodeKind | (string & {});
 
-export type EdgeKind =
-  | 'CALLS'
-  | 'IMPORTS_FROM'
-  | 'INHERITS'
-  | 'IMPLEMENTS'
-  | 'CONTAINS'
-  | 'TESTED_BY'
-  | 'DEPENDS_ON';
+export type EdgeKind = KnownEdgeKind | (string & {});
 
 export interface GraphNode {
   id: number;
