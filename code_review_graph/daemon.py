@@ -33,7 +33,7 @@ else:
     except ImportError:
         tomllib = None  # type: ignore[assignment]
 
-from .constants import crg_home
+from .constants import crg_home, env_float
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +103,9 @@ _HEALTH_CHECK_INTERVAL = 30
 # Restarting a watcher costs a full initial update, so a repo that cannot stay
 # up must not be restarted every health check forever.  The delay doubles per
 # consecutive failure and resets once a watcher has stayed up this long.
-_RESTART_BACKOFF_BASE = float(os.environ.get("CRG_RESTART_BACKOFF", "30"))
-_RESTART_BACKOFF_MAX = float(os.environ.get("CRG_RESTART_BACKOFF_MAX", "900"))
-_RESTART_HEALTHY_SECONDS = float(os.environ.get("CRG_RESTART_HEALTHY_AFTER", "600"))
+_RESTART_BACKOFF_BASE = env_float("CRG_RESTART_BACKOFF", 30.0)
+_RESTART_BACKOFF_MAX = env_float("CRG_RESTART_BACKOFF_MAX", 900.0)
+_RESTART_HEALTHY_SECONDS = env_float("CRG_RESTART_HEALTHY_AFTER", 600.0)
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -385,11 +385,51 @@ def remove_repo_from_config(
 # ---------------------------------------------------------------------------
 
 
+class DaemonAlreadyRunningError(RuntimeError):
+    """Another live daemon owns the PID file."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        super().__init__(f"daemon already running (PID {pid})")
+
+
+def _create_pid_file(pid_path: Path, pid: int) -> bool:
+    try:
+        fd = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, str(pid).encode("ascii"))
+    finally:
+        os.close(fd)
+    return True
+
+
 def write_pid(pid: int | None = None, path: Path | None = None) -> None:
-    """Write the current (or given) PID to the PID file."""
+    """Claim the PID file for the current (or given) PID.
+
+    Created with ``O_EXCL`` so two daemons starting at once cannot both win.
+    A file naming a dead process is stale and replaced.
+
+    Raises:
+        DaemonAlreadyRunningError: a live process other than *pid* owns it.
+    """
     pid_path = path or default_pid_path()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(pid or os.getpid()), encoding="utf-8")
+    pid = pid or os.getpid()
+    for _attempt in range(2):
+        if _create_pid_file(pid_path, pid):
+            return
+        owner = read_pid(pid_path)
+        if owner == pid:
+            return
+        if owner is not None and pid_alive(owner):
+            raise DaemonAlreadyRunningError(owner)
+        # Stale: remove it only if it still names the dead owner we checked.
+        if read_pid(pid_path) == owner:
+            clear_pid(pid_path)
+    owner = read_pid(pid_path)
+    raise DaemonAlreadyRunningError(owner if owner is not None else -1)
 
 
 def read_pid(path: Path | None = None) -> int | None:
@@ -541,7 +581,7 @@ def _is_pid_alive(pid: int) -> bool:
 # alone reports it healthy forever.  Each watch child publishes its observer
 # state and last-event time here instead; anything older than this is a stall.
 # See: #811.
-_WATCH_HEALTH_STALE_SECONDS = float(os.environ.get("CRG_WATCH_HEALTH_STALE", "90"))
+_WATCH_HEALTH_STALE_SECONDS = env_float("CRG_WATCH_HEALTH_STALE", 90.0)
 
 
 def watch_health_dir() -> Path:
@@ -740,6 +780,61 @@ class ConfigWatcher:
 # ---------------------------------------------------------------------------
 
 
+# Log rotation for daemon.log and per-repo watcher logs.
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+_LOG_BACKUPS = 3
+# A first build of a large repo can take many minutes; never hang forever.
+_INITIAL_BUILD_TIMEOUT_DEFAULT = 3600.0
+
+
+def _graph_exists(repo: WatchRepo) -> bool:
+    """True when *repo* already has a graph, wherever its data dir points."""
+    from .incremental import get_db_path
+
+    return get_db_path(Path(repo.path), read_only=True).exists()
+
+
+def configure_daemon_logging(
+    log_file: Path, max_bytes: int = _LOG_MAX_BYTES, backups: int = _LOG_BACKUPS,
+) -> logging.Handler:
+    """Send root logging to a size-rotated *log_file*; returns the handler."""
+    from logging.handlers import RotatingFileHandler
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_file, maxBytes=max_bytes, backupCount=backups, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    if root.level > logging.INFO or root.level == logging.NOTSET:
+        root.setLevel(logging.INFO)
+    return handler
+
+
+def rotate_if_large(
+    path: Path, max_bytes: int = _LOG_MAX_BYTES, backups: int = _LOG_BACKUPS,
+) -> None:
+    """Shift ``path`` to ``path.1`` (and older ones up) once it passes *max_bytes*.
+
+    Watcher children write to an inherited file descriptor, which a handler
+    cannot rotate, so their logs rotate when the child is (re)spawned.
+    """
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+    except OSError:
+        return
+    try:
+        for index in range(backups - 1, 0, -1):
+            older = path.with_name(f"{path.name}.{index}")
+            if older.exists():
+                os.replace(older, path.with_name(f"{path.name}.{index + 1}"))
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    except OSError as exc:
+        logger.warning("Could not rotate %s: %s", path, exc)
+
+
 class WatchDaemon:
     """Manages child processes for multi-repo file watching.
 
@@ -781,8 +876,7 @@ class WatchDaemon:
 
         # Build initial graph for repos that lack a database
         for repo in self._config.repos:
-            db_path = Path(repo.path) / ".code-review-graph" / "graph.db"
-            if not db_path.exists():
+            if not _graph_exists(repo):
                 self._initial_build(repo)
 
         # Spawn a watcher child for every repo
@@ -853,8 +947,7 @@ class WatchDaemon:
             for alias in to_add | to_update:
                 repo = desired[alias]
                 registry.register(repo.path, alias=repo.alias)
-                db_path = Path(repo.path) / ".code-review-graph" / "graph.db"
-                if not db_path.exists():
+                if not _graph_exists(repo):
                     repos_needing_build.append(repo)
 
             for repo in repos_needing_build:
@@ -1126,10 +1219,13 @@ class WatchDaemon:
 
         self._config.log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self._config.log_dir / "daemon.log"
+        # Raw stdout/stderr (tracebacks, stray prints) go to their own file:
+        # daemon.log is rotated by its handler, which an fd cannot follow.
+        out_file = self._config.log_dir / "daemon.out"
+        rotate_if_large(out_file)
 
-        # Open log file for stdout/stderr
         fd = os.open(
-            str(log_file),
+            str(out_file),
             os.O_WRONLY | os.O_CREAT | os.O_APPEND,
             0o644,
         )
@@ -1143,8 +1239,20 @@ class WatchDaemon:
         if fd > 2:
             os.close(fd)
 
-        # Write PID file
-        write_pid()
+        root_logger = logging.getLogger()
+        for handler in list(root_logger.handlers):
+            if isinstance(handler, logging.StreamHandler) and not isinstance(
+                handler, logging.FileHandler,
+            ):
+                root_logger.removeHandler(handler)
+        configure_daemon_logging(log_file)
+
+        # Write PID file; losing the race to another daemon ends this one.
+        try:
+            write_pid()
+        except DaemonAlreadyRunningError as exc:
+            logger.error("Not starting: %s", exc)
+            os._exit(1)
 
         # Set up signal handlers
         self._setup_signal_handlers()
@@ -1210,6 +1318,7 @@ class WatchDaemon:
         """Spawn a child process running ``code-review-graph watch`` for *repo*."""
         self._config.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._config.log_dir / f"{repo.alias}.log"
+        rotate_if_large(log_path)
 
         crg_bin = shutil.which("code-review-graph")
         if crg_bin:
@@ -1295,12 +1404,23 @@ class WatchDaemon:
                 repo.path,
             ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        timeout = env_float("CRG_DAEMON_BUILD_TIMEOUT", _INITIAL_BUILD_TIMEOUT_DEFAULT,
+                            minimum=1.0)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Initial build for '%s' timed out after %gs; the watcher starts anyway",
+                repo.alias, timeout,
+            )
+            return
         if result.returncode != 0:
             logger.warning(
                 "Initial build for '%s' failed (rc=%d): %s",

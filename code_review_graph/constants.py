@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from pathlib import Path
@@ -38,6 +39,43 @@ def _bounded_float_env(
         return default
     return value
 
+
+_logger = logging.getLogger(__name__)
+
+
+def env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Read an integer setting; a malformed or out-of-range value warns and
+    falls back to *default*, so a typo never breaks an import or a tool."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < minimum:
+        _logger.warning("%s=%d is below %d; using %d", name, value, minimum, default)
+        return default
+    return value
+
+
+def env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    """Float counterpart of :func:`env_int`; non-finite values are rejected."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning("%s=%r is not a number; using %g", name, raw, default)
+        return default
+    if not math.isfinite(value) or value < minimum:
+        _logger.warning("%s=%r is out of range; using %g", name, raw, default)
+        return default
+    return value
+
+
 SECURITY_KEYWORDS: frozenset[str] = frozenset({
     "auth", "login", "password", "token", "session", "crypt", "secret",
     "credential", "permission", "sql", "query", "execute", "connect",
@@ -48,10 +86,10 @@ SECURITY_KEYWORDS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # Configurable limits (override via environment variables)
 # ---------------------------------------------------------------------------
-MAX_IMPACT_NODES = int(os.environ.get("CRG_MAX_IMPACT_NODES", "500"))
-MAX_IMPACT_DEPTH = int(os.environ.get("CRG_MAX_IMPACT_DEPTH", "2"))
-MAX_BFS_DEPTH = int(os.environ.get("CRG_MAX_BFS_DEPTH", "15"))
-MAX_SEARCH_RESULTS = int(os.environ.get("CRG_MAX_SEARCH_RESULTS", "20"))
+MAX_IMPACT_NODES = env_int("CRG_MAX_IMPACT_NODES", 500, minimum=1)
+MAX_IMPACT_DEPTH = env_int("CRG_MAX_IMPACT_DEPTH", 2)
+MAX_BFS_DEPTH = env_int("CRG_MAX_BFS_DEPTH", 15)
+MAX_SEARCH_RESULTS = env_int("CRG_MAX_SEARCH_RESULTS", 20, minimum=1)
 
 # Impact traversal engine: "sql" (bounded SQLite relaxation) or "networkx".
 BFS_ENGINE = os.environ.get("CRG_BFS_ENGINE", "sql")
