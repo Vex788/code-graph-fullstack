@@ -1036,9 +1036,15 @@ _TS_TYPE_DECLARATIONS = frozenset({
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
     "python": ["function_definition"],
-    "javascript": ["function_declaration", "method_definition", "arrow_function"],
-    "typescript": ["function_declaration", "method_definition", "arrow_function"],
-    "tsx": ["function_declaration", "method_definition", "arrow_function"],
+    "javascript": [
+        "function_declaration", "method_definition", "arrow_function", "function_expression",
+    ],
+    "typescript": [
+        "function_declaration", "method_definition", "arrow_function", "function_expression",
+    ],
+    "tsx": [
+        "function_declaration", "method_definition", "arrow_function", "function_expression",
+    ],
     "go": ["function_declaration", "method_declaration"],
     "rust": ["function_item", "function_signature_item"],
     "java": [
@@ -2697,6 +2703,8 @@ class CodeParser:
         language = self.detect_language(path, source)
         if not language:
             return [], []
+        # Per-file sequence numbers for anonymous JS callbacks (``ready$1``).
+        self._js_callback_seq: dict[str, int] = {}
 
         parser = None
         tree = None
@@ -6669,6 +6677,18 @@ class CodeParser:
             ):
                 continue
 
+            # --- JS/TS anonymous callbacks: $(document).ready(function () {...}) ---
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type in ("function_expression", "arrow_function")
+                and self._extract_js_callback(
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                )
+            ):
+                continue
+
             # --- Functions ---
             if node_type in func_types and self._extract_functions(
                 child, source, language, file_path, nodes, edges,
@@ -8847,6 +8867,103 @@ class CodeParser:
     _JS_FUNC_VALUE_TYPES = frozenset(
         {"arrow_function", "function_expression", "function"},
     )
+    # Callee methods whose first string argument names the event handled.
+    _JS_EVENT_BINDERS = frozenset({
+        "on", "one", "off", "bind", "live", "delegate", "addEventListener",
+    })
+
+    def _extract_js_callback(
+        self,
+        child,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Name an anonymous function passed to a call after that call.
+
+        ``$(document).ready(function () {...})`` becomes ``ready$1`` and
+        ``$(x).on("click", () => {...})`` ``on_click$1``, numbered per file
+        in source order, so calls inside are attributed to the callback
+        instead of the enclosing function or file.
+        """
+        arguments = child.parent
+        if (
+            arguments is None
+            or arguments.type != "arguments"
+            or child.child_by_field_name("name") is not None
+        ):
+            return False
+        call = arguments.parent
+        callee = call.child_by_field_name("function") if call is not None else None
+        if callee is None:
+            return False
+        if callee.type == "member_expression":
+            prop = callee.child_by_field_name("property")
+            base = prop.text.decode("utf-8", errors="replace") if prop is not None else ""
+        elif callee.type == "identifier":
+            base = callee.text.decode("utf-8", errors="replace")
+        else:
+            return False
+        if not base:
+            return False
+        # Test-runner callbacks already belong to their synthetic Test node.
+        if _is_test_file(file_path, self._repo_root) and (
+            base in _TEST_RUNNER_NAMES
+            or (self._get_base_call_name(call, source) or base) in _TEST_RUNNER_NAMES
+        ):
+            return False
+        if base in self._JS_EVENT_BINDERS:
+            event = next((a for a in arguments.named_children if a.type == "string"), None)
+            if event is not None:
+                label = re.sub(r"\W+", "_", event.text.decode("utf-8", errors="replace"))
+                label = label.strip("_")
+                if label:
+                    base = f"{base}_{label}"
+        seq = getattr(self, "_js_callback_seq", {})
+        seq[base] = seq.get(base, 0) + 1
+        self._js_callback_seq = seq
+        name = f"{base}${seq[base]}"
+        qualified = self._qualify(name, file_path, enclosing_class)
+        line = child.start_point[0] + 1
+        nodes.append(NodeInfo(
+            kind="Function",
+            name=name,
+            file_path=file_path,
+            line_start=line,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            params=self._get_params(child, language, source),
+            extra={"js_callback": True},
+        ))
+        scope = (
+            self._qualify(enclosing_func, file_path, enclosing_class)
+            if enclosing_func
+            else self._qualify(enclosing_class, file_path, None)
+            if enclosing_class
+            else file_path
+        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS", source=scope, target=qualified, file_path=file_path, line=line,
+        ))
+        # Passed as a value: the enclosing scope hands it to the framework.
+        edges.append(EdgeInfo(
+            kind="REFERENCES", source=scope, target=qualified, file_path=file_path, line=line,
+        ))
+        self._extract_from_tree(
+            child, source, language, file_path, nodes, edges,
+            enclosing_class=enclosing_class, enclosing_func=name,
+            import_map=import_map, defined_names=defined_names,
+            _depth=_depth + 1,
+        )
+        return True
 
     def _extract_js_var_functions(
         self,

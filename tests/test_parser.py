@@ -2699,3 +2699,44 @@ def test_custom_language_without_grammar_yields_the_file_marker(
     marker = _marker_only(*parser.parse_bytes(path, source))
 
     assert marker.language == "erlang"
+
+
+class TestJsAnonymousCallbacks:
+    """Anonymous callbacks get names from their call, so their calls are theirs."""
+
+    def _parse(self, tmp_path: Path, text: str):
+        path = tmp_path / "page.js"
+        path.write_text(text, encoding="utf-8")
+        nodes, edges = CodeParser(tmp_path).parse_file(path)
+        return path.as_posix(), nodes, edges
+
+    def test_callbacks_are_named_by_their_call(self, tmp_path):
+        prefix, nodes, edges = self._parse(tmp_path, (
+            "$(document).ready(function () {\n"
+            "    init();\n"
+            "    $('#save').on('click', () => { save(); });\n"
+            "    $('#load').on('click', () => { load(); });\n"
+            "});\n"
+            "setTimeout(function () { init(); }, 10);\n"
+            "function init() {}\nfunction save() {}\nfunction load() {}\n"
+        ))
+        names = sorted(n.name for n in nodes if n.extra.get("js_callback"))
+        assert names == ["on_click$1", "on_click$2", "ready$1", "setTimeout$1"]
+        calls = {(e.source, e.target) for e in edges if e.kind == "CALLS"}
+        assert (f"{prefix}::ready$1", f"{prefix}::init") in calls
+        assert (f"{prefix}::on_click$1", f"{prefix}::save") in calls
+        assert (f"{prefix}::on_click$2", f"{prefix}::load") in calls
+        assert (f"{prefix}::setTimeout$1", f"{prefix}::init") in calls
+        # nothing inside a callback is attributed to the file
+        assert not {t for s, t in calls if s == prefix} & {f"{prefix}::save", f"{prefix}::load"}
+        contains = {(e.source, e.target) for e in edges if e.kind == "CONTAINS"}
+        assert (f"{prefix}::ready$1", f"{prefix}::on_click$1") in contains
+
+    def test_named_function_expression_is_a_function(self, tmp_path):
+        prefix, nodes, edges = self._parse(tmp_path, (
+            "el.addEventListener('change', function onChange(e) { refresh(); });\n"
+            "function refresh() {}\n"
+        ))
+        assert "onChange" in {n.name for n in nodes if n.kind == "Function"}
+        calls = {(e.source, e.target) for e in edges if e.kind == "CALLS"}
+        assert (f"{prefix}::onChange", f"{prefix}::refresh") in calls
