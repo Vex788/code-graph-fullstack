@@ -56,6 +56,23 @@ embeddings = [
     "sentence-transformers>=3.0.0,<7",
     "numpy>=1.26,<3",
 ]
+# Embedding profiles (`code-review-graph embeddings enable --profile P`).
+# fast: static model2vec vectors, numpy only.
+embeddings-fast = [
+    "model2vec>=0.6.0,<1",
+    "numpy>=1.26,<3",
+]
+# balanced on every OS: EmbeddingGemma through ONNX Runtime.
+embeddings-onnx = [
+    "fastembed>=0.8.0,<1",
+    "numpy>=1.26,<3",
+]
+# balanced/accurate on Apple Silicon; resolves to nothing elsewhere.
+embeddings-mlx = [
+    "mlx-embeddings>=0.1.0,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.31.0,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy>=1.26,<3",
+]
 google-embeddings = [
     "google-genai>=1.0.0,<3",
 ]
@@ -71,6 +88,9 @@ wiki = [
 ]
 all = [
     "code-graph-fullstack[embeddings]",
+    "code-graph-fullstack[embeddings-fast]",
+    "code-graph-fullstack[embeddings-onnx]",
+    "code-graph-fullstack[embeddings-mlx]",
     "code-graph-fullstack[google-embeddings]",
     "code-graph-fullstack[communities]",
     "code-graph-fullstack[enrichment]",
