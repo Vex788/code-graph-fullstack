@@ -5,17 +5,21 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 from ..graph import fts_triggers_installed, node_signature
 from ..incremental import (
+    clear_flows_stale,
     fault_point,
     finish_write,
     full_build,
     incremental_update,
+    read_flows_stale,
     resolve_incremental_base,
     store_writer_lock,
 )
+from ..parser import normalize_file_path
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
@@ -59,11 +63,14 @@ def _run_postprocess(
     changed_files: list[str] | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    repo_root: Any = None,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
-    When *full_rebuild* is False and *changed_files* are available,
-    uses incremental flow/community detection for faster updates.
+    When *full_rebuild* is False, flows and communities re-derive only what
+    the pending graph delta (``flows_stale``) says changed; without one they
+    fall back to *changed_files* (relative ones resolved against *repo_root*).
+    Levels below ``full`` leave the delta pending for the next full run.
 
     Records structured stage durations in ``build_result["postprocess_timing"]``.
     Minimal processing reports ``signatures_s`` and ``fts_s``; full processing
@@ -74,6 +81,9 @@ def _run_postprocess(
     """
     warnings: list[str] = []
     build_result["postprocess_level"] = postprocess
+
+    if postprocess != "full":
+        build_result["flows_stale"] = read_flows_stale(store) is not None
 
     if postprocess == "none":
         _run_embedding_refresh(
@@ -154,14 +164,23 @@ def _run_postprocess(
         return warnings
 
     # -- Expensive: flows + communities (only for "full") --
-    use_incremental = not full_rebuild and bool(changed_files)
+    pending = read_flows_stale(store)
+    delta = None if pending is None or pending.get("full") else pending
+    use_incremental = not full_rebuild and (
+        delta is not None or (pending is None and bool(changed_files))
+    )
+    changed = [
+        normalize_file_path(Path(repo_root) / path) if repo_root is not None else path
+        for path in changed_files or ()
+    ]
+    derived_ok = True
 
     stage_started = time.perf_counter()
     try:
         if use_incremental:
             from code_review_graph.flows import incremental_trace_flows
 
-            count = incremental_trace_flows(store, changed_files)
+            count = incremental_trace_flows(store, changed, delta=delta)
         else:
             from code_review_graph.flows import store_flows as _store_flows
             from code_review_graph.flows import trace_flows as _trace_flows
@@ -170,6 +189,7 @@ def _run_postprocess(
             count = _store_flows(store, flows)
         build_result["flows_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
+        derived_ok = False
         logger.warning("Flow detection failed: %s", e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
     timing["flows_s"] = max(
@@ -184,7 +204,7 @@ def _run_postprocess(
                 incremental_detect_communities,
             )
 
-            count = incremental_detect_communities(store, changed_files)
+            count = incremental_detect_communities(store, changed, delta=delta)
         else:
             from code_review_graph.communities import (
                 detect_communities as _detect_communities,
@@ -197,12 +217,15 @@ def _run_postprocess(
             count = _store_communities(store, comms)
         build_result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
+        derived_ok = False
         logger.warning("Community detection failed: %s", e)
         warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
     timing["communities_s"] = max(
         0.0,
         round(time.perf_counter() - stage_started, 6),
     )
+    if derived_ok and pending is not None:
+        clear_flows_stale(store)
 
     # -- Compute pre-computed summary tables --
     stage_started = time.perf_counter()
@@ -576,13 +599,19 @@ def _build_locked(
                 ),
             }
         if "write_epoch" not in result:
-            return {
+            unchanged = {
                 **result,
                 "build_type": "incremental",
                 "base_resolved": base_resolved,
                 "summary": "No changes detected. Graph is up to date.",
                 "postprocess_level": postprocess,
             }
+            if postprocess == "full" and read_flows_stale(store) is not None:
+                # Earlier --skip-flows updates left flows and communities behind.
+                warnings = _run_postprocess(store, unchanged, postprocess, repo_root=root)
+                if warnings:
+                    unchanged["warnings"] = warnings
+            return unchanged
         build_result = {
             **result,
             "build_type": "incremental",
@@ -606,6 +635,7 @@ def _build_locked(
         changed_files=changed,
         embedding_provider=embedding_provider,
         embedding_model=embedding_model,
+        repo_root=root,
     )
     if warnings:
         build_result["warnings"] = warnings
@@ -729,6 +759,9 @@ def run_postprocess(
                 store.rollback()
                 logger.warning("Community detection failed: %s", e)
                 warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
+
+        if "flows_detected" in result and "communities_detected" in result:
+            clear_flows_stale(store)
 
         _run_embedding_refresh(
             store,

@@ -10,8 +10,6 @@ import subprocess
 import threading
 from pathlib import Path
 
-import pytest
-
 from .conftest import build, git, open_store
 
 USER_SERVICE = "src/main/java/com/acme/service/UserService.java"
@@ -131,10 +129,6 @@ def test_watcher_restart_catches_up_on_edits_made_while_down(fixture_repo: Path)
     assert "deactivateAll" in _function_names(fixture_repo, USER_SERVICE)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="W4b: incremental flows/communities match 0 rows with repo-relative paths",
-)
 def test_incremental_postprocess_retraces_changed_flows(fixture_repo: Path):
     assert build(fixture_repo)["flows_detected"] > 0
     _add_method(fixture_repo, USER_SERVICE, "deactivateAll")

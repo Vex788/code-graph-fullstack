@@ -14,6 +14,7 @@ from typing import Any
 
 from .graph import GraphEdge, GraphNode, GraphStore, _sanitize_name
 from .kinds import community_edge_weights
+from .parser import normalize_file_path
 
 # Fixed seed for igraph's RNG so Leiden community detection is reproducible
 # across runs. Without this, two builds of the same graph produce different
@@ -805,9 +806,13 @@ def detect_communities(
         List of community dicts with keys: name, level, size, cohesion,
         dominant_language, description, members, member_qns.
     """
-    # Gather all nodes (exclude File nodes to focus on code entities)
+    # Gather all nodes (exclude File nodes to focus on code entities).
+    # Leiden depends on input order; sorting makes the result a function of
+    # the graph alone, so an incremental update matches a full rebuild.
     all_edges = store.get_all_edges()
+    all_edges.sort(key=lambda e: (e.source_qualified, e.target_qualified, e.kind, e.line))
     unique_nodes = store.get_all_nodes(exclude_files=True)
+    unique_nodes.sort(key=lambda n: n.qualified_name)
 
     # Build adjacency index once for fast cohesion computation
     adj = _build_adjacency(all_edges)
@@ -844,44 +849,46 @@ def incremental_detect_communities(
     store: GraphStore,
     changed_files: list[str],
     min_size: int = 2,
+    *,
+    delta: dict[str, Any] | None = None,
 ) -> int:
-    """Re-detect communities only if changed files affect existing communities.
+    """Re-detect communities only when the graph's structure changed.
 
-    If no existing communities contain nodes from changed files, skips
-    re-detection entirely (the common case for small changes). Otherwise
-    re-runs full community detection.
+    Detection is global, so any structural change re-runs it in full. With
+    the journaled *delta* of an incremental update that is exact: a change
+    that moved no node or edge (a comment, a reformat) skips it. Without a
+    delta, *changed_files* holding any node counts as a change.
 
     Args:
         store: The GraphStore instance.
         changed_files: List of file paths that have changed.
         min_size: Minimum number of nodes for a community to be included.
+        delta: The journaled graph change, when known.
 
     Returns:
         Number of communities detected, or 0 if skipped.
     """
-    if not changed_files:
-        return 0
+    if delta is not None:
+        if not delta.get("structural"):
+            return 0
+    else:
+        if not changed_files:
+            return 0
+        conn = store._conn
+        files = [normalize_file_path(p) for p in changed_files]
+        affected = False
+        for i in range(0, len(files), _SQL_BATCH):
+            batch = files[i:i + _SQL_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            if conn.execute(
+                f"SELECT 1 FROM nodes WHERE file_path IN ({placeholders}) LIMIT 1",  # nosec B608
+                batch,
+            ).fetchone():
+                affected = True
+                break
+        if not affected:
+            return 0
 
-    conn = store._conn
-
-    # Check if any communities are affected (batch to stay under SQLite limit)
-    affected_count = 0
-    for i in range(0, len(changed_files), _SQL_BATCH):
-        batch = changed_files[i:i + _SQL_BATCH]
-        placeholders = ",".join("?" * len(batch))
-        row = conn.execute(
-            f"SELECT COUNT(DISTINCT community_id) FROM nodes "  # nosec B608
-            f"WHERE community_id IS NOT NULL AND file_path IN ({placeholders})",
-            batch,
-        ).fetchone()
-        if row:
-            affected_count += row[0]
-    affected = (affected_count,) if affected_count else None
-
-    if not affected or affected[0] == 0:
-        return 0  # No communities affected, skip
-
-    # Re-run full community detection (correct and fast enough)
     communities = detect_communities(store, min_size=min_size)
     return store_communities(store, communities)
 

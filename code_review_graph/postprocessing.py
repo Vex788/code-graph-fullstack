@@ -54,6 +54,10 @@ def run_post_processing(
     _rebuild_fts_index(store, result, warnings)
     _trace_flows(store, result, warnings)
     _detect_communities(store, result, warnings)
+    if "flows_detected" in result and "communities_detected" in result:
+        from .incremental import clear_flows_stale
+
+        clear_flows_stale(store)
     _refresh_embeddings(
         store,
         result,
@@ -62,6 +66,30 @@ def run_post_processing(
         model=embedding_model,
     )
 
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+def run_pending_post_processing(
+    store: GraphStore,
+    *,
+    repo_root: Any = None,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
+) -> dict[str, Any]:
+    """Post-process after a watch batch: flows and communities follow the pending delta."""
+    from .tools.build import _run_postprocess
+
+    result: dict[str, Any] = {}
+    warnings = _run_postprocess(
+        store,
+        result,
+        "full",
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+        repo_root=repo_root,
+    )
     if warnings:
         result["warnings"] = warnings
     return result

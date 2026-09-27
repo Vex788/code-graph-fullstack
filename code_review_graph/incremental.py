@@ -247,6 +247,150 @@ def finish_write(store: GraphStore, result: dict[str, Any]) -> None:
     result["status"] = "partial" if failures or result.get("failed_files") else "ok"
 
 
+# -- Graph delta: what flows and communities must re-derive -----------------
+#
+# An incremental write journals every node and edge change through temporary
+# triggers on its own connection, so resolver rewrites in unchanged files are
+# seen too. The net change is merged into ``flows_stale`` metadata; the next
+# full post-processing consumes it. {"full": true} asks for a full recompute.
+
+_FLOWS_STALE_KEY = "flows_stale"
+_DELTA_LISTS = ("nodes", "sources", "targets", "deleted_ids")
+_MAX_DELTA_ENTRIES = env_int("CRG_MAX_DELTA_ENTRIES", 50_000, minimum=1)
+# Columns flows, communities and embedding text read; line moves are not changes.
+_NODE_COLUMNS = (
+    "kind", "name", "qualified_name", "file_path", "language", "parent_name",
+    "params", "return_type", "modifiers", "is_test", "extra",
+)
+_JOURNAL_TRIGGERS = {
+    "crg_delta_node_insert": (
+        "AFTER INSERT ON main.nodes BEGIN INSERT INTO crg_delta VALUES "
+        "('n', NEW.kind, NEW.qualified_name, NULL, NEW.id, NULL); END"
+    ),
+    "crg_delta_node_delete": (
+        "AFTER DELETE ON main.nodes BEGIN INSERT INTO crg_delta VALUES "
+        "('d', OLD.kind, OLD.qualified_name, NULL, OLD.id, NULL); END"
+    ),
+    "crg_delta_node_update": (
+        "AFTER UPDATE ON main.nodes WHEN "
+        + " OR ".join(f"OLD.{column} IS NOT NEW.{column}" for column in _NODE_COLUMNS)
+        + " BEGIN INSERT INTO crg_delta VALUES "
+        "('n', NEW.kind, NEW.qualified_name, NULL, NEW.id, NULL); "
+        "INSERT INTO crg_delta VALUES ('n', OLD.kind, OLD.qualified_name, NULL, NULL, NULL); END"
+    ),
+    "crg_delta_edge_insert": (
+        "AFTER INSERT ON main.edges BEGIN INSERT INTO crg_delta VALUES "
+        "('+', NEW.kind, NEW.source_qualified, NEW.target_qualified, NULL, NEW.file_path); END"
+    ),
+    "crg_delta_edge_delete": (
+        "AFTER DELETE ON main.edges BEGIN INSERT INTO crg_delta VALUES "
+        "('-', OLD.kind, OLD.source_qualified, OLD.target_qualified, NULL, OLD.file_path); END"
+    ),
+    "crg_delta_edge_update": (
+        "AFTER UPDATE ON main.edges WHEN OLD.kind IS NOT NEW.kind "
+        "OR OLD.source_qualified IS NOT NEW.source_qualified "
+        "OR OLD.target_qualified IS NOT NEW.target_qualified BEGIN "
+        "INSERT INTO crg_delta VALUES "
+        "('-', OLD.kind, OLD.source_qualified, OLD.target_qualified, NULL, OLD.file_path); "
+        "INSERT INTO crg_delta VALUES "
+        "('+', NEW.kind, NEW.source_qualified, NEW.target_qualified, NULL, NEW.file_path); END"
+    ),
+}
+
+
+def _start_delta_journal(store: GraphStore) -> None:
+    conn = store._conn
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS crg_delta "
+        "(op TEXT, kind TEXT, a TEXT, b TEXT, node_id INTEGER, file_path TEXT)"
+    )
+    conn.execute("DELETE FROM temp.crg_delta")
+    for name, body in _JOURNAL_TRIGGERS.items():
+        conn.execute(f"CREATE TEMP TRIGGER IF NOT EXISTS {name} {body}")
+    conn.commit()
+
+
+def _stop_delta_journal(store: GraphStore) -> dict[str, Any]:
+    """Drop the triggers and return the net change they recorded."""
+    conn = store._conn
+    for name in _JOURNAL_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS temp.{name}")
+    nodes: set[str] = set()
+    deleted_ids: set[int] = set()
+    edge_net: dict[tuple[str, str, str], int] = {}
+    for op, kind, a, b, node_id in conn.execute(
+        "SELECT op, kind, a, b, node_id FROM temp.crg_delta"
+    ):
+        if op in ("n", "d"):
+            nodes.add(a)
+            if op == "d":
+                deleted_ids.add(node_id)
+        else:
+            key = (kind, a, b)
+            edge_net[key] = edge_net.get(key, 0) + (1 if op == "+" else -1)
+    conn.execute("DELETE FROM temp.crg_delta")
+    conn.commit()
+    changed = [key for key, count in edge_net.items() if count]
+    return {
+        "nodes": sorted(nodes),
+        "sources": sorted({s for k, s, _t in changed if k in ("CALLS", "TESTED_BY")}),
+        "targets": sorted({t for k, _s, t in changed if k == "CALLS"}),
+        "deleted_ids": sorted(deleted_ids),
+        "inherits": any(k in ("INHERITS", "IMPLEMENTS") for k, _s, _t in changed),
+        "structural": bool(nodes or changed),
+    }
+
+
+def _journal_mark(store: GraphStore) -> int:
+    row = store._conn.execute("SELECT MAX(rowid) FROM temp.crg_delta").fetchone()
+    return int(row[0] or 0)
+
+
+def _files_that_lost_edges(store: GraphStore, since: int) -> set[str]:
+    """Files whose edges were deleted after journal position *since*."""
+    return {
+        row[0] for row in store._conn.execute(
+            "SELECT DISTINCT file_path FROM temp.crg_delta "
+            "WHERE rowid > ? AND op = '-' AND file_path IS NOT NULL",
+            (since,),
+        )
+    }
+
+
+def read_flows_stale(store: GraphStore) -> Optional[dict[str, Any]]:
+    """The graph change flows and communities have not absorbed yet, or None."""
+    raw = store.get_metadata(_FLOWS_STALE_KEY)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {"full": True}
+    return value if isinstance(value, dict) else {"full": True}
+
+
+def mark_flows_stale(store: GraphStore, delta: dict[str, Any]) -> None:
+    """Merge *delta* into the pending change; too large a change becomes full."""
+    pending = read_flows_stale(store)
+    if delta.get("full") or (pending is not None and pending.get("full")):
+        merged: dict[str, Any] = {"full": True}
+    else:
+        previous = pending or {}
+        merged = {
+            key: sorted(set(previous.get(key, ())) | set(delta.get(key, ())))
+            for key in _DELTA_LISTS
+        }
+        for flag in ("inherits", "structural"):
+            merged[flag] = bool(previous.get(flag) or delta.get(flag))
+        if sum(len(merged[key]) for key in _DELTA_LISTS) > _MAX_DELTA_ENTRIES:
+            merged = {"full": True}
+    store.set_metadata(_FLOWS_STALE_KEY, json.dumps(merged, separators=(",", ":")))
+
+
+def clear_flows_stale(store: GraphStore) -> None:
+    store.delete_metadata(_FLOWS_STALE_KEY)
+
+
 # Extension -> language tag, matching the RESOLVERS frozensets in
 # code_review_graph/resolvers/__init__.py. Turns a set of changed file paths
 # into the set of languages that changed, for incremental resolver gating.
@@ -1733,6 +1877,7 @@ def full_build(
             "write_epoch": epoch,
             **_resolver_results_section(resolver_results),
         }
+        mark_flows_stale(store, {"full": True})
         return _end_write(store, result, pending, stamp)
 
 
@@ -1820,6 +1965,25 @@ def _incremental_update_locked(
             "expected_index_generation": INDEX_GENERATION,
         }
 
+    _start_delta_journal(store)
+    try:
+        return _incremental_update_journaled(
+            repo_root, store, base, changed_files, reconcile_stale, startup, stamp,
+        )
+    finally:
+        _stop_delta_journal(store)
+
+
+def _incremental_update_journaled(
+    repo_root: Path,
+    store: GraphStore,
+    base: str,
+    changed_files: list[str] | None,
+    reconcile_stale: bool,
+    startup: bool,
+    stamp: bool,
+) -> dict:
+    journal_start = _journal_mark(store)
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
     # A previous write that never stamped left the graph in an unknown state.
@@ -1952,6 +2116,31 @@ def _incremental_update_locked(
     missing_paths.update(normalize_file_path(repo_root / rel) for rel in outcome.vanished)
 
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
+
+    # Removing a file drops other files' edges into it, while a fresh build
+    # keeps them as unresolved references: parse those files again.
+    settled = missing_paths | set(stale_files) | {
+        normalize_file_path(repo_root / rel) for rel in to_parse
+    }
+    referrers: list[str] = []
+    for lost in sorted(_files_that_lost_edges(store, journal_start) - settled):
+        try:
+            rel = str(Path(lost).relative_to(repo_root))
+        except ValueError:
+            continue
+        if (repo_root / rel).is_file() and not _should_ignore(rel, ignore_patterns):
+            referrers.append(rel)
+    if referrers:
+        again = _parse_and_store(repo_root, store, parser, referrers)
+        outcome = _ParseOutcome(
+            outcome.parsed + again.parsed,
+            outcome.total_nodes + again.total_nodes,
+            outcome.total_edges + again.total_edges,
+            outcome.errors + again.errors,
+            outcome.vanished + again.vanished,
+        )
+        dependent_files.update(referrers)
+        all_files.update(referrers)
     files_updated = outcome.parsed + len(stale_files) + removed_files
 
     # Only re-run a resolver when a file in one of its declared languages
@@ -1991,6 +2180,8 @@ def _incremental_update_locked(
         "write_epoch": epoch,
         **_resolver_results_section(resolver_results),
     }
+    # An unstamped earlier write may have changed anything.
+    mark_flows_stale(store, {"full": True} if recovering else _stop_delta_journal(store))
     return _end_write(store, result, pending, stamp)
 
 

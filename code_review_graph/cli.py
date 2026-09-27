@@ -2421,13 +2421,11 @@ def main() -> None:
                     )
 
         elif args.command == "watch":
-            from .postprocessing import run_post_processing
+            from .postprocessing import run_pending_post_processing
 
             try:
-                callback = (
-                    partial(run_post_processing, **embedding_refresh_kwargs)
-                    if embedding_refresh_kwargs
-                    else run_post_processing
+                callback = partial(
+                    run_pending_post_processing, repo_root=repo_root, **embedding_refresh_kwargs,
                 )
                 watch(repo_root, store, on_files_updated=callback)
             except RuntimeError as exc:
