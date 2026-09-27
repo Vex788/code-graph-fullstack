@@ -1,0 +1,1825 @@
+{
+  "contract_version": "1.0.0-rc1",
+  "compat_epoch": 1,
+  "fork_version": "2.3.8+fs.5",
+  "schema_version": 10,
+  "reader_compat": 9,
+  "min_writer_version": 10,
+  "index_generation": 1,
+  "statuses": [
+    "missing_graph",
+    "building",
+    "rebuild_required",
+    "partial_index",
+    "stale_graph",
+    "stale_worktree",
+    "ok"
+  ],
+  "embeddings_statuses": [
+    "off",
+    "ready",
+    "stale",
+    "unavailable"
+  ],
+  "exit_codes": {
+    "ok": 0,
+    "error": 1,
+    "usage": 2,
+    "degraded": 3,
+    "rebuild_required": 4,
+    "lock_busy": 75
+  },
+  "kinds": {
+    "node_kinds": [
+      {
+        "name": "File",
+        "vscode_color": "#58a6ff",
+        "since": null,
+        "description": "A source file"
+      },
+      {
+        "name": "Class",
+        "vscode_color": "#f0883e",
+        "since": null,
+        "description": "Class, interface, struct, enum or record"
+      },
+      {
+        "name": "Function",
+        "vscode_color": "#3fb950",
+        "since": null,
+        "description": "Function, method or constructor"
+      },
+      {
+        "name": "Type",
+        "vscode_color": "#8b949e",
+        "since": null,
+        "description": "Type alias or type declaration"
+      },
+      {
+        "name": "Test",
+        "vscode_color": "#d2a8ff",
+        "since": null,
+        "description": "Test function"
+      },
+      {
+        "name": "Endpoint",
+        "vscode_color": "#89dceb",
+        "since": null,
+        "description": "HTTP route exposed by a handler"
+      },
+      {
+        "name": "ConfigProperty",
+        "vscode_color": "#f9e2af",
+        "since": null,
+        "description": "Configuration key"
+      },
+      {
+        "name": "Scheduler",
+        "vscode_color": "#fab387",
+        "since": null,
+        "description": "Scheduled job trigger"
+      },
+      {
+        "name": "Event",
+        "vscode_color": "#f38ba8",
+        "since": null,
+        "description": "Application event published or handled"
+      }
+    ],
+    "edge_kinds": [
+      {
+        "name": "CALLS",
+        "direction": "incoming",
+        "impact_weight": 1.0,
+        "community_weight": 1.0,
+        "dependents_trigger": true,
+        "cross_stack": false,
+        "risk_counts": true,
+        "vscode_color": "#3fb950",
+        "since": null,
+        "description": "Caller invokes callee"
+      },
+      {
+        "name": "INHERITS",
+        "direction": "incoming",
+        "impact_weight": 0.9,
+        "community_weight": 0.8,
+        "dependents_trigger": true,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#d2a8ff",
+        "since": null,
+        "description": "Subtype extends supertype"
+      },
+      {
+        "name": "OVERRIDES",
+        "direction": "incoming",
+        "impact_weight": 0.9,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#cba6f7",
+        "since": null,
+        "description": "Method overrides a supertype method"
+      },
+      {
+        "name": "IMPLEMENTS",
+        "direction": "incoming",
+        "impact_weight": 0.9,
+        "community_weight": 0.7,
+        "dependents_trigger": true,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#f9e2af",
+        "since": null,
+        "description": "Class implements an interface"
+      },
+      {
+        "name": "TESTED_BY",
+        "direction": "outgoing",
+        "impact_weight": 0.7,
+        "community_weight": 0.4,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#f38ba8",
+        "since": null,
+        "description": "Production code -> the test covering it"
+      },
+      {
+        "name": "REFERENCES",
+        "direction": "incoming",
+        "impact_weight": 0.6,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#94e2d5",
+        "since": null,
+        "description": "Symbol mentions another symbol"
+      },
+      {
+        "name": "DEPENDS_ON",
+        "direction": "incoming",
+        "impact_weight": 0.6,
+        "community_weight": 0.6,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#fab387",
+        "since": null,
+        "description": "Generic dependency"
+      },
+      {
+        "name": "IMPORTS_FROM",
+        "direction": "incoming",
+        "impact_weight": 0.5,
+        "community_weight": 0.5,
+        "dependents_trigger": true,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#f0883e",
+        "since": null,
+        "description": "Module imports from another module"
+      },
+      {
+        "name": "RENDERS",
+        "direction": "incoming",
+        "impact_weight": 0.6,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#89b4fa",
+        "since": null,
+        "description": "Page renders a server class (useActionBean, bean binding)"
+      },
+      {
+        "name": "REQUESTS",
+        "direction": "incoming",
+        "impact_weight": 0.5,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#74c7ec",
+        "since": null,
+        "description": "Page script requests a server route"
+      },
+      {
+        "name": "INCLUDES",
+        "direction": "incoming",
+        "impact_weight": 0.5,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#b4befe",
+        "since": null,
+        "description": "Page includes another page or script file"
+      },
+      {
+        "name": "CONTAINS",
+        "direction": "none",
+        "impact_weight": 0.3,
+        "community_weight": 0.3,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "rgba(139,148,158,0.15)",
+        "since": null,
+        "description": "Parent contains child"
+      },
+      {
+        "name": "INJECTS",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#a6e3a1",
+        "since": null,
+        "description": "Dependency injection point"
+      },
+      {
+        "name": "HANDLES",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#89dceb",
+        "since": null,
+        "description": "Handler serves an endpoint"
+      },
+      {
+        "name": "TRIGGERS",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#fab387",
+        "since": null,
+        "description": "Scheduler triggers a job"
+      },
+      {
+        "name": "PUBLISHES",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#f5c2e7",
+        "since": null,
+        "description": "Code publishes an event"
+      },
+      {
+        "name": "CONSUMES",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#eba0ac",
+        "since": null,
+        "description": "Code consumes a message"
+      },
+      {
+        "name": "PRODUCES",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#f5e0dc",
+        "since": null,
+        "description": "Code produces a message"
+      },
+      {
+        "name": "TEMPORAL_STUB",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#9399b2",
+        "since": null,
+        "description": "Unresolved Temporal workflow/activity stub"
+      },
+      {
+        "name": "DEPENDS_ON_CONFIG",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": false,
+        "risk_counts": false,
+        "vscode_color": "#f9e2af",
+        "since": null,
+        "description": "Code reads a configuration key"
+      },
+      {
+        "name": "FORWARDS_TO",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#89b4fa",
+        "since": "fs.6",
+        "description": "Action forwards or redirects to a page"
+      },
+      {
+        "name": "BINDS",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#94e2d5",
+        "since": "fs.6",
+        "description": "Form field binds to a bean property"
+      },
+      {
+        "name": "USES_STYLE",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#f2cdcd",
+        "since": "fs.6",
+        "description": "Page uses a stylesheet"
+      },
+      {
+        "name": "MAPS_TO",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#74c7ec",
+        "since": "fs.6",
+        "description": "URL binding maps to an action"
+      },
+      {
+        "name": "HANDLES_EVENT",
+        "direction": null,
+        "impact_weight": null,
+        "community_weight": null,
+        "dependents_trigger": false,
+        "cross_stack": true,
+        "risk_counts": false,
+        "vscode_color": "#eba0ac",
+        "since": "fs.6",
+        "description": "Action method handles a named request event"
+      }
+    ]
+  },
+  "tools": [
+    {
+      "name": "apply_refactor_tool",
+      "read_only": false,
+      "params": [
+        {
+          "name": "refactor_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "dry_run",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        },
+        {
+          "name": "max_diff_files",
+          "type": "integer",
+          "required": false,
+          "default": 25
+        }
+      ]
+    },
+    {
+      "name": "batch_query_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "queries",
+          "type": "array<object>",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_results_per_query",
+          "type": "integer",
+          "required": false,
+          "default": 10
+        }
+      ]
+    },
+    {
+      "name": "build_or_update_graph_tool",
+      "read_only": false,
+      "params": [
+        {
+          "name": "full_rebuild",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "base",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "postprocess",
+          "type": "string",
+          "required": false,
+          "default": "full"
+        },
+        {
+          "name": "recurse_submodules",
+          "type": "boolean|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "embedding_provider",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "embedding_model",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "status_only",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        }
+      ]
+    },
+    {
+      "name": "common_callers_of_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "symbol_a",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "symbol_b",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "coverage_report_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "cross_repo_search_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "kind",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 20
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        }
+      ]
+    },
+    {
+      "name": "detect_changes_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "base",
+          "type": "string",
+          "required": false,
+          "default": "HEAD~1"
+        },
+        {
+          "name": "changed_files",
+          "type": "array<string>|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "include_source",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        },
+        {
+          "name": "max_depth",
+          "type": "integer",
+          "required": false,
+          "default": 2
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 25
+        },
+        {
+          "name": "max_flows",
+          "type": "integer",
+          "required": false,
+          "default": 20
+        }
+      ]
+    },
+    {
+      "name": "embed_graph_tool",
+      "read_only": false,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "model",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "provider",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "find_large_functions_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "min_lines",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        },
+        {
+          "name": "kind",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "file_path_pattern",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "generate_wiki_tool",
+      "read_only": false,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "force",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        }
+      ]
+    },
+    {
+      "name": "get_affected_flows_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "changed_files",
+          "type": "array<string>|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "base",
+          "type": "string",
+          "required": false,
+          "default": "HEAD~1"
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        },
+        {
+          "name": "max_flows",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        }
+      ]
+    },
+    {
+      "name": "get_architecture_overview_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "minimal"
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 100
+        },
+        {
+          "name": "max_members",
+          "type": "integer",
+          "required": false,
+          "default": 10
+        }
+      ]
+    },
+    {
+      "name": "get_bridge_nodes_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "top_n",
+          "type": "integer",
+          "required": false,
+          "default": 10
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "get_community_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "community_name",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "community_id",
+          "type": "integer|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "include_members",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_members",
+          "type": "integer",
+          "required": false,
+          "default": 25
+        }
+      ]
+    },
+    {
+      "name": "get_docs_section_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "section_name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "get_flow_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "flow_id",
+          "type": "integer|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "flow_name",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "include_source",
+          "type": "boolean",
+          "required": false,
+          "default": false
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_steps",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        },
+        {
+          "name": "max_source_lines",
+          "type": "integer",
+          "required": false,
+          "default": 400
+        }
+      ]
+    },
+    {
+      "name": "get_hub_nodes_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "top_n",
+          "type": "integer",
+          "required": false,
+          "default": 10
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "get_impact_radius_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "changed_files",
+          "type": "array<string>|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_depth",
+          "type": "integer",
+          "required": false,
+          "default": 2
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "base",
+          "type": "string",
+          "required": false,
+          "default": "HEAD~1"
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "get_knowledge_gaps_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_per_category",
+          "type": "integer",
+          "required": false,
+          "default": 15
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "get_minimal_context_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "task",
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        {
+          "name": "changed_files",
+          "type": "array<string>|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "base",
+          "type": "string",
+          "required": false,
+          "default": "HEAD~1"
+        }
+      ]
+    },
+    {
+      "name": "get_review_context_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "changed_files",
+          "type": "array<string>|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_depth",
+          "type": "integer",
+          "required": false,
+          "default": 2
+        },
+        {
+          "name": "include_source",
+          "type": "boolean",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "max_lines_per_file",
+          "type": "integer",
+          "required": false,
+          "default": 200
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "base",
+          "type": "string",
+          "required": false,
+          "default": "HEAD~1"
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 100
+        },
+        {
+          "name": "max_files",
+          "type": "integer",
+          "required": false,
+          "default": 25
+        }
+      ]
+    },
+    {
+      "name": "get_suggested_questions_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "get_surprising_connections_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "top_n",
+          "type": "integer",
+          "required": false,
+          "default": 15
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "get_wiki_page_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "community_name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_chars",
+          "type": "integer",
+          "required": false,
+          "default": 20000
+        }
+      ]
+    },
+    {
+      "name": "list_communities_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "sort_by",
+          "type": "string",
+          "required": false,
+          "default": "size"
+        },
+        {
+          "name": "min_size",
+          "type": "integer",
+          "required": false,
+          "default": 0
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        },
+        {
+          "name": "max_members",
+          "type": "integer",
+          "required": false,
+          "default": 10
+        }
+      ]
+    },
+    {
+      "name": "list_flows_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "sort_by",
+          "type": "string",
+          "required": false,
+          "default": "criticality"
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        },
+        {
+          "name": "kind",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "list_graph_stats_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "list_repos_tool",
+      "read_only": true,
+      "params": []
+    },
+    {
+      "name": "orient_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "query_graph_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "pattern",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "target",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 100
+        }
+      ]
+    },
+    {
+      "name": "refactor_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "rename"
+        },
+        {
+          "name": "old_name",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "new_name",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "kind",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "file_pattern",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "max_results",
+          "type": "integer",
+          "required": false,
+          "default": 50
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "run_postprocess_tool",
+      "read_only": false,
+      "params": [
+        {
+          "name": "flows",
+          "type": "boolean",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "communities",
+          "type": "boolean",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "fts",
+          "type": "boolean",
+          "required": false,
+          "default": true
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "embedding_provider",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "embedding_model",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "semantic_search_nodes_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "kind",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 20
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "model",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "provider",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        },
+        {
+          "name": "detail_level",
+          "type": "string",
+          "required": false,
+          "default": "standard"
+        }
+      ]
+    },
+    {
+      "name": "shortest_path_between_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "symbol_a",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "symbol_b",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "call"
+        },
+        {
+          "name": "max_depth",
+          "type": "integer",
+          "required": false,
+          "default": 6
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    },
+    {
+      "name": "traverse_graph_tool",
+      "read_only": true,
+      "params": [
+        {
+          "name": "query",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "bfs"
+        },
+        {
+          "name": "depth",
+          "type": "integer",
+          "required": false,
+          "default": 3
+        },
+        {
+          "name": "token_budget",
+          "type": "integer",
+          "required": false,
+          "default": 2000
+        },
+        {
+          "name": "repo_root",
+          "type": "string|null",
+          "required": false,
+          "default": null
+        }
+      ]
+    }
+  ],
+  "schemas": {
+    "error": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Error response",
+      "type": "object",
+      "required": [
+        "status",
+        "error_code",
+        "message"
+      ],
+      "properties": {
+        "status": {
+          "const": "error"
+        },
+        "error_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "graph_receipt": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "_graph receipt attached to tool responses",
+      "type": "object",
+      "properties": {
+        "updated_at": {
+          "type": "string"
+        },
+        "age_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "built_at_sha": {
+          "type": "string"
+        },
+        "built_on_branch": {
+          "type": "string"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "head_matches_build": {
+          "type": "boolean"
+        },
+        "missing_build_anchor": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "missing_graph",
+            "building",
+            "rebuild_required",
+            "partial_index",
+            "stale_graph",
+            "stale_worktree",
+            "ok"
+          ]
+        },
+        "embeddings": {
+          "enum": [
+            "off",
+            "ready",
+            "stale",
+            "unavailable"
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "index_generation": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_identity": {
+          "type": "object",
+          "properties": {
+            "runtime_matches_source": {
+              "type": "boolean"
+            },
+            "index_matches_runtime": {
+              "type": "boolean"
+            },
+            "source_matches_build": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "status_json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "code-review-graph status --json",
+      "type": "object",
+      "required": [
+        "nodes",
+        "files",
+        "last_updated",
+        "built_at_commit"
+      ],
+      "properties": {
+        "nodes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "edges": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_updated": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vcs": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "built_on_branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "built_at_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "svn_branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "svn_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "readiness": {
+          "type": "object",
+          "required": [
+            "status",
+            "embeddings",
+            "reasons"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "missing_graph",
+                "building",
+                "rebuild_required",
+                "partial_index",
+                "stale_graph",
+                "stale_worktree",
+                "ok"
+              ]
+            },
+            "embeddings": {
+              "enum": [
+                "off",
+                "ready",
+                "stale",
+                "unavailable"
+              ]
+            },
+            "reasons": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "index_generation": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "source_identity": {
+          "type": "object",
+          "properties": {
+            "runtime_matches_source": {
+              "type": "boolean"
+            },
+            "index_matches_runtime": {
+              "type": "boolean"
+            },
+            "source_matches_build": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "harness_fragment": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "code-review-graph harness fragment --json",
+      "type": "object",
+      "required": [
+        "owner",
+        "version",
+        "target",
+        "hooks",
+        "mcpServers",
+        "permissions"
+      ],
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "target": {
+          "enum": [
+            "claude",
+            "zcode",
+            "bug-hunter"
+          ]
+        },
+        "hooks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "event",
+              "command"
+            ],
+            "properties": {
+              "event": {
+                "type": "string"
+              },
+              "matcher": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "timeout": {
+                "type": "number",
+                "minimum": 0
+              },
+              "rewrites_input": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "mcpServers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "command"
+            ],
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "permissions": {
+          "type": "object",
+          "required": [
+            "allow"
+          ],
+          "properties": {
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "statusLine": {
+          "type": "object",
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
