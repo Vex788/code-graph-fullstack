@@ -13,7 +13,9 @@ from .targets import Target, get_target
 
 OWNER = "code-review-graph"
 MCP_SERVER = "code-review-graph"
-# The "agent" tool preset lands with W5b; until then serve ignores the value.
+# The same server as a plain MCP entry and as the bug-hunter plugin's server.
+MCP_PREFIXES = (f"mcp__{MCP_SERVER}__", f"mcp__plugin_bug-hunter_{MCP_SERVER}__")
+# "agent" is a TOOL_PRESETS entry in main.py.
 MCP_ARGS = ["serve", "--tools", "agent"]
 READ_ONLY_CLI = ("status", "contract", "query", "impact", "search")
 UPDATE_HOOK = "crg-update.py"
@@ -32,7 +34,7 @@ def fragment(target: str | Target) -> dict[str, Any]:
     if spec.regions_only or spec.command_root is None:
         raise ValueError(f"target {spec.name!r} takes no config fragment")
     hook_path = f"{spec.command_root}/{spec.hooks_dir}/{UPDATE_HOOK}"
-    allow = [f"mcp__{MCP_SERVER}__{name}" for name in _read_only_tools()]
+    allow = [f"{prefix}{name}" for prefix in MCP_PREFIXES for name in _read_only_tools()]
     allow += [f"Bash(code-review-graph {cmd}:*)" for cmd in READ_ONLY_CLI]
     doc: dict[str, Any] = {
         "owner": OWNER,

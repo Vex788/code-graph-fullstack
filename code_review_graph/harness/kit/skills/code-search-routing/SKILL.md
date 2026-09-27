@@ -20,8 +20,8 @@ Use the cheapest tool that answers the question; escalate only for structural-co
 | Completeness claim ("all callers, pages, assets covered") | `coverage_report_tool` (CLI `code-review-graph coverage --json`) | the root controller prepares the graph; still failing → claim is `UNVERIFIED` |
 | Concept search, no exact anchor ("vendor invoice approval") | `semantic_search_nodes_tool`; read `search_mode` and any `warning` in the response | `Grep` on the best candidate names |
 | Broad exploration with ranking | `orient_tool` for a task mini-map | `semantic_search_nodes_tool`, then exact anchors |
-| JSP ↔ Java binding (which handler renders a page, which pages break when a handler class changes) | Graph FIRST: RENDERS/REQUESTS/INCLUDES/REFERENCES edges plus `get_impact_radius_tool` on the handler class | `Grep` on the handler or bean name when the graph lane is down (text evidence only) |
-| CSS selector or stylesheet usage | Graph (`css`/`scss` File nodes and REFERENCES edges; USES_STYLE from fs.6) | `Grep` on the selector text |
+| JSP ↔ Java binding (which handler renders a page, which pages break when a handler class changes) | Graph FIRST: `query_graph_tool` `pages_for`/`requests_to`/`included_by`/`views_of` plus `get_impact_radius_tool` on the handler class | `Grep` on the handler or bean name when the graph lane is down (text evidence only) |
+| CSS selector or stylesheet usage | Graph (`css`/`scss` File nodes and REFERENCES edges; `styles_of` once USES_STYLE edges land, fs.6+) | `Grep` on the selector text |
 
 ## Entry rule and receipt
 
@@ -33,9 +33,9 @@ Use the cheapest tool that answers the question; escalate only for structural-co
 
 ## Cross-stack query patterns
 
-Edges that exist now: RENDERS (JSP → handler class or Endpoint), REQUESTS (JSP/JS URL → Endpoint or handler), INCLUDES (JSP → JSP), REFERENCES (asset tags: script, stylesheet, page). From fs.6 the graph also carries FORWARDS_TO (`ForwardResolution`/`RedirectResolution`), HANDLES_EVENT (`@HandlesEvent`/`@DefaultHandler`), BINDS (form `name=` → property), USES_STYLE (`class=` → CSS selector) and MAPS_TO (`@Entity`/`@Table`/`*.hbm.xml` → table).
+Edges that exist now: RENDERS (JSP → handler class or Endpoint), REQUESTS (JSP/JS URL → Endpoint or handler), INCLUDES (JSP → JSP), REFERENCES (asset tags: script, stylesheet, page). Edge kinds registered but not produced yet (fs.6+): FORWARDS_TO (`ForwardResolution`/`RedirectResolution`), HANDLES_EVENT (`@HandlesEvent`/`@DefaultHandler`), BINDS (form `name=` → property), USES_STYLE (`class=` → CSS selector), MAPS_TO (`@Entity`/`@Table`/`*.hbm.xml` → table) and jQuery `$.ajax`/`$.get` REQUESTS.
 
-`query_graph_tool` patterns for them (fs.6+; also usable inside `batch_query_tool`):
+`query_graph_tool` patterns for them (also usable inside `batch_query_tool`; patterns over the not-yet-produced kinds return empty today):
 
 | Pattern | Answers |
 |---|---|
@@ -48,7 +48,7 @@ Edges that exist now: RENDERS (JSP → handler class or Endpoint), REQUESTS (JSP
 | `binds_to` | form fields bound to a bean property |
 | `styles_of` | CSS selectors a page uses |
 
-Before fs.6, use `callers_of`/`importers_of` on the handler class plus `get_impact_radius_tool`; they follow RENDERS/REQUESTS/INCLUDES too.
+`callers_of` follows only CALLS and `importers_of` only IMPORTS_FROM; they never return pages. Use the patterns above for page ↔ handler questions, plus `get_impact_radius_tool` on the handler class.
 
 ## Semantic search
 

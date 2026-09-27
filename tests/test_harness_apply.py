@@ -24,6 +24,19 @@ def _claude_root(root: Path) -> Path:
     return root
 
 
+def _seed_regions(root: Path, target: str) -> None:
+    """Every region file of ``target`` as shipped, with empty markers."""
+    _claude_root(root)
+    for region in get_target(target).regions:
+        path = root / region.file
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"<!-- crg-kit:begin {region.id} -->\n<!-- crg-kit:end {region.id} -->\n",
+                encoding="utf-8",
+            )
+
+
 def _snapshot(root: Path) -> dict[str, bytes]:
     return {
         p.relative_to(root).as_posix(): p.read_bytes()
@@ -225,7 +238,9 @@ def test_dry_run_writes_nothing(tmp_path: Path):
 def test_bare_root_is_degraded_on_missing_claude_md_region(tmp_path: Path, target: str):
     report = apply(target, tmp_path)
     assert report.status == 3
-    assert _kind(report, "region-missing") == ["CLAUDE.md#graph-routing"]
+    assert _kind(report, "region-missing") == [
+        f"{r.file}#{r.id}" for r in get_target(target).regions
+    ]
     assert "hooks/crg-update.py" in report.written and not (tmp_path / "CLAUDE.md").exists()
     assert apply(target, tmp_path, check=True).status == 1
 
@@ -238,7 +253,7 @@ def test_bare_root_is_degraded_on_missing_claude_md_region(tmp_path: Path, targe
     ],
 )
 def test_graph_routing_region_is_filled_in_claude_md(tmp_path: Path, target: str, prefix: str):
-    _claude_root(tmp_path)
+    _seed_regions(tmp_path, target)
     report = apply(target, tmp_path)
     assert report.status == 0 and "CLAUDE.md" in report.written
     text = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")

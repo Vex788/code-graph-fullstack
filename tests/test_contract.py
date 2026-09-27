@@ -128,3 +128,11 @@ def test_schema_structure_without_jsonschema(name):
     assert schema["type"] == "object"
     assert set(schema.get("required", [])) <= set(schema["properties"])
     assert set(schema.get("required", [])) <= set(EXAMPLES[name])
+
+
+def test_tool_presets_expand_to_registered_tools():
+    c = build_contract()
+    names = sorted(t["name"] for t in c["tools"])
+    assert c["tool_presets"]["all"] == names
+    assert set(c["tool_presets"]["agent"]) <= set(names)
+    assert "query_graph_tool" in c["tool_presets"]["agent"]

@@ -1567,10 +1567,11 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argument
     serve_cmd.add_argument(
         "--tools", default=None,
         help=(
-            "Comma-separated list of tool names to expose "
-            "(e.g. query_graph_tool,semantic_search_nodes_tool). "
-            "Unlisted tools are removed. Falls back to CRG_TOOLS env var. "
-            "When unset, all tools are available."
+            "Comma-separated tool names and presets to expose. Presets: "
+            "'agent' (the 14-tool working set for coding agents) and 'all'. "
+            "Combinable, e.g. agent,embed_graph_tool. Unlisted tools are "
+            "removed. Falls back to CRG_TOOLS env var. When unset, all tools "
+            "are available."
         ),
     )
     serve_cmd.add_argument(

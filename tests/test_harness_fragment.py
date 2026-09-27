@@ -45,6 +45,7 @@ def test_fragment_permissions_are_read_only(fragments):
     allow = fragments["claude"]["permissions"]["allow"]
     tools = [a for a in allow if a.startswith("mcp__")]
     assert "mcp__code-review-graph__query_graph_tool" in tools
+    assert "mcp__plugin_bug-hunter_code-review-graph__query_graph_tool" in tools
     assert not {f"mcp__code-review-graph__{t}" for t in WRITE_TOOLS} & set(tools)
     assert "Bash(code-review-graph status:*)" in allow
     assert not any("build" in a or "update" in a for a in allow if a.startswith("Bash("))

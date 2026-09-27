@@ -69,8 +69,11 @@ hooks_dir = "hooks"
 skills_dir = "skills"
 data_dir = "hooks"
 edit_matcher = "Edit|Write|MultiEdit|ApplyPatch"
+# Claude Code never loads a plugin-root CLAUDE.md; agents and skills carry the routing.
 regions = [
   { file = "CLAUDE.md", id = "graph-routing", block = "graph-routing" },
+  { file = "agents/reviewer.md", id = "graph-routing", block = "graph-routing" },
+  { file = "skills/pr-review-orchestrator/SKILL.md", id = "graph-routing", block = "graph-routing" },
 ]
 
 [targets.bug-hunter.events]

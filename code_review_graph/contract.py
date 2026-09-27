@@ -245,6 +245,17 @@ def tool_specs() -> list[dict[str, Any]]:
     return specs
 
 
+def tool_presets(tools: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Each ``serve --tools`` preset expanded to its tool names."""
+    from .main import TOOL_PRESETS
+
+    names = sorted(spec["name"] for spec in tools)
+    return {
+        preset: sorted(members) if members else names
+        for preset, members in TOOL_PRESETS.items()
+    }
+
+
 def cli_command_specs() -> list[dict[str, Any]]:
     from .cli import cli_commands
 
@@ -252,6 +263,7 @@ def cli_command_specs() -> list[dict[str, Any]]:
 
 
 def build_contract() -> dict[str, Any]:
+    tools = tool_specs()
     return {
         "contract_version": CONTRACT_VERSION,
         "compat_epoch": COMPAT_EPOCH,
@@ -264,7 +276,8 @@ def build_contract() -> dict[str, Any]:
         "embeddings_statuses": EMBEDDINGS_VALUES,
         "exit_codes": dict(EXIT_CODES),
         "kinds": kinds_as_dict(),
-        "tools": tool_specs(),
+        "tools": tools,
+        "tool_presets": tool_presets(tools),
         "cli_commands": cli_command_specs(),
         "schemas": SCHEMAS,
     }

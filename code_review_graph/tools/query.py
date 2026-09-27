@@ -1313,9 +1313,9 @@ def batch_query(
                 item = {"pattern": pattern, "target": target,
                         "status": handle.get("status", "error"),
                         "summary": handle.get("message") or handle.get("summary")}
-                for key in ("error_code", "reason"):
-                    if key in handle:
-                        item[key] = handle[key]
+                for field in ("error_code", "reason"):
+                    if field in handle:
+                        item[field] = handle[field]
                 if entry_root != repo_root:
                     item["repo_root"] = entry_root
                 items.append(item)
