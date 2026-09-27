@@ -1350,17 +1350,25 @@ class GraphStore:
                 (receiver and receiver not in ("self", "cls", "this"))
                 or edge_extra.get("receiver_expression")
             ):
-                # A member call belongs to its receiver's type: without type
-                # evidence (or for a library type) no repo method qualifies.
+                # A member call belongs to its receiver's type. Library types
+                # never bind; a known type binds only to its own methods; in
+                # languages whose parser tracks declared types, no type means
+                # no evidence at all.
                 receiver_type = edge_extra.get("receiver_type")
-                if not isinstance(receiver_type, str) or edge_extra.get("receiver_external"):
+                if edge_extra.get("receiver_external"):
                     candidates = []
-                else:
+                elif isinstance(receiver_type, str):
                     owner_type = receiver_type.rsplit(".", 1)[-1]
                     candidates = [
                         candidate for candidate in candidates
                         if node_owner.get(candidate[0]) == owner_type
                     ]
+                elif edge_extra.get("receiver_import"):
+                    # A module/namespace receiver: only its imported files qualify.
+                    imported = import_targets.get(edge["file_path"], set())
+                    candidates = [c for c in candidates if c[1] in imported]
+                elif edge["file_path"].endswith((".java", ".kt", ".kts", ".cs")):
+                    candidates = []
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())

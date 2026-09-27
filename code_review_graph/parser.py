@@ -11360,6 +11360,13 @@ class CodeParser:
                     call_name = method_name
                 if receiver:
                     call_extra["receiver"] = receiver
+                    # ``utils.helper()`` / ``api.load()`` on an imported module
+                    # or namespace: the import is the evidence for the target.
+                    if (
+                        language in ("python", "javascript", "typescript", "tsx")
+                        and receiver in (import_map or {})
+                    ):
+                        call_extra["receiver_import"] = True
                     if (
                         language == "go"
                         and _go_receiver_bindings is not None

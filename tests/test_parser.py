@@ -2740,3 +2740,32 @@ class TestJsAnonymousCallbacks:
         assert "onChange" in {n.name for n in nodes if n.kind == "Function"}
         calls = {(e.source, e.target) for e in edges if e.kind == "CALLS"}
         assert (f"{prefix}::onChange", f"{prefix}::refresh") in calls
+
+
+class TestReceiverBindingOutsideJava:
+    """The strict receiver gate is for declared-type languages; others keep evidence."""
+
+    def test_module_namespace_and_local_instance_calls_still_bind(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        (tmp_path / "utils.py").write_text("def helper():\n    return 1\n")
+        (tmp_path / "app.py").write_text(
+            "import utils\n\nclass Repo:\n    def save(self):\n        pass\n\n"
+            "def run():\n    utils.helper()\n    r = Repo()\n    r.save()\n"
+        )
+        (tmp_path / "api.js").write_text("export function load() {}\n")
+        (tmp_path / "page.js").write_text(
+            "import * as api from './api.js';\nexport function g() { api.load(); }\n"
+        )
+        with GraphStore(tmp_path / "graph.db") as store:
+            full_build(tmp_path, store)
+            store.resolve_bare_call_targets()
+            store.commit()
+            calls = {
+                (e.source_qualified.rsplit("/", 1)[-1], e.target_qualified.rsplit("/", 1)[-1])
+                for e in store.get_edges_by_source(f"{(tmp_path / 'app.py').as_posix()}::run")
+                + store.get_edges_by_source(f"{(tmp_path / 'page.js').as_posix()}::g")
+                if e.kind == "CALLS"
+            }
+        assert ("app.py::run", "utils.py::helper") in calls
+        assert ("app.py::run", "app.py::Repo.save") in calls
+        assert ("page.js::g", "api.js::load") in calls

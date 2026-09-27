@@ -60,15 +60,19 @@ _MAX_FQN_CANDIDATES = 100
 
 # Statically typed languages: a member call there belongs to the receiver's
 # type, so a bare-name match on a receiver edge is not evidence of a caller.
+# Go is absent: its ``pkg.Func()`` qualifier is recorded as a receiver.
 _TYPED_RECEIVER_LANGUAGES = frozenset({
-    "java", "kotlin", "csharp", "cpp", "go", "rust", "scala", "swift",
+    "java", "kotlin", "csharp", "cpp", "rust", "scala", "swift",
     "typescript", "tsx", "dart",
 })
 
 
 def _is_member_call(extra: dict[str, Any]) -> bool:
+    """A call on an object, not on ``this``/``self`` or an imported namespace."""
     receiver = extra.get("receiver")
     lexical = receiver in ("self", "cls", "this")
+    if extra.get("receiver_import"):
+        return False
     return bool((receiver and not lexical) or extra.get("receiver_expression"))
 
 
