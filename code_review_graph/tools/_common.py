@@ -322,6 +322,15 @@ _BUILTIN_CALL_NAMES: set[str] = {
     "require", "fetch",
 }
 
+# The names above are JS/TS runtime and library APIs. In other languages a
+# ``get``/``update``/``save`` method is ordinary repository code.
+_BUILTIN_CALL_LANGUAGES = frozenset({"javascript", "typescript", "tsx", "vue", "svelte"})
+
+
+def is_builtin_call_name(name: str, defining_languages: set[str]) -> bool:
+    """True when *name* is a JS builtin and no non-JS node defines it."""
+    return name in _BUILTIN_CALL_NAMES and not (defining_languages - _BUILTIN_CALL_LANGUAGES)
+
 
 def _validate_repo_root(path: "Path | str") -> Path:
     """Validate that a path is a plausible project root.

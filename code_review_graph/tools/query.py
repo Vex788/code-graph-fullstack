@@ -25,6 +25,7 @@ from ._common import (
     _get_store,
     _resolve_graph_file_paths,
     _resolve_root,
+    is_builtin_call_name,
 )
 from .context import missing_graph_response
 from .navigation import _short
@@ -485,6 +486,13 @@ def query_graph(
             pattern == "callers_of"
             and target in _BUILTIN_CALL_NAMES
             and "::" not in target
+            and is_builtin_call_name(target, {
+                row[0] for row in store._conn.execute(
+                    "SELECT DISTINCT lower(language) FROM nodes "
+                    "WHERE name = ? AND kind IN ('Function', 'Test')",
+                    (target,),
+                )
+            })
         ):
             return {
                 "status": "ok", "pattern": pattern, "target": target,
