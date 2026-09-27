@@ -200,6 +200,22 @@ def enclosing_class_chain(
     return [f"{file_path}::{name}" for name in chain]
 
 
+def calls_in_files(conn: sqlite3.Connection, files: set[str]) -> list[sqlite3.Row]:
+    """CALLS edges recorded in *files*, read through the file index.
+
+    A receiver resolves through its caller's enclosing classes, which never
+    leave the caller's file, so only files declaring a mapped field matter.
+    """
+    rows: list[sqlite3.Row] = []
+    for file_path in sorted(files):
+        rows.extend(conn.execute(
+            "SELECT id, source_qualified, target_qualified, extra, file_path, line "
+            "FROM edges WHERE file_path = ? AND kind = 'CALLS'",
+            (file_path,),
+        ).fetchall())
+    return rows
+
+
 def called_method_name(target: str) -> str:
     """``f::C.save(User)`` / ``C.save`` / ``save`` -> ``save``."""
     return target.rsplit("::", 1)[-1].split("(", 1)[0].rsplit(".", 1)[-1]
@@ -275,10 +291,9 @@ def _resolve_injected_receivers(store: GraphStore) -> dict:
     # -----------------------------------------------------------------------
     # Resolve CALLS edges
     # -----------------------------------------------------------------------
-    calls_rows = conn.execute(
-        "SELECT id, source_qualified, target_qualified, extra, file_path, line "
-        "FROM edges WHERE kind = 'CALLS'"
-    ).fetchall()
+    calls_rows = calls_in_files(
+        conn, {class_qual.partition("::")[0] for class_qual, _ in field_map} & java_files,
+    )
 
     resolved = 0
 

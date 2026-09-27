@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from .spring_resolver import (
     _bare_type_name,
     called_method_name,
+    calls_in_files,
     enclosing_class_chain,
     java_class_owners,
     java_method_index,
@@ -127,10 +128,9 @@ def _resolve_temporal_calls(store: GraphStore) -> dict:
     # -----------------------------------------------------------------------
     # Resolve CALLS edges
     # -----------------------------------------------------------------------
-    calls_rows = conn.execute(
-        "SELECT id, source_qualified, target_qualified, extra, file_path "
-        "FROM edges WHERE kind = 'CALLS'"
-    ).fetchall()
+    calls_rows = calls_in_files(
+        conn, {class_qual.partition("::")[0] for class_qual, _ in field_map} & java_files,
+    )
 
     resolved = 0
 
