@@ -6,6 +6,14 @@ import math
 import os
 from pathlib import Path
 
+from .kinds import (
+    DIRECTION_INCOMING,
+    DIRECTION_NONE,
+    DIRECTION_OUTGOING,
+    impact_edge_directions,
+    impact_edge_weights,
+)
+
 
 def _bounded_float_env(
     name: str,
@@ -54,23 +62,8 @@ BFS_ENGINE = os.environ.get("CRG_BFS_ENGINE", "sql")
 # Each hop multiplies the best score so strongly coupled nodes rank first.
 # These review-risk weights intentionally differ from community-clustering
 # affinity weights.
-IMPACT_EDGE_WEIGHTS: dict[str, float] = {
-    "CALLS": 1.0,
-    "INHERITS": 0.9,
-    "OVERRIDES": 0.9,
-    "IMPLEMENTS": 0.9,
-    "TESTED_BY": 0.7,
-    "REFERENCES": 0.6,
-    "DEPENDS_ON": 0.6,
-    "IMPORTS_FROM": 0.5,
-    # Presentation layer. RENDERS names one class deliberately, like an explicit
-    # reference; REQUESTS matches a URL against a route contract and is commonly
-    # many-to-one; INCLUDES is file-granular, like an import.
-    "RENDERS": 0.6,
-    "REQUESTS": 0.5,
-    "INCLUDES": 0.5,
-    "CONTAINS": 0.3,
-}
+# Per-kind values live in kinds.py (the kind registry).
+IMPACT_EDGE_WEIGHTS: dict[str, float] = impact_edge_weights()
 IMPACT_DEFAULT_EDGE_WEIGHT = 0.5
 
 # Stored dependency edges point from the dependent to its dependency, so impact
@@ -78,24 +71,10 @@ IMPACT_DEFAULT_EDGE_WEIGHT = 0.5
 # intentionally stored in the opposite orientation (production -> test).
 # CONTAINS is not traversed: changing a file already seeds every node in it, and
 # following containment can bridge into unrelated structure through stale edges.
-IMPACT_DIRECTION_INCOMING = "incoming"
-IMPACT_DIRECTION_OUTGOING = "outgoing"
-IMPACT_DIRECTION_NONE = "none"
-IMPACT_EDGE_DIRECTIONS: dict[str, str] = {
-    "CALLS": IMPACT_DIRECTION_INCOMING,
-    "INHERITS": IMPACT_DIRECTION_INCOMING,
-    "OVERRIDES": IMPACT_DIRECTION_INCOMING,
-    "IMPLEMENTS": IMPACT_DIRECTION_INCOMING,
-    "TESTED_BY": IMPACT_DIRECTION_OUTGOING,
-    "REFERENCES": IMPACT_DIRECTION_INCOMING,
-    "DEPENDS_ON": IMPACT_DIRECTION_INCOMING,
-    "IMPORTS_FROM": IMPACT_DIRECTION_INCOMING,
-    # The page depends on what it renders, requests and includes.
-    "RENDERS": IMPACT_DIRECTION_INCOMING,
-    "REQUESTS": IMPACT_DIRECTION_INCOMING,
-    "INCLUDES": IMPACT_DIRECTION_INCOMING,
-    "CONTAINS": IMPACT_DIRECTION_NONE,
-}
+IMPACT_DIRECTION_INCOMING = DIRECTION_INCOMING
+IMPACT_DIRECTION_OUTGOING = DIRECTION_OUTGOING
+IMPACT_DIRECTION_NONE = DIRECTION_NONE
+IMPACT_EDGE_DIRECTIONS: dict[str, str] = impact_edge_directions()
 # Unknown relationships conservatively follow the dominant graph convention:
 # source depends on target. This includes possible dependents without claiming
 # that a changed node's own unclassified dependency is impacted.

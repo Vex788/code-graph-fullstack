@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from .graph import GraphEdge, GraphNode, GraphStore, _sanitize_name
+from .kinds import community_edge_weights
 
 # Fixed seed for igraph's RNG so Leiden community detection is reproducible
 # across runs. Without this, two builds of the same graph produce different
@@ -42,15 +43,8 @@ except ImportError:
 # Edge weight mapping
 # ---------------------------------------------------------------------------
 
-EDGE_WEIGHTS: dict[str, float] = {
-    "CALLS": 1.0,
-    "IMPORTS_FROM": 0.5,
-    "INHERITS": 0.8,
-    "IMPLEMENTS": 0.7,
-    "CONTAINS": 0.3,
-    "TESTED_BY": 0.4,
-    "DEPENDS_ON": 0.6,
-}
+# Per-kind values live in kinds.py (the kind registry).
+EDGE_WEIGHTS: dict[str, float] = community_edge_weights()
 
 # Common words to filter when generating community names
 _COMMON_WORDS = frozenset({
