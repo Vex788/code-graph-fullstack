@@ -2,6 +2,78 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.6] - 2026-09-28
+
+Covers fs.5 and fs.6. **Run `code-review-graph build` once after upgrading.**
+
+### Breaking
+- Schema v10 and index generation 2: an existing graph reads `rebuild_required`
+  and `update` exits 4 until one full `build`.
+- `min_writer_version` keeps older pinned builds from writing into a v10 database.
+
+### Contract
+- `code-review-graph contract --json` (committed as `docs/spec/contract.json`,
+  contract 1.0.0-rc1): tools with parameters and `read_only`, `tool_presets`,
+  CLI commands, statuses, exit codes, node and edge kinds, and JSON Schemas for
+  `status --json`, the `_graph` receipt, the error shape and the harness fragment.
+- Every tool response carries `_graph` with readiness status, reasons,
+  embeddings sub-state and `source_identity`; errors use
+  `{status: "error", error_code, message}`.
+- `serve --tools agent` exposes a 14-tool preset for coding agents; `all` keeps all 35.
+- Cross-stack query patterns: `pages_for`, `requests_to`, `included_by`,
+  `views_of`, `forwards_to`, `maps_to`, `binds_to`, `styles_of`, with offset paging.
+
+### Stability
+- Pure readiness machine: `missing_graph > building > rebuild_required >
+  partial_index > stale_graph > stale_worktree > ok`; `ok` only when the write
+  epoch is closed, nothing failed, and HEAD and source match the build.
+- Single-writer lock (`graph.db.lock`) with token re-entrancy; `--if-locked
+  skip|wait|fail`; exit codes 0/1/2/3/4/75. MCP builds run as jobs, never inline.
+- Readiness is stamped last under a write epoch; each resolver runs in its own
+  transaction and records failures (`partial_index`, exit 3) instead of aborting.
+- Edited indexed files no longer read as `stale_worktree`; git failures surface
+  instead of reading as zero changes; files over `CRG_MAX_FILE_BYTES` are skipped
+  and reported.
+
+### Speed (generated 1,999-file Stripes fixture, 4-core Linux container)
+- Full build 7.52 s -> 3.53 s; no-op update 0.144 s -> 0.038 s; one-file update
+  1.20 s -> 0.45 s; JSP resolver 0.53 s -> 0.04 s (`docs/perf/`).
+- Diff-store in batched transactions; flows and communities derived from the
+  journaled delta; grammars probed once; FTS maintained by triggers.
+- Known: on this repository's own tree a one-file update is 0.71 s -> 1.01 s
+  (community recompute); tracked for the next release.
+
+### Java correctness
+- Records, annotation types and interface `extends` parse; overloads and
+  anonymous classes get their own ids; static imports resolve to the owner class;
+  member calls stay on their receiver type; the import walk stops at the repo root.
+- Stripes `@SpringBean` injection and handlers resolve through file-keyed lookups.
+
+### Fullstack
+- Kind registry (`kinds.py`) generates `docs/spec/EDGES.md` and the VS Code kinds.
+- JSP resolver re-reads only changed pages; web-file changes are risk-scored
+  through their cross-stack links. FORWARDS_TO, HANDLES_EVENT, BINDS, USES_STYLE,
+  MAPS_TO and jQuery REQUESTS are registered but not produced yet.
+
+### Search and embeddings
+- Tracked `.code-review-graph.toml`; profiles `fast`, `balanced`, `accurate`,
+  `legacy`, off by default (`embeddings enable|disable|status`, `CRG_EMBEDDINGS`).
+- Normalized float16 vectors; changed nodes re-embedded in the background after
+  the readiness stamp. FTS terms are OR-ed and search reports its mode.
+
+### Harness kit
+- `code-review-graph harness apply|fragment|bump-pin`: hook, four skills, agent
+  blocks and `crg_rules.json` for claude, zcode and bug-hunter, with a hash lock,
+  drift check, adopt, backups and revert. Config is merged by `laya harness-apply`.
+- Fragment permissions cover the plain and the bug-hunter plugin MCP prefixes;
+  bug-hunter carries the routing block in `agents/reviewer.md` and the
+  `pr-review-orchestrator` skill.
+
+### Docs and release
+- New fork README; `docs/spec/` (TOOLS, CLI generated; READINESS, CONFIG,
+  HARNESS) with a drift test. Releases are GitHub releases built on tag; no PyPI
+  upload (local version segments are rejected there).
+
 ## [2.3.8+fs.4] - 2026-09-19
 
 **A `vendor` package is only a dependency dump in PHP.** `**/vendor/**` was an
