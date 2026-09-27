@@ -13,7 +13,6 @@ import pytest
 from code_review_graph.contract import SCHEMAS, WRITE_TOOLS
 from code_review_graph.harness import cli as harness_cli
 from code_review_graph.harness.fragment import fragment, validate_fragment
-from code_review_graph.harness.targets import KIT_DIR
 
 
 @pytest.fixture(scope="module")
@@ -122,30 +121,41 @@ def test_bump_pin_rewrites_literals(tmp_path: Path, capsys):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX fake binary")
 @pytest.mark.parametrize(
-    ("tool", "command", "rc", "expected_rc", "called"),
+    ("tool", "command", "rc", "called"),
     [
-        ("Edit", "", 0, 0, True),
-        ("Bash", "ls -la", 0, 0, False),
-        ("Bash", "git log --grep=checkout", 0, 0, False),
-        ("Bash", "git -C repo checkout main", 0, 0, True),
-        ("Bash", "git pull --rebase", 75, 0, True),
-        ("Write", "", 1, 1, True),
+        ("Edit", "", 0, True),
+        ("Bash", "ls -la", 0, False),
+        ("Bash", "git log --grep=checkout", 0, False),
+        ("Bash", "git -C repo checkout main", 0, True),
+        ("Bash", "git pull --rebase", 75, True),
+        ("Write", "", 1, True),
     ],
 )
-def test_kit_update_hook(tmp_path: Path, tool, command, rc, expected_rc, called):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+def test_kit_update_hook(tmp_path: Path, tool, command, rc, called):
+    from code_review_graph.harness.apply import render_kit
+    from code_review_graph.harness.targets import get_target
+
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    hook = tmp_path / "crg-update.py"
+    hook.write_text(render_kit(get_target("claude"))["hooks/crg-update.py"], encoding="utf-8")
     log = tmp_path / "calls.log"
-    fake = bin_dir / "code-review-graph"
-    fake.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexit {rc}\n')
-    fake.chmod(0o755)
-    event = {"tool_name": tool, "tool_input": {"command": command}, "cwd": str(tmp_path)}
-    result = subprocess.run(
-        [sys.executable, str(KIT_DIR / "hooks" / "crg-update.py")],
-        input=json.dumps(event), capture_output=True, text=True, timeout=30,
-        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    fake = tmp_path / "code-review-graph"
+    fake.write_text(
+        f'#!/bin/sh\necho "$*" >> "{log}"\n'
+        'if [ "$1" = status ]; then echo \'{"files": 1, "readiness": {"status": "ok"}}\'; '
+        f"exit 0; fi\nexit {rc}\n"
     )
-    assert result.returncode == expected_rc, result.stderr
-    assert log.exists() is called
-    if called:
-        assert "update --skip-flows --if-locked=skip" in log.read_text()
+    fake.chmod(0o755)
+    event = {"tool_name": tool, "cwd": str(repo),
+             "tool_input": {"command": command, "file_path": str(repo / "a.py")}}
+    env = {**os.environ, "CRG_BIN": str(fake), "CRG_UPDATE_INLINE": "1",
+           "CRG_UPDATE_DEBOUNCE": "0", "CRG_UPDATE_STATE_DIR": str(tmp_path / "state"),
+           "CRG_UPDATE_LOG_DIR": str(tmp_path / "logs")}
+    result = subprocess.run(
+        [sys.executable, str(hook)],
+        input=json.dumps(event), capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert result.returncode == 0, result.stderr  # PostToolUse observers never block
+    calls = log.read_text() if log.exists() else ""
+    assert ("update --skip-flows --if-locked=skip" in calls) is called
