@@ -152,3 +152,72 @@ def test_state_is_dropped_when_the_config_changes(built_repo, monkeypatch):
         assert any(p.endswith(".jsp") for p in reads)
     finally:
         store.close()
+
+
+@pytest.fixture
+def clean_probes():
+    from code_review_graph import parser
+
+    parser._clear_parser_probe_cache()
+    yield parser
+    parser._clear_parser_probe_cache()
+
+
+def test_grammars_are_probed_once_in_the_parent(clean_probes, monkeypatch):
+    parser = clean_probes
+    probed: list[str] = []
+    monkeypatch.setattr(
+        parser, "_run_parser_load_probe", lambda g, t: probed.append(g) or g != "nosuch",
+    )
+    assert parser.probe_grammars(["java", "python", "nosuch", "java"]) == {
+        "java": True, "python": True, "nosuch": False,
+    }
+    assert parser.probe_grammars(["java", "python"]) == {"java": True, "python": True}
+    assert sorted(probed) == ["java", "nosuch", "python"]
+
+
+def test_seeded_workers_do_not_probe_and_warn_on_first_use(clean_probes, monkeypatch, caplog):
+    parser = clean_probes
+    monkeypatch.setattr(
+        parser, "_run_parser_load_probe",
+        lambda g, t: pytest.fail(f"worker probed {g} again"),
+    )
+    parser.seed_parser_probes({"java": True, "jsp": False})
+    assert "Skipping" not in caplog.text
+    assert parser._parser_load_probe_succeeds("java") is True
+    assert parser._parser_load_probe_succeeds("jsp") is False
+    assert parser._parser_load_probe_succeeds("jsp") is False
+    assert caplog.text.count("Skipping unavailable tree-sitter parser for jsp") == 1
+
+
+def test_process_pool_workers_start_with_the_parent_probes(monkeypatch):
+    from code_review_graph import incremental, parser
+
+    monkeypatch.setenv("CRG_PARSE_EXECUTOR", "process")
+    with incremental._make_executor(1, {"java": True}) as executor:
+        assert executor._initializer is parser.seed_parser_probes
+        assert executor._initargs == ({"java": True},)
+
+
+def test_parse_pool_probes_the_files_grammars(tmp_path, monkeypatch):
+    from code_review_graph import incremental
+    from code_review_graph.parser import CodeParser
+
+    for index in range(10):
+        (tmp_path / f"m{index}.py").write_text(f"def f{index}():\n    pass\n", encoding="utf-8")
+    (tmp_path / "A.java").write_text("class A {}\n", encoding="utf-8")
+    seen: list[list[str]] = []
+    real = incremental.probe_grammars
+    monkeypatch.setattr(
+        incremental, "probe_grammars",
+        lambda grammars: seen.append(list(grammars)) or real(grammars),
+    )
+    monkeypatch.setenv("CRG_PARSE_EXECUTOR", "thread")
+    store = GraphStore(tmp_path / "graph.db")
+    try:
+        files = sorted(p.name for p in tmp_path.iterdir() if p.suffix in (".py", ".java"))
+        outcome = incremental._parse_and_store(tmp_path, store, CodeParser(tmp_path), files)
+    finally:
+        store.close()
+    assert outcome.parsed == 11
+    assert seen == [["java", "python"]]

@@ -28,7 +28,7 @@ from .constants import env_float, env_int
 from .graph import STORE_BATCH_FILES, GraphStore
 from .locking import writer_lock
 from .migrations import INDEX_GENERATION, get_index_generation
-from .parser import CodeParser, normalize_file_path
+from .parser import CodeParser, normalize_file_path, probe_grammars, seed_parser_probes
 from .resolvers import RESOLVERS, run_resolver
 
 _MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
@@ -73,11 +73,17 @@ def _select_executor_kind() -> str:
     return "process"
 
 
-def _make_executor(max_workers: int):
-    """Construct the parallel-parse executor selected by [_select_executor_kind]."""
+def _make_executor(max_workers: int, probes: Optional[dict[str, bool]] = None):
+    """Construct the parallel-parse executor selected by [_select_executor_kind].
+
+    Process workers start with the parent's grammar *probes* instead of each
+    spawning its own probe per grammar.
+    """
     if _select_executor_kind() == "thread":
         return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers, initializer=seed_parser_probes, initargs=(probes or {},),
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1755,7 +1761,8 @@ def _parse_and_store(
             for i in range(0, file_count, _PARSE_CHUNK_FILES)
         ]
         done = 0
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
+        probes = probe_grammars(sorted(parser.grammars_for(repo_root / rel for rel in rel_paths)))
+        with _make_executor(_MAX_PARSE_WORKERS, probes) as executor:
             futures = [executor.submit(_parse_chunk, chunk) for chunk in chunks]
             try:
                 for future in concurrent.futures.as_completed(futures):

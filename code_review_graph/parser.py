@@ -7,6 +7,7 @@ Extracts structural nodes (classes, functions, imports, types) and edges
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import html
 import importlib
@@ -452,6 +453,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PARSER_LOAD_TIMEOUT_SECONDS = 5.0
 _PARSER_PROBE_RESULTS: dict[str, bool] = {}
+# Failed probes run ahead of use (see probe_grammars) and not yet logged.
+_PARSER_PROBE_UNREPORTED: set[str] = set()
 _PARSER_PROBE_FAILURE_DETAILS: dict[str, str] = {}
 _PARSER_PROBE_LOCK = threading.Lock()
 
@@ -538,6 +541,9 @@ def _parser_load_probe_succeeds(
     with _PARSER_PROBE_LOCK:
         cached = _PARSER_PROBE_RESULTS.get(grammar)
         if cached is not None:
+            if grammar in _PARSER_PROBE_UNREPORTED:
+                _PARSER_PROBE_UNREPORTED.discard(grammar)
+                logger.warning("Skipping unavailable tree-sitter parser for %s", grammar)
             return cached
         timeout = (
             _parser_load_timeout_seconds()
@@ -562,6 +568,40 @@ def _parser_load_probe_succeeds(
         return result
 
 
+def probe_grammars(grammars) -> dict[str, bool]:
+    """Probe the uncached *grammars* concurrently; return their cached results.
+
+    A process pool's workers start with an empty cache, so the parent probes
+    once and hands the results to each worker (:func:`seed_parser_probes`).
+    """
+    wanted = list(dict.fromkeys(grammars))
+    with _PARSER_PROBE_LOCK:
+        pending = [grammar for grammar in wanted if grammar not in _PARSER_PROBE_RESULTS]
+    if pending:
+        timeout = _parser_load_timeout_seconds()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
+            outcomes = list(pool.map(lambda g: _run_parser_load_probe(g, timeout), pending))
+        with _PARSER_PROBE_LOCK:
+            for grammar, ok in zip(pending, outcomes):
+                if grammar not in _PARSER_PROBE_RESULTS:
+                    _PARSER_PROBE_RESULTS[grammar] = ok
+                    if not ok:
+                        # Some languages never load their grammar: warn on use.
+                        _PARSER_PROBE_UNREPORTED.add(grammar)
+    with _PARSER_PROBE_LOCK:
+        return {g: _PARSER_PROBE_RESULTS[g] for g in wanted if g in _PARSER_PROBE_RESULTS}
+
+
+def seed_parser_probes(results: dict[str, bool]) -> None:
+    """Pool-worker initializer: adopt the parent's grammar probe results."""
+    with _PARSER_PROBE_LOCK:
+        for grammar, ok in results.items():
+            if grammar not in _PARSER_PROBE_RESULTS:
+                _PARSER_PROBE_RESULTS[grammar] = ok
+                if not ok:
+                    _PARSER_PROBE_UNREPORTED.add(grammar)
+
+
 def _mark_parser_unavailable(grammar: str) -> None:
     """Prevent repeated parent-process loads after an expected failure."""
     with _PARSER_PROBE_LOCK:
@@ -573,6 +613,7 @@ def _clear_parser_probe_cache() -> None:
     with _PARSER_PROBE_LOCK:
         _PARSER_PROBE_RESULTS.clear()
         _PARSER_PROBE_FAILURE_DETAILS.clear()
+        _PARSER_PROBE_UNREPORTED.clear()
 
 
 def _load_tree_sitter_parser(grammar: str):
@@ -2566,6 +2607,17 @@ class CodeParser:
                 self._function_types[custom.name] = list(custom.function_node_types)
                 self._import_types[custom.name] = list(custom.import_node_types)
                 self._call_types[custom.name] = list(custom.call_node_types)
+
+    def grammars_for(self, paths) -> set[str]:
+        """The tree-sitter grammars that parsing *paths* loads first."""
+        grammars: set[str] = set()
+        for path in paths:
+            language = self.detect_language(Path(path))
+            if language is None:
+                continue
+            custom = self._custom_languages.get(language)
+            grammars.add(custom.grammar if custom is not None else language)
+        return grammars
 
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
