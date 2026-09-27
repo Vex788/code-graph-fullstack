@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -36,6 +37,7 @@ from .constants import (
 )
 from .locking import LockBusyError, writer_lock
 from .migrations import (
+    FTS_TRIGGERS,
     LATEST_VERSION,
     MIGRATION_LOCK_WAIT_SECONDS,
     SchemaMigrationPending,
@@ -188,6 +190,102 @@ class GraphStats:
 # GraphStore
 # ---------------------------------------------------------------------------
 
+_UPSERT_NODE_SQL = """INSERT INTO nodes
+   (kind, name, qualified_name, file_path, line_start, line_end,
+    language, parent_name, params, return_type, modifiers, is_test,
+    file_hash, extra, updated_at, name_tokens)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(qualified_name) DO UPDATE SET
+     kind=excluded.kind, name=excluded.name,
+     name_tokens=excluded.name_tokens,
+     file_path=excluded.file_path, line_start=excluded.line_start,
+     line_end=excluded.line_end, language=excluded.language,
+     parent_name=excluded.parent_name, params=excluded.params,
+     return_type=excluded.return_type, modifiers=excluded.modifiers,
+     is_test=excluded.is_test, file_hash=excluded.file_hash,
+     extra=excluded.extra, updated_at=excluded.updated_at
+"""
+
+# Writer connection tuning. WAL with synchronous=NORMAL only syncs at
+# checkpoints, so per-transaction commits stay cheap.
+_CONNECTION_PRAGMAS = (
+    "PRAGMA busy_timeout=30000",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA cache_size=-65536",
+    "PRAGMA mmap_size=268435456",
+    "PRAGMA temp_store=MEMORY",
+    "PRAGMA journal_size_limit=67108864",
+)
+
+# Bounded retries when BEGIN IMMEDIATE still reports "database is locked"
+# after busy_timeout (a writer that bypasses the writer lock).
+_LOCKED_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+
+# Files stored per write transaction by :meth:`GraphStore.store_file_batch` callers.
+STORE_BATCH_FILES = 200
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """True for SQLite's busy/locked errors, which are never parse errors."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
+class _GraphConnection(sqlite3.Connection):
+    """Connection whose commit/rollback defer to an enclosing held transaction.
+
+    Inside :meth:`GraphStore.transaction` a callee's ``commit()`` is a no-op
+    and its ``rollback()`` marks the transaction rollback-only, so resolver
+    and store code that commits on its own still lands atomically.
+    """
+
+    txn_depth = 0
+    rollback_only = False
+
+    def commit(self) -> None:
+        if self.txn_depth:
+            return
+        super().commit()
+
+    def rollback(self) -> None:
+        if self.txn_depth:
+            self.rollback_only = True
+            return
+        super().rollback()
+
+    def real_commit(self) -> None:
+        super().commit()
+
+    def real_rollback(self) -> None:
+        super().rollback()
+
+
+def fts_triggers_installed(store: "GraphStore") -> bool:
+    """True when every trigger that keeps ``nodes_fts`` in sync exists."""
+    placeholders = ", ".join("?" * len(FTS_TRIGGERS))
+    count = store._conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' "
+        f"AND name IN ({placeholders})",  # nosec B608
+        FTS_TRIGGERS,
+    ).fetchone()[0]
+    return bool(count == len(FTS_TRIGGERS))
+
+
+def node_signature(kind: str, name: str, params: Optional[str], return_type: Optional[str]) -> str:
+    """Display signature stored in ``nodes.signature`` (also indexed by FTS)."""
+    if kind in ("Function", "Test"):
+        sig = f"def {name}({params or ''})"
+        if return_type:
+            sig += f" -> {return_type}"
+    elif kind == "Class":
+        sig = f"class {name}"
+    else:
+        sig = name
+    return sig[:512]
+
+
 
 class GraphStore:
     """SQLite-backed code knowledge graph."""
@@ -195,13 +293,15 @@ class GraphStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn: _GraphConnection = sqlite3.connect(
             str(self.db_path), timeout=30, check_same_thread=False,
             isolation_level=None,  # Disable implicit transactions (#135)
+            factory=_GraphConnection,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        for pragma in _CONNECTION_PRAGMAS:
+            self._conn.execute(pragma)
         try:
             self._ensure_schema()
         except BaseException:
@@ -272,21 +372,7 @@ class GraphStore:
         extra = json.dumps(node.extra) if node.extra else "{}"
 
         self._conn.execute(
-            """INSERT INTO nodes
-               (kind, name, qualified_name, file_path, line_start, line_end,
-                language, parent_name, params, return_type, modifiers, is_test,
-                file_hash, extra, updated_at, name_tokens)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(qualified_name) DO UPDATE SET
-                 kind=excluded.kind, name=excluded.name,
-                 name_tokens=excluded.name_tokens,
-                 file_path=excluded.file_path, line_start=excluded.line_start,
-                 line_end=excluded.line_end, language=excluded.language,
-                 parent_name=excluded.parent_name, params=excluded.params,
-                 return_type=excluded.return_type, modifiers=excluded.modifiers,
-                 is_test=excluded.is_test, file_hash=excluded.file_hash,
-                 extra=excluded.extra, updated_at=excluded.updated_at
-            """,
+            _UPSERT_NODE_SQL,
             (
                 node.kind, node.name, qualified, node.file_path,
                 node.line_start, node.line_end, node.language,
@@ -388,52 +474,186 @@ class GraphStore:
     def _begin_immediate(self) -> None:
         """Start an IMMEDIATE transaction, rolling back any prior uncommitted
         transaction first (regression guard for #135 / #489).
+
+        Inside a held :meth:`transaction` this joins it instead.
         """
+        if self._conn.txn_depth:
+            return
         if self._conn.in_transaction:
             logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
-            self._conn.rollback()
-        self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.real_rollback()
+        for delay in (*_LOCKED_RETRY_DELAYS, None):
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                if delay is None or not is_locked_error(exc):
+                    raise
+                logger.warning("Graph database locked; retrying BEGIN in %.1fs", delay)
+                time.sleep(delay)
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Run the block in one write transaction; nested calls join it.
+
+        ``commit()``/``rollback()`` issued by code inside the block are
+        deferred to the outermost block, which commits on success and rolls
+        back on an exception or when an inner rollback was requested.
+        """
+        conn = self._conn
+        if conn.txn_depth:
+            conn.txn_depth += 1
+            try:
+                yield
+            finally:
+                conn.txn_depth -= 1
+            return
+        self._begin_immediate()
+        conn.txn_depth = 1
+        conn.rollback_only = False
+        try:
+            yield
+        except BaseException:
+            conn.txn_depth = 0
+            conn.rollback_only = False
+            if conn.in_transaction:
+                conn.real_rollback()
+            self._invalidate_cache()
+            raise
+        conn.txn_depth = 0
+        if conn.rollback_only:
+            conn.rollback_only = False
+            conn.real_rollback()
+            self._invalidate_cache()
+            raise sqlite3.OperationalError("write transaction rolled back by an inner rollback()")
+        conn.real_commit()
+        self._invalidate_cache()
+
+    @contextmanager
+    def bulk_load(self) -> Iterator[None]:
+        """One write transaction with FTS triggers off; FTS is rebuilt at the end.
+
+        For loading an empty graph. The trigger drop is part of the same
+        transaction, so a crash leaves the previous (consistent) state.
+        """
+        from .search import disable_fts_triggers, rebuild_fts
+
+        with self.transaction():
+            disable_fts_triggers(self._conn)
+            yield
+            rebuild_fts(self._conn)
+
+    def checkpoint(self) -> None:
+        """Fold the WAL back into the database and truncate it."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.warning("WAL checkpoint failed: %s", exc)
 
     def store_file_nodes_edges(
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
         """Atomically replace all data for a file."""
-        self._begin_immediate()
-        try:
-            self.remove_file_data(file_path)
-            for node in nodes:
-                self.upsert_node(node, file_hash=fhash)
-            for edge in edges:
-                self.upsert_edge(edge)
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._invalidate_cache()
+        self.store_file_batch([(file_path, nodes, edges, fhash)])
 
     def store_file_batch(
         self, batch: list[tuple[str, list[NodeInfo], list[EdgeInfo], str]]
     ) -> None:
-        """Atomically replace data for a batch of files in one transaction."""
-        self._begin_immediate()
-        try:
+        """Atomically replace data for a batch of files in one transaction.
+
+        Nodes are diffed by ``qualified_name``: surviving rows are updated in
+        place, so their ``id`` and ``community_id`` stay stable.
+        """
+        with self.transaction():
             for file_path, nodes, edges, fhash in batch:
-                self.remove_file_data(file_path)
-                for node in nodes:
-                    self.upsert_node(node, file_hash=fhash)
-                for edge in edges:
-                    self.upsert_edge(edge)
-            self._conn.commit()
-        except BaseException:
-            self._conn.rollback()
-            raise
-        self._invalidate_cache()
+                self._store_file_rows(file_path, nodes, edges, fhash)
+
+    def _store_file_rows(
+        self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str,
+    ) -> None:
+        conn = self._conn
+        file_path = normalize_file_path(file_path)
+        now = time.time()
+        existing = {
+            row[0]: row[1] for row in conn.execute(
+                "SELECT qualified_name, id FROM nodes WHERE file_path = ?", (file_path,),
+            )
+        }
+        # Last occurrence wins, as repeated upserts of one name did.
+        rows: dict[str, tuple] = {}
+        for node in nodes:
+            qualified = self._make_qualified(node)
+            rows[qualified] = (
+                node.kind, node.name, node.file_path, node.line_start, node.line_end,
+                node.language, node.parent_name, node.params, node.return_type,
+                node.modifiers, int(node.is_test), fhash,
+                json.dumps(node.extra) if node.extra else "{}", now,
+                split_name_tokens(node.name),
+            )
+        removed = [(node_id,) for qn, node_id in existing.items() if qn not in rows]
+        if removed:
+            conn.executemany("DELETE FROM nodes WHERE id = ?", removed)
+        updates = []
+        inserts = []
+        for qualified, values in rows.items():
+            node_id = existing.get(qualified)
+            if node_id is None:
+                inserts.append((values[0], values[1], qualified, *values[2:]))
+            else:
+                # kind, name, params, return_type decide whether the signature survives.
+                updates.append(
+                    (values[0], values[1], values[7], values[8], *values, node_id)
+                )
+        if updates:
+            conn.executemany(
+                """UPDATE nodes SET
+                     signature = CASE WHEN kind IS ? AND name IS ? AND params IS ?
+                                      AND return_type IS ? THEN signature END,
+                     kind = ?, name = ?, file_path = ?, line_start = ?, line_end = ?,
+                     language = ?, parent_name = ?, params = ?, return_type = ?,
+                     modifiers = ?, is_test = ?, file_hash = ?, extra = ?,
+                     updated_at = ?, name_tokens = ?
+                   WHERE id = ?""",
+                updates,
+            )
+        if inserts:
+            conn.executemany(_UPSERT_NODE_SQL, inserts)
+
+        conn.execute("DELETE FROM edges WHERE file_path = ?", (file_path,))
+        # One row per (kind, source, target, file, line); the last one's extra wins.
+        edge_rows: dict[tuple, tuple] = {}
+        for edge in edges:
+            extra_dict = edge.extra if edge.extra else {}
+            edge_rows[(edge.kind, edge.source, edge.target, edge.file_path, edge.line)] = (
+                json.dumps(extra_dict),
+                float(extra_dict.get("confidence", 1.0)),
+                str(extra_dict.get("confidence_tier", "EXTRACTED")),
+            )
+        if edge_rows:
+            conn.executemany(
+                """INSERT INTO edges
+                   (kind, source_qualified, target_qualified, file_path, line, extra,
+                    confidence, confidence_tier, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(*key, *value, now) for key, value in edge_rows.items()],
+            )
 
     def set_metadata(self, key: str, value: str) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value)
+        self._write_metadata(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value),
         )
-        self._conn.commit()
+
+    def delete_metadata(self, key: str) -> None:
+        self._write_metadata("DELETE FROM metadata WHERE key = ?", (key,))
+
+    def _write_metadata(self, sql: str, params: tuple) -> None:
+        if self._conn.in_transaction and not self._conn.txn_depth:
+            # A caller's raw transaction: commit it along, as this always did.
+            self._conn.execute(sql, params)
+            self._conn.commit()
+            return
+        with self.transaction():
+            self._conn.execute(sql, params)
 
     def get_metadata(self, key: str) -> Optional[str]:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
@@ -1236,6 +1456,14 @@ class GraphStore:
             "ORDER BY file_path"
         ).fetchall()
         return [r["file_path"] for r in rows]
+
+    def get_file_hash(self, file_path: str) -> Optional[str]:
+        """Content hash recorded for *file_path*, or None when not indexed."""
+        row = self._conn.execute(
+            "SELECT file_hash FROM nodes WHERE file_path = ? AND file_hash != '' LIMIT 1",
+            (normalize_file_path(file_path),),
+        ).fetchone()
+        return row[0] if row else None
 
     def get_file_marker_paths(self) -> list[str]:
         """Return paths that have authoritative File nodes.
