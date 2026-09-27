@@ -1,0 +1,13 @@
+.page-header {
+  display: flex;
+  gap: 1rem;
+}
+
+.page-footer {
+  margin-top: 2rem;
+  color: #666;
+}
+
+.error {
+  color: #b00020;
+}

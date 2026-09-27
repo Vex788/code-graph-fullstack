@@ -1,0 +1,16 @@
+.invoice-form {
+  display: grid;
+  grid-template-columns: 8rem 1fr;
+}
+
+.invoice-form--busy {
+  opacity: 0.5;
+}
+
+.invoice-total {
+  font-weight: bold;
+}
+
+.invoice-table td {
+  padding: 0.25rem 0.5rem;
+}
