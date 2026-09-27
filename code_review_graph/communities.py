@@ -790,6 +790,43 @@ def _dedupe_community_names(
 # ---------------------------------------------------------------------------
 
 
+def _load_graph(store: GraphStore) -> tuple[list[GraphEdge], list[GraphNode]]:
+    """All edges and non-File nodes, without the ``extra`` detection never reads.
+
+    Leiden depends on input order; sorting makes the result a function of
+    the graph alone, so an incremental update matches a full rebuild.
+    """
+    conn = store._conn
+    cursor = conn.cursor()
+    cursor.row_factory = None  # plain tuples sort natively
+    rows = cursor.execute(
+        "SELECT source_qualified, target_qualified, kind, COALESCE(line, 0), "
+        "COALESCE(file_path, ''), id FROM edges"
+    ).fetchall()
+    rows.sort()
+    edges = [
+        GraphEdge(
+            id=row[5], kind=row[2], source_qualified=row[0], target_qualified=row[1],
+            file_path=row[4], line=row[3], extra={},
+        )
+        for row in rows
+    ]
+    nodes = [
+        GraphNode(
+            id=row[0], kind=row[1], name=row[2], qualified_name=row[3], file_path=row[4],
+            line_start=row[5], line_end=row[6], language=row[7] or "", parent_name=row[8],
+            params=row[9], return_type=row[10], is_test=bool(row[11]), file_hash=row[12],
+            extra={},
+        )
+        for row in conn.execute(
+            "SELECT id, kind, name, qualified_name, file_path, line_start, line_end, "
+            "language, parent_name, params, return_type, is_test, file_hash "
+            "FROM nodes WHERE kind != 'File' ORDER BY qualified_name"
+        )
+    ]
+    return edges, nodes
+
+
 def detect_communities(
     store: GraphStore, min_size: int = 2
 ) -> list[dict[str, Any]]:
@@ -807,12 +844,7 @@ def detect_communities(
         dominant_language, description, members, member_qns.
     """
     # Gather all nodes (exclude File nodes to focus on code entities).
-    # Leiden depends on input order; sorting makes the result a function of
-    # the graph alone, so an incremental update matches a full rebuild.
-    all_edges = store.get_all_edges()
-    all_edges.sort(key=lambda e: (e.source_qualified, e.target_qualified, e.kind, e.line))
-    unique_nodes = store.get_all_nodes(exclude_files=True)
-    unique_nodes.sort(key=lambda n: n.qualified_name)
+    all_edges, unique_nodes = _load_graph(store)
 
     # Build adjacency index once for fast cohesion computation
     adj = _build_adjacency(all_edges)
