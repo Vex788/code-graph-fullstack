@@ -256,3 +256,63 @@ def test_embeddings_state(tmp_path):
     conn.commit()
     conn.close()
     assert compute_readiness(_gather(repo, db)).embeddings.value == "ready"
+
+
+def _embed_rows(db: Path, provider: str, meta: dict[str, str]) -> None:
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS embeddings (qualified_name TEXT PRIMARY KEY, "
+        "vector BLOB NOT NULL, text_hash TEXT NOT NULL, provider TEXT)"
+    )
+    qn = conn.execute("SELECT qualified_name FROM nodes WHERE kind='Function'").fetchone()[0]
+    conn.execute("INSERT INTO embeddings VALUES (?, x'00', 'h', ?)", (qn, provider))
+    conn.executemany(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", list(meta.items()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _embeddings_value(repo: Path, db: Path) -> str:
+    from code_review_graph.readiness import compute_readiness
+
+    return compute_readiness(_gather(repo, db)).embeddings.value
+
+
+def test_disabled_embeddings_with_kept_vectors_read_off(tmp_path):
+    repo, db = _repo(tmp_path)
+    _embed_rows(db, "p", {"embeddings_state": "off", "embeddings_provider": "p"})
+    assert _embeddings_value(repo, db) == "off"
+
+
+def test_unavailable_embeddings_state_is_reported(tmp_path):
+    repo, db = _repo(tmp_path)
+    _embed_rows(db, "p", {"embeddings_state": "unavailable"})
+    assert _embeddings_value(repo, db) == "unavailable"
+
+
+def test_only_current_provider_vectors_count(tmp_path):
+    repo, db = _repo(tmp_path)
+    _embed_rows(db, "old", {"embeddings_state": "ready", "embeddings_provider": "new"})
+    assert _embeddings_value(repo, db) == "stale"
+
+
+def test_current_provider_vectors_are_ready(tmp_path):
+    repo, db = _repo(tmp_path)
+    _embed_rows(db, "new", {"embeddings_state": "ready", "embeddings_provider": "new",
+                            "embeddings_stale_count": "0"})
+    assert _embeddings_value(repo, db) == "ready"
+
+
+def test_recorded_stale_count_wins_over_row_count(tmp_path):
+    repo, db = _repo(tmp_path)
+    _embed_rows(db, "new", {"embeddings_state": "stale", "embeddings_provider": "new",
+                            "embeddings_stale_count": "3"})
+    assert _embeddings_value(repo, db) == "stale"
+
+
+def test_recorded_state_without_vectors_is_stale(tmp_path):
+    repo, db = _repo(tmp_path, {"embeddings_state": "ready", "embeddings_provider": "p"})
+    assert _embeddings_value(repo, db) == "stale"

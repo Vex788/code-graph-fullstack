@@ -120,18 +120,59 @@ def _epochs(meta: dict[str, str]) -> tuple[int, Optional[int]]:
     return opened, closed
 
 
-def _embeddings(conn: sqlite3.Connection) -> tuple[bool, int, int]:
-    """(enabled, embedded, embeddable); cheap when embeddings are off."""
+_EMBEDDING_META_KEYS = ("embeddings_state", "embeddings_provider", "embeddings_stale_count")
+
+
+def _embeddings(conn: sqlite3.Connection) -> tuple[bool, bool, int, int]:
+    """(enabled, provider_available, embedded, embeddable); cheap when embeddings are off.
+
+    The ``embeddings_*`` metadata the embedder writes wins over raw row counts:
+    ``off`` stays off even when vectors were kept, and only the recorded
+    provider's vectors count. Graphs without that metadata count every row.
+    """
     try:
-        if conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone() is None:
-            return False, 0, 0
-        embedded = int(conn.execute("SELECT count(*) FROM embeddings").fetchone()[0])
+        marks = ",".join("?" * len(_EMBEDDING_META_KEYS))
+        try:
+            meta = {
+                str(k): str(v) for k, v in conn.execute(
+                    f"SELECT key, value FROM metadata WHERE key IN ({marks})",  # nosec B608
+                    _EMBEDDING_META_KEYS,
+                )
+            }
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            meta = {}
+        state = meta.get("embeddings_state")
+        if state == "off":
+            return False, True, 0, 0
+        if state == "unavailable":
+            return True, False, 0, 0
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embeddings'"
+        ).fetchone() is not None
+        if not has_table or conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone() is None:
+            if state is None:
+                return False, True, 0, 0
+            embedded = 0
+        elif provider := meta.get("embeddings_provider"):
+            embedded = int(conn.execute(
+                "SELECT count(*) FROM embeddings WHERE provider = ?", (provider,),
+            ).fetchone()[0])
+        else:
+            embedded = int(conn.execute("SELECT count(*) FROM embeddings").fetchone()[0])
         embeddable = int(conn.execute(
             "SELECT count(*) FROM nodes WHERE kind != 'File'"
         ).fetchone()[0])
     except sqlite3.OperationalError:
-        return False, 0, 0
-    return True, embedded, embeddable
+        return False, True, 0, 0
+    stale = _int_or_none(meta.get("embeddings_stale_count")) or 0
+    if state == "stale":
+        stale = max(stale, 1)
+    if stale > 0:
+        embedded = min(embedded, max(embeddable - stale, 0))
+        embeddable = max(embeddable, embedded + stale)
+    return True, True, embedded, embeddable
 
 
 def _connect_ro(db_path: Path) -> sqlite3.Connection:
@@ -173,7 +214,7 @@ def gather_report(
     generation: Optional[int] = None
     drift: Optional[dict[str, Any]] = None
     source_matches: Optional[bool] = None
-    embeddings = (False, 0, 0)
+    embeddings = (False, True, 0, 0)
     try:
         conn = _connect_ro(db)
     except sqlite3.Error as exc:
@@ -231,8 +272,9 @@ def gather_report(
         built_at_commit=meta.get("built_at_commit") or meta.get("git_head_sha"),
         source_matches=source_matches,
         embeddings_enabled=embeddings[0],
-        embedded_nodes=embeddings[1],
-        embeddable_nodes=embeddings[2],
+        embeddings_provider_available=embeddings[1],
+        embedded_nodes=embeddings[2],
+        embeddable_nodes=embeddings[3],
     )
     return ReadinessReport(
         facts=facts,
