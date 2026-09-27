@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://{{pack_schema}}.local/review/context-pack.schema.json",
+  "title": "Pull-request context pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "pr", "repo", "git", "changed_files", "changed_line_ranges",
+    "hunks", "diff_symbols", "graph", "domain", "review_scope", "capabilities", "pack_id"
+  ],
+  "properties": {
+    "schema": {"const": "{{pack_schema}}/pr-context-pack/1"},
+    "pr": {"type": "string", "minLength": 1},
+    "repo": {"type": "string", "minLength": 1},
+    "pack_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_sha", "head_sha", "merge_base_sha", "diff_mode", "diff_sha256", "head_committed_at"],
+      "properties": {
+        "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "merge_base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "diff_mode": {"const": "three-dot"},
+        "diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "head_committed_at": {"type": "string", "minLength": 20}
+      }
+    },
+    "changed_files": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "changed_line_ranges": {"type": "object"},
+    "hunks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "path", "old_start", "old_count", "new_start", "new_count",
+          "heading", "artifact", "bytes", "sha256"
+        ],
+        "properties": {
+          "artifact": {"type": "string", "pattern": "^hunks/H-[0-9a-f]{16}\\.patch$"},
+          "bytes": {"type": "integer", "minimum": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "diff_symbols": {"type": "array"},
+    "graph": {"type": "object"},
+    "domain": {"type": "object"},
+    "review_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "diff_bytes", "max_diff_bytes", "max_hunk_bytes",
+        "oversized_hunks", "action"
+      ],
+      "properties": {
+        "status": {"enum": ["ready", "oversized"]},
+        "diff_bytes": {"type": "integer", "minimum": 0},
+        "max_diff_bytes": {"type": "integer", "minimum": 1},
+        "max_hunk_bytes": {"type": "integer", "minimum": 1},
+        "oversized_hunks": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "action": {"enum": ["review", "escalate-or-split"]}
+      }
+    },
+    "capabilities": {"type": "object"}
+  }
+}
