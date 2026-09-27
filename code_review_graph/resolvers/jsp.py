@@ -220,7 +220,9 @@ def _endpoint_map(conn, dead_url_suffixes: tuple[str, ...]) -> dict[str, str]:
         route = _normalize_url(str(extra.get("route", "")), dead_url_suffixes)
         if not route:
             continue
-        routes.setdefault(route, []).append((str(extra.get("http_method", "")), row["qualified_name"]))
+        routes.setdefault(route, []).append(
+            (str(extra.get("http_method", "")), row["qualified_name"])
+        )
     return {
         route: _preferred_endpoint(candidates)
         for route, candidates in routes.items()
@@ -418,7 +420,9 @@ def resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
                     continue
                 target, binding_extra = bound
                 extra = {"route": route, "url": match.group(1), **binding_extra}
-                requests.append(("REQUESTS", source_qn, target, _line_of(text, match.start()), extra))
+                requests.append(
+                    ("REQUESTS", source_qn, target, _line_of(text, match.start()), extra)
+                )
 
     def _collect_references(source_qn: str, text: str) -> None:
         nonlocal unresolved_references
