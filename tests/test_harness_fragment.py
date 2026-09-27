@@ -62,9 +62,18 @@ def test_validate_fragment_flags_bad_shape():
     assert validate_fragment({"owner": "x"})
 
 
+def _seed_claude_md(root: Path) -> None:
+    # A real claude root carries the graph-routing markers; a bare one is degraded (exit 3).
+    (root / "CLAUDE.md").write_text(
+        "<!-- crg-kit:begin graph-routing -->\n<!-- crg-kit:end graph-routing -->\n",
+        encoding="utf-8",
+    )
+
+
 def test_cli_fragment_and_apply(tmp_path: Path, capsys):
     assert harness_cli.main(["fragment", "--target", "claude", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["target"] == "claude"
+    _seed_claude_md(tmp_path)
     root = str(tmp_path)
     assert harness_cli.main(["apply", "--target", "claude", "--root", root, "--check"]) == 1
     assert harness_cli.main(
@@ -84,6 +93,7 @@ def test_register_adds_harness_subcommand():
 
 
 def test_module_entry_point(tmp_path: Path):
+    _seed_claude_md(tmp_path)
     result = subprocess.run(
         [sys.executable, "-m", "code_review_graph.harness", "apply", "--target", "claude",
          "--root", str(tmp_path), "--dry-run"],

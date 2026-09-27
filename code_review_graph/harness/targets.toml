@@ -10,7 +10,9 @@ hooks_dir = "hooks"
 skills_dir = "skills"
 data_dir = "hooks"
 edit_matcher = "Edit|Write|MultiEdit"
-regions = []
+regions = [
+  { file = "CLAUDE.md", id = "graph-routing", block = "graph-routing" },
+]
 
 [targets.claude.events]
 post_tool_use = "PostToolUse"
@@ -67,7 +69,9 @@ hooks_dir = "hooks"
 skills_dir = "skills"
 data_dir = "hooks"
 edit_matcher = "Edit|Write|MultiEdit|ApplyPatch"
-regions = []
+regions = [
+  { file = "CLAUDE.md", id = "graph-routing", block = "graph-routing" },
+]
 
 [targets.bug-hunter.events]
 post_tool_use = "PostToolUse"
