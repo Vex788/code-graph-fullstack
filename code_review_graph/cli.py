@@ -1384,17 +1384,34 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argument
 
     # Graph tool wrappers
     query_cmd = sub.add_parser("query", help="Query graph relationships")
+    # Every query_graph pattern; tests/test_cross_stack_queries.py checks parity.
     query_cmd.add_argument(
         "pattern",
         choices=[
             "callers_of",
+            "references_to",
             "callees_of",
             "imports_of",
             "importers_of",
             "children_of",
             "tests_for",
             "inheritors_of",
+            "triggers_of",
+            "triggered_by",
+            "publishers_of",
+            "listeners_of",
+            "handlers_of",
+            "endpoints_for",
+            "consumers_of",
             "file_summary",
+            "pages_for",
+            "requests_to",
+            "included_by",
+            "views_of",
+            "forwards_to",
+            "maps_to",
+            "binds_to",
+            "styles_of",
         ],
     )
     query_cmd.add_argument("target", help="Node name, qualified name, or file path")
