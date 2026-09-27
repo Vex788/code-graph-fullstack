@@ -55,23 +55,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check Python/VSCode schema versions match
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - name: Check the VS Code reader can read what Python writes
         run: |
-          PY_VER=$(grep -oP 'LATEST_VERSION\s*=\s*max\(MIGRATIONS\.keys\(\)\)' code_review_graph/migrations.py > /dev/null && python3 -c "
-          import re, ast
+          python3 - <<'PY'
+          import re, sys
           src = open('code_review_graph/migrations.py').read()
-          m = re.search(r'MIGRATIONS:\s*dict\[.*?\]\s*=\s*\{([^}]+)\}', src)
-          keys = [int(k.strip().rstrip(':')) for k in re.findall(r'(\d+):', m.group(1))]
-          print(max(keys))
-          ")
-          TS_VER=$(grep -oP 'SUPPORTED_SCHEMA_VERSION\s*=\s*\K\d+' code-review-graph-vscode/src/backend/sqlite.ts)
-          echo "Python LATEST_VERSION: $PY_VER"
-          echo "VSCode SUPPORTED_SCHEMA_VERSION: $TS_VER"
-          if [ "$PY_VER" != "$TS_VER" ]; then
-            echo "::error::Schema version mismatch! Python=$PY_VER, VSCode=$TS_VER"
-            exit 1
-          fi
-          echo "Schema versions in sync."
+          block = re.search(r'MIGRATIONS:\s*dict\[.*?\]\s*=\s*\{([^}]+)\}', src).group(1)
+          latest = max(int(k) for k in re.findall(r'(\d+):', block))
+          compat = int(re.search(r'^READER_COMPAT\s*=\s*(\d+)', src, re.M).group(1))
+          ts = open('code-review-graph-vscode/src/backend/sqlite.ts').read()
+          supported = int(re.search(r'SUPPORTED_SCHEMA_VERSION\s*=\s*(\d+)', ts).group(1))
+          print(f"Python LATEST_VERSION={latest} READER_COMPAT={compat}; "
+                f"VSCode SUPPORTED_SCHEMA_VERSION={supported}")
+          if not compat <= supported <= latest:
+              print(f"::error::VSCode schema {supported} must be within "
+                    f"[READER_COMPAT {compat}, LATEST {latest}]")
+              sys.exit(1)
+          PY
+      - name: Check generated kind files are up to date
+        run: python3 scripts/gen_kinds.py --check
 
   test:
     runs-on: ubuntu-latest

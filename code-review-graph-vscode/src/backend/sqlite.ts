@@ -36,6 +36,13 @@ try {
   throw err;
 }
 
+/**
+ * Highest graph schema this extension understands. A newer database is still
+ * opened when its metadata `reader_compat` is at most this value.
+ * CI (schema-sync) checks it against docs/spec/contract.json.
+ */
+export const SUPPORTED_SCHEMA_VERSION = 10;
+
 // ---------------------------------------------------------------------------
 // Interfaces
 // ---------------------------------------------------------------------------
@@ -211,10 +218,16 @@ export class SqliteReader {
           .get() as { value: string } | undefined;
         if (row) {
           const version = parseInt(row.value, 10);
-          // Must match LATEST_VERSION in code_review_graph/migrations.py
-          const SUPPORTED_SCHEMA_VERSION = 9;
           if (!isNaN(version) && version > SUPPORTED_SCHEMA_VERSION) {
-            return `Database was created with a newer version (schema v${version}). Update the extension.`;
+            // A newer schema is still readable when its writer says a reader
+            // at our level can read it (additive changes only).
+            const compatRow = this.db
+              .prepare("SELECT value FROM metadata WHERE key = 'reader_compat'")
+              .get() as { value: string } | undefined;
+            const readerCompat = compatRow ? parseInt(compatRow.value, 10) : NaN;
+            if (isNaN(readerCompat) || readerCompat > SUPPORTED_SCHEMA_VERSION) {
+              return `Database was created with a newer version (schema v${version}). Update the extension.`;
+            }
           }
         }
       }

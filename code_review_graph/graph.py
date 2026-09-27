@@ -34,7 +34,16 @@ from .constants import (
     MAX_IMPACT_DEPTH,
     MAX_IMPACT_NODES,
 )
-from .migrations import get_schema_version, run_migrations
+from .locking import LockBusyError, writer_lock
+from .migrations import (
+    LATEST_VERSION,
+    MIGRATION_LOCK_WAIT_SECONDS,
+    SchemaMigrationPending,
+    check_readable,
+    get_schema_version,
+    register_sql_functions,
+    run_migrations,
+)
 from .parser import EdgeInfo, NodeInfo, normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -111,9 +120,6 @@ CREATE TABLE IF NOT EXISTS metadata (
 
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
 CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
-CREATE INDEX IF NOT EXISTS idx_nodes_qualified ON nodes(qualified_name);
-CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_qualified);
-CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_qualified);
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_qualified, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_qualified, kind);
@@ -193,18 +199,15 @@ class GraphStore:
             isolation_level=None,  # Disable implicit transactions (#135)
         )
         self._conn.row_factory = sqlite3.Row
+        # The FTS triggers call this function on every node write.
+        register_sql_functions(self._conn)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
-        self._init_schema()
-        # Ensure schema_version is set, then run pending migrations
-        if get_schema_version(self._conn) < 1:
-            # Fresh DB — metadata table just created by _init_schema
-            self._conn.execute(
-                "INSERT OR IGNORE INTO metadata (key, value) "
-                "VALUES ('schema_version', '1')"
-            )
-            self._conn.commit()
-        run_migrations(self._conn)
+        try:
+            self._ensure_schema()
+        except BaseException:
+            self._conn.close()
+            raise
         self._nxg_cache: nx.DiGraph | None = None
         self._cache_lock = threading.Lock()
 
@@ -213,6 +216,38 @@ class GraphStore:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    def _ensure_schema(self) -> None:
+        """Create or migrate the schema, only while holding the writer lock.
+
+        A current schema needs no lock. Otherwise this waits up to
+        ``MIGRATION_LOCK_WAIT_SECONDS`` for the writer lock and raises
+        :class:`SchemaMigrationPending` if another writer keeps it.
+        """
+        if check_readable(self._conn) >= LATEST_VERSION:
+            return
+        if str(self.db_path) in ("", ":memory:"):
+            # Private to this connection; no other process can see it.
+            self._migrate_schema()
+            return
+        try:
+            with writer_lock(self.db_path, wait=MIGRATION_LOCK_WAIT_SECONDS):
+                self._migrate_schema()
+        except LockBusyError as exc:
+            raise SchemaMigrationPending(
+                get_schema_version(self._conn), LATEST_VERSION, exc.holder_pid,
+            ) from exc
+
+    def _migrate_schema(self) -> None:
+        self._init_schema()
+        if get_schema_version(self._conn) < 1:
+            # Fresh DB — metadata table just created by _init_schema
+            self._conn.execute(
+                "INSERT OR IGNORE INTO metadata (key, value) "
+                "VALUES ('schema_version', '1')"
+            )
+            self._conn.commit()
+        run_migrations(self._conn)
 
     def _init_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)

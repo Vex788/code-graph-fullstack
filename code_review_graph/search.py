@@ -13,6 +13,12 @@ import sqlite3
 from typing import Any, Optional
 
 from .graph import GraphStore, _sanitize_name
+from .migrations import (
+    create_fts_triggers,
+    drop_fts_triggers,
+    rebuild_fts_in_transaction,
+    register_sql_functions,
+)
 from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -23,11 +29,45 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def disable_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Stop row-level FTS maintenance before a bulk load.
+
+    The index is stale until :func:`rebuild_fts` runs, which also re-enables
+    the triggers.
+    """
+    drop_fts_triggers(conn)
+
+
+def enable_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Resume row-level FTS maintenance (only valid on an in-sync index)."""
+    register_sql_functions(conn)
+    create_fts_triggers(conn)
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    """Rebuild ``nodes_fts`` from ``nodes`` and re-enable its triggers.
+
+    Runs inside the caller's transaction when one is open, otherwise in its
+    own ``BEGIN IMMEDIATE`` transaction. Returns the number of indexed rows.
+    """
+    if conn.in_transaction:
+        return rebuild_fts_in_transaction(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        count = rebuild_fts_in_transaction(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return count
+
+
 def rebuild_fts_index(store: GraphStore) -> int:
     """Rebuild the FTS5 index from the nodes table.
 
-    Checks whether the ``nodes_fts`` virtual table exists, clears it, then
-    repopulates it from every row in ``nodes``.
+    Drops the sync triggers, recreates ``nodes_fts`` from every row in
+    ``nodes``, then re-creates the triggers, all in one transaction so a
+    crash cannot leave the DB without an FTS table (#259).
 
     Returns:
         Number of rows indexed.
@@ -35,35 +75,10 @@ def rebuild_fts_index(store: GraphStore) -> int:
     # NOTE: rebuild_fts_index uses store._conn directly because it manages
     # the FTS5 virtual table DDL, which is tightly coupled to SQLite internals.
     conn = store._conn
-
-    # Wrap the full DROP + CREATE + INSERT sequence in an explicit transaction
-    # so a crash mid-rebuild cannot leave the DB without an FTS table at all
-    # (DROP succeeded but CREATE/INSERT didn't).  See #259.
     if conn.in_transaction:
         logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
         conn.rollback()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        # Drop and recreate the FTS table with content sync to match migration v5
-        conn.execute("DROP TABLE IF EXISTS nodes_fts")
-        conn.execute("""
-            CREATE VIRTUAL TABLE nodes_fts USING fts5(
-                name, qualified_name, file_path, signature,
-                content='nodes', content_rowid='rowid',
-                tokenize='porter unicode61'
-            )
-        """)
-
-        # Rebuild from the content table (nodes) using the FTS5 rebuild command
-        conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
-
-
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-
-    count = conn.execute("SELECT count(*) FROM nodes_fts").fetchone()[0]
+    count = rebuild_fts(conn)
     logger.info("FTS index rebuilt: %d rows indexed", count)
     return count
 
