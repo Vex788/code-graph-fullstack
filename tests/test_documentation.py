@@ -28,9 +28,13 @@ USER_DOC_FILES = README_FILES + (
 )
 
 
+# README.md is the fork's own page; the translations keep upstream's install docs.
+UPSTREAM_README_FILES = tuple(name for name in README_FILES if name != "README.md")
+
+
 def test_pip_extra_examples_use_cross_shell_double_quotes():
     """Extras must survive zsh globbing without breaking Windows cmd.exe."""
-    for readme_name in README_FILES:
+    for readme_name in UPSTREAM_README_FILES:
         content = (ROOT / readme_name).read_text(encoding="utf-8")
         for group in OPTIONAL_GROUPS:
             command = f'pip install "code-review-graph[{group}]"'
@@ -67,7 +71,8 @@ def test_codebuddy_install_docs_cover_project_artifacts():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     usage = (ROOT / "docs/USAGE.md").read_text(encoding="utf-8")
 
-    assert "install --platform codebuddy" in readme
+    assert "install --platform codebuddy" in usage
+    assert "docs/INDEX.md" in readme
     for artifact in (
         ".mcp.json",
         "CODEBUDDY.md",
@@ -75,3 +80,9 @@ def test_codebuddy_install_docs_cover_project_artifacts():
         ".codebuddy/skills/<name>/SKILL.md",
     ):
         assert artifact in usage
+
+
+def test_fork_readme_install_examples_quote_extras():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert 'uv tool install "git+https://github.com/Vex788/code-graph-fullstack@' in readme
+    assert 'uv tool install "code-graph-fullstack[embeddings-onnx] @ git+' in readme
