@@ -15764,6 +15764,9 @@ class CodeParser:
 
     def _get_return_type(self, node, language: str, source: bytes) -> Optional[str]:
         """Extract return type annotation if present."""
+        if language == "java":
+            type_node = node.child_by_field_name("type")
+            return type_node.text.decode("utf-8", errors="replace") if type_node else None
         for child in node.children:
             if child.type in ("type", "return_type", "type_annotation", "return_type_definition"):
                 return child.text.decode("utf-8", errors="replace")
