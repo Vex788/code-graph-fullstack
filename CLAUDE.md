@@ -18,8 +18,8 @@ When using code-review-graph MCP tools, follow these rules:
   - `parser.py` — Tree-sitter multi-language AST parser plus targeted fallbacks for broad source-language and notebook support
   - `custom_languages.py` — Config-driven custom language support (`.code-review-graph/languages.toml`, see docs/CUSTOM_LANGUAGES.md)
   - `graph.py` — SQLite-backed graph store (nodes, edges, weighted-score impact analysis)
-  - `tools/` — 30 MCP tool implementations split by domain
-  - `main.py` — FastMCP server entry point, registers 30 tools + 5 prompts
+  - `tools/` — 35 MCP tool implementations split by domain (see docs/spec/TOOLS.md)
+  - `main.py` — FastMCP server entry point, registers 35 tools + 5 prompts
   - `incremental.py` — Git-based change detection, file watching
   - `embeddings.py` — Optional vector embeddings (local sentence-transformers, OpenAI-compatible endpoints, Google Gemini, MiniMax)
   - `visualization.py` — D3.js interactive HTML graph generator
@@ -34,7 +34,7 @@ When using code-review-graph MCP tools, follow these rules:
   - `wiki.py` — Markdown wiki generation from community structure
   - `skills.py` — Multi-platform install/config generation and shipped skill metadata
   - `registry.py` — Multi-repo registry helpers
-  - `migrations.py` — Database schema migrations (v1-v9)
+  - `migrations.py` — Database schema migrations (v1-v10)
   - `tsconfig_resolver.py` — TypeScript path alias resolution
 
 - **VS Code Extension**: `code-review-graph-vscode/` (TypeScript)
