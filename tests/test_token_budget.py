@@ -320,8 +320,8 @@ BUDGETS: dict[str, dict[str, Any]] = {
         "worst_max": None,  # see QUERY_OWNED_UNBOUNDED
     },
     "embed_graph_tool": {
-        # sentence-transformers is not a test dependency, so this exercises
-        # the structured "provider unavailable" error response.
+        # _no_embedding_provider stubs the provider out, so this exercises the
+        # structured "provider unavailable" error response in every env.
         "default": {},
         "worst": {},
         "default_max": 800,
@@ -563,6 +563,12 @@ def _call(name: str, spec: dict[str, Any], kwargs: dict[str, Any],
     if inspect.iscoroutinefunction(func):
         return asyncio.run(func(**call_kwargs))
     return func(**call_kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _no_embedding_provider(monkeypatch):
+    """Keep tools off the network: a real local provider downloads a model."""
+    monkeypatch.setattr("code_review_graph.embeddings.get_provider", lambda *a, **k: None)
 
 
 @pytest.fixture(scope="module")
