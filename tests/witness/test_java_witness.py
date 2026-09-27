@@ -84,7 +84,6 @@ def test_test_detection_control_marks_maven_test_file(built_fixture: Path):
     assert rows == [(1,)]
 
 
-@pytest.mark.xfail(strict=True, reason="W3a: a com/acme/latest/ path is classified as test")
 def test_latest_package_is_production_code(built_fixture: Path):
     rows = _rows(
         built_fixture,

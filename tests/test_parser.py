@@ -918,6 +918,34 @@ class Plain:
         # Negative: __tests__ as a substring without path separators must not match
         assert not _is_test_file("my__tests__notdir.ts")
 
+    def test_test_dir_patterns_are_anchored_to_a_segment(self):
+        from code_review_graph.parser import _is_test_file
+        assert not _is_test_file("src/main/java/com/acme/latest/LatestRatesService.java")
+        assert not _is_test_file("app/contests/views.py")
+        assert not _is_test_file("pkg/latest_rates.py")
+        assert not _is_test_file("R/latest-helpers.R")
+        assert _is_test_file("src/test/java/com/acme/dao/UserDao.java")
+        assert _is_test_file("tests/helpers.py")
+        assert _is_test_file("pkg/test_rates.py")
+        assert _is_test_file("R/test-helpers.R")
+        assert _is_test_file("test/runtests.jl")
+
+    def test_test_detection_ignores_directories_above_repo_root(self, tmp_path):
+        from code_review_graph.parser import _is_test_file
+        root = tmp_path / "tests" / "app"
+        source = str(root / "src" / "service.py")
+        assert _is_test_file(source)
+        assert not _is_test_file(source, root)
+        assert _is_test_file(str(root / "tests" / "service.py"), root)
+
+    def test_parser_marks_only_repo_relative_test_dirs(self, tmp_path):
+        root = tmp_path / "test" / "app"
+        (root / "src").mkdir(parents=True)
+        path = root / "src" / "rates.py"
+        path.write_text("def convert():\n    return 1\n", encoding="utf-8")
+        nodes, _ = CodeParser(root).parse_file(path)
+        assert [n.is_test for n in nodes if n.kind == "File"] == [False]
+
     def test_jest_tests_dir_produces_test_nodes(self):
         """A vitest-style file under __tests__/ should yield Test nodes
         and TESTED_BY edges, the same as a *.test.ts file."""
