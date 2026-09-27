@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 permissions:
   contents: read
@@ -14,27 +14,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.10"
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: uv sync --locked --extra dev
       - name: Lint with ruff
-        run: ruff check code_review_graph/
+        run: uv run --locked ruff check code_review_graph/
 
   type-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.10"
       - name: Install dependencies
-        run: pip install -e ".[dev]" mypy types-networkx
+        run: uv sync --locked --extra dev
       - name: Run mypy
-        run: mypy code_review_graph/ --ignore-missing-imports --no-strict-optional
+        run: >-
+          uv run --locked --with types-networkx
+          mypy code_review_graph/ --ignore-missing-imports --no-strict-optional
 
   security:
     runs-on: ubuntu-latest
@@ -78,14 +80,16 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
+      - name: Set up uv with Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: pip install -e ".[dev]" pytest-cov
+        run: uv sync --locked --extra dev
       - name: Run tests with coverage
-        run: pytest --tb=short -q --cov=code_review_graph --cov-report=term-missing --cov-fail-under=65
+        run: >-
+          uv run --locked pytest --tb=short -q --cov=code_review_graph
+          --cov-report=term-missing --cov-fail-under=65
 
   google-embeddings:
     name: Google embeddings (${{ matrix.extra }})

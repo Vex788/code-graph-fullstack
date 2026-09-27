@@ -1,6 +1,9 @@
 """Tests for MCP prompt templates."""
 
-from fastmcp.prompts.prompt import Message
+try:
+    from fastmcp.prompts import Message
+except ImportError:  # fastmcp releases without the package-level re-export
+    from fastmcp.prompts.prompt import Message  # type: ignore[no-redef]
 
 from code_review_graph.prompts import (
     architecture_map_prompt,

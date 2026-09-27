@@ -454,7 +454,23 @@ _DEFAULT_PARSER_LOAD_TIMEOUT_SECONDS = 5.0
 _PARSER_PROBE_RESULTS: dict[str, bool] = {}
 _PARSER_PROBE_FAILURE_DETAILS: dict[str, str] = {}
 _PARSER_PROBE_LOCK = threading.Lock()
-_EXPECTED_PARSER_LOAD_ERRORS = (ImportError, LookupError, OSError, ValueError)
+
+
+def _language_pack_error_types() -> tuple[type[Exception], ...]:
+    """Return the language pack's base error class when it defines one (1.x)."""
+    try:
+        language_pack = importlib.import_module("tree_sitter_language_pack")
+    except ImportError:
+        return ()
+    error_type = getattr(language_pack, "Error", None)
+    if isinstance(error_type, type) and issubclass(error_type, Exception):
+        return (error_type,)
+    return ()
+
+
+_EXPECTED_PARSER_LOAD_ERRORS: tuple[type[BaseException], ...] = (
+    ImportError, LookupError, OSError, ValueError, *_language_pack_error_types(),
+)
 
 
 def _parser_load_timeout_seconds() -> float:
