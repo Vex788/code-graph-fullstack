@@ -3192,8 +3192,8 @@ def watch(
     observer.start()
     # What changed after the reconciliation looked and before the observer
     # listened produced no event; replay it through the debouncer.
-    for path in _paths_changed_since(repo_root, ignore_patterns, reconcile_started):
-        handler.dispatch(FileModifiedEvent(str(path)))
+    for changed in _paths_changed_since(repo_root, ignore_patterns, reconcile_started):
+        handler.dispatch(FileModifiedEvent(str(changed)))
     supervisor.report_health(observer_alive=True, force=True)
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
