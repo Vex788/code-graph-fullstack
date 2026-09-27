@@ -844,3 +844,17 @@ class TestRiskScoreChurn:
                 repo_root=str(tmp_path),
             )
         churn.assert_not_called()
+
+
+def test_malformed_git_timeout_env_falls_back_instead_of_crashing_import():
+    import os
+    import sys
+
+    env = {**os.environ, "CRG_GIT_TIMEOUT": "thirty"}
+    completed = subprocess.run(
+        [sys.executable, "-c",
+         "import code_review_graph.changes as c; print(c._GIT_TIMEOUT)"],
+        capture_output=True, text=True, env=env, timeout=60, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "30"

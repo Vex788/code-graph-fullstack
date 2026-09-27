@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
+from .constants import env_int
 from .flows import get_affected_flows
 from .graph import GraphNode, GraphStore, _sanitize_name, node_to_dict
 from .parser import normalize_file_path
@@ -31,7 +32,7 @@ _TEST_GAP_EXEMPT_NAMES = frozenset({
     "__construct", "__init__", "__destruct",
 })
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
+_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds, configurable
 
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)
