@@ -221,3 +221,41 @@ def test_parse_pool_probes_the_files_grammars(tmp_path, monkeypatch):
         store.close()
     assert outcome.parsed == 11
     assert seen == [["java", "python"]]
+
+
+def _java(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_java_import_walk_stops_at_the_repository_root(tmp_path):
+    from code_review_graph.parser import CodeParser
+
+    _java(tmp_path / "com" / "outside" / "Leak.java", "package com.outside;\nclass Leak {}\n")
+    repo = tmp_path / "repo"
+    caller = _java(
+        repo / "src" / "main" / "java" / "com" / "acme" / "App.java",
+        "package com.acme;\nimport com.outside.Leak;\nimport static com.outside.Leak.x;\n"
+        "class App {}\n",
+    )
+    walker = CodeParser(repo)
+    assert walker._resolve_module_to_file("com.outside.Leak", str(caller), "java") is None
+    assert walker._resolve_module_to_file("com.outside.Leak.x", str(caller), "java") is None
+
+
+def test_java_tests_still_resolve_main_sources(tmp_path):
+    from code_review_graph.parser import CodeParser
+
+    repo = tmp_path / "repo"
+    main = _java(
+        repo / "src" / "main" / "java" / "com" / "acme" / "Money.java",
+        "package com.acme;\nclass Money {}\n",
+    )
+    test = _java(
+        repo / "src" / "test" / "java" / "com" / "acme" / "MoneyTest.java",
+        "package com.acme;\nimport com.acme.Money;\nclass MoneyTest {}\n",
+    )
+    walker = CodeParser(repo)
+    resolved = walker._resolve_module_to_file("com.acme.Money", str(test), "java")
+    assert resolved == main.resolve().as_posix()

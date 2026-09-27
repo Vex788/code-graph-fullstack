@@ -14394,6 +14394,8 @@ class CodeParser:
             if module.endswith(".*"):
                 return None  # wildcard import — can't resolve to one file
             rel_path = module.replace(".", "/") + ".java"
+            # The walk ends at the repository root: nothing above it is indexed.
+            top = self._repo_root
             current = caller_dir
             while True:
                 target = current / rel_path
@@ -14404,7 +14406,7 @@ class CodeParser:
                     target = current.parent.parent / "main" / "java" / rel_path
                     if target.is_file():
                         return str(target.resolve())
-                if current == current.parent:
+                if current == current.parent or current == top:
                     break
                 current = current.parent
             # Static import: ``pkg.Class.member`` — strip member, try again
@@ -14417,7 +14419,7 @@ class CodeParser:
                     target = current / rel_path2
                     if target.is_file():
                         return str(target.resolve())
-                    if current == current.parent:
+                    if current == current.parent or current == top:
                         break
                     current = current.parent
 
