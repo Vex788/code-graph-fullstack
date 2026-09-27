@@ -10,12 +10,18 @@ import threading
 import time
 from types import ModuleType, SimpleNamespace
 
-import numpy as np
 import pytest
 
 from code_review_graph import embeddings
 from code_review_graph.embedding_providers import backends, profiles
 from code_review_graph.repo_settings import EmbeddingSettings
+
+try:
+    import numpy as np
+except ImportError:  # the dev-only lane has no embedding extras
+    np = None
+
+needs_numpy = pytest.mark.skipif(np is None, reason="local backends need numpy")
 
 MAC = "darwin-arm64"
 LINUX = "linux-x86_64"
@@ -164,9 +170,14 @@ class _FakeMx(ModuleType):
         return np.arange(n)
 
 
-class _MxArray(np.ndarray):
-    def astype(self, dtype, *args, **kwargs):  # mlx arrays take mx dtypes
-        return np.asarray(self, dtype=np.float32)
+def _mx_array(values):
+    """A numpy array whose ``astype`` accepts mlx dtypes, like an mx.array."""
+
+    class _MxArray(np.ndarray):
+        def astype(self, dtype, *args, **kwargs):
+            return np.asarray(self, dtype=np.float32)
+
+    return np.asarray(values).view(_MxArray)
 
 
 @pytest.fixture
@@ -179,6 +190,7 @@ def fake_mlx(monkeypatch):
     return mx
 
 
+@needs_numpy
 def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fake_mlx):
     calls: list[list[str]] = []
 
@@ -186,7 +198,7 @@ def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fak
         calls.append(list(texts))
         out = np.zeros((len(texts), 768), dtype=np.float32)
         out[:, 0], out[:, 1], out[:, 300] = 3.0, 4.0, 100.0  # beyond the 256 prefix
-        return SimpleNamespace(text_embeds=out.view(_MxArray))
+        return SimpleNamespace(text_embeds=_mx_array(out))
 
     loads: list[str] = []
     mod = ModuleType("mlx_embeddings")
@@ -209,6 +221,7 @@ def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fak
     assert not provider.loaded and fake_mlx.cleared == 1
 
 
+@needs_numpy
 def test_mlx_lm_provider_pools_last_token_with_end_token(monkeypatch, fake_mlx):
     class Tok:
         eos_token_id = 7
@@ -232,7 +245,7 @@ def test_mlx_lm_provider_pools_last_token_with_end_token(monkeypatch, fake_mlx):
             # Position p carries the token id in dim 0 and the position in dim 1.
             hidden[..., 0] = batch
             hidden[..., 1] = np.arange(batch.shape[1])
-            return hidden.view(_MxArray)
+            return _mx_array(hidden)
 
     net = Net()
     mod = ModuleType("mlx_lm")
@@ -253,6 +266,7 @@ def test_mlx_lm_provider_pools_last_token_with_end_token(monkeypatch, fake_mlx):
     assert query_ids[-1] == 9 and len(query_ids) == len(backends.QWEN_QUERY.split()) + 1
 
 
+@needs_numpy
 def test_model2vec_provider_never_forces_download(monkeypatch):
     seen: dict = {}
 
@@ -278,6 +292,7 @@ def test_model2vec_provider_never_forces_download(monkeypatch):
     assert provider.name == "model2vec:minishlab/potion-code-16M-v2:f32:d256"
 
 
+@needs_numpy
 def test_fastembed_provider_uses_gemma_prompts_and_threads(monkeypatch):
     seen: dict = {"texts": []}
 
@@ -312,6 +327,7 @@ class _CountingProvider(backends.LocalModelProvider):
         return np.ones((len(texts), 4), dtype=np.float32)
 
 
+@needs_numpy
 def test_idle_unload_releases_the_model():
     provider = _CountingProvider(profiles.FAST, "m", 4, idle_unload_s=0.05)
     provider.embed_query("x")
@@ -325,6 +341,7 @@ def test_idle_unload_releases_the_model():
     provider.unload()
 
 
+@needs_numpy
 def test_truncate_normalize_keeps_zero_rows_and_rejects_short_vectors():
     out = backends.truncate_normalize([[0.0, 0.0, 1.0], [3.0, 4.0, 9.0]], 2)
     assert out.tolist() == [[0.0, 0.0], pytest.approx([0.6, 0.8])]
@@ -332,6 +349,7 @@ def test_truncate_normalize_keeps_zero_rows_and_rejects_short_vectors():
         backends.truncate_normalize([[1.0]], 2)
 
 
+@needs_numpy
 def test_parity_cosine_is_the_worst_text():
     a = _CountingProvider(profiles.FAST, "a", 4, idle_unload_s=0)
     b = _CountingProvider(profiles.FAST, "b", 4, idle_unload_s=0)

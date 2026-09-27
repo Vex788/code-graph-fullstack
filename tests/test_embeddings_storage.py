@@ -9,8 +9,8 @@ from __future__ import annotations
 import sqlite3
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 from code_review_graph import embeddings
@@ -27,6 +27,13 @@ from code_review_graph.embeddings import (
 from code_review_graph.graph import GraphNode, GraphStore
 from code_review_graph.parser import NodeInfo
 from code_review_graph.repo_settings import EmbeddingSettings, clear_cache
+
+try:
+    import numpy as np
+except ImportError:  # the dev-only lane searches with the pure-Python path
+    np = None
+
+needs_numpy = pytest.mark.skipif(np is None, reason="vectorized search needs numpy")
 
 
 class StubProvider(EmbeddingProvider):
@@ -103,8 +110,8 @@ def test_stored_vectors_are_normalized_float16(tmp_path):
         blobs = [row[0] for row in store._conn.execute("SELECT vector FROM embeddings")]
         assert {len(b) for b in blobs} == {2 * 4}
         for blob in blobs:
-            vec = np.frombuffer(blob, dtype=np.float16).astype(np.float32)
-            assert np.linalg.norm(vec) == pytest.approx(1.0, abs=1e-3)
+            vec = struct.unpack("4e", blob)
+            assert sum(x * x for x in vec) ** 0.5 == pytest.approx(1.0, abs=1e-3)
     finally:
         store.close()
 
@@ -188,6 +195,7 @@ def test_search_without_vectors_never_embeds_the_query(tmp_path):
         store.close()
 
 
+@needs_numpy
 def test_top_k_matches_full_sort(tmp_path):
     rng = np.random.default_rng(7)
     provider = StubProvider()
@@ -211,6 +219,7 @@ def test_top_k_matches_full_sort(tmp_path):
         store.close()
 
 
+@needs_numpy
 def test_matrix_cache_is_reused_and_invalidated_by_writes(tmp_path, monkeypatch):
     provider = StubProvider()
     store = _store(tmp_path, provider)
@@ -328,7 +337,7 @@ def test_legacy_local_provider_uses_model_query_prompt():
 
         def encode(self, texts, prompt_name=None, show_progress_bar=False):
             self.calls.append(prompt_name)
-            return [np.array([1.0, 0.0])]
+            return [SimpleNamespace(tolist=lambda: [1.0, 0.0])]
 
     provider = embeddings.LocalEmbeddingProvider("m")
     provider._model = Model()

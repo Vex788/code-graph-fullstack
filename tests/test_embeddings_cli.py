@@ -7,7 +7,6 @@ import sqlite3
 import sys
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from code_review_graph import cli, embeddings
@@ -170,6 +169,8 @@ def test_status_human_output(tmp_path, monkeypatch, capsys, stub_provider):
 # ---------------------------------------------------------------------------
 
 def _fake_backend(vector):
+    np = pytest.importorskip("numpy")
+
     class Fake(backends.LocalModelProvider):
         def _load(self):
             return object()
@@ -212,6 +213,7 @@ def test_parity_check_skips_off_mac(tmp_path, monkeypatch):
 
 
 def test_parity_backend_failure_means_onnx(tmp_path, monkeypatch):
+    pytest.importorskip("numpy")
     repo = _repo(tmp_path)
 
     class Broken(backends.LocalModelProvider):
