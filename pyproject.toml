@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.5"
+version = "2.3.8+fs.6"
 description = "Fork of code-review-graph: fullstack code mapping (templates, routes, ORM) for AI review agents"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -41,11 +41,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://code-review-graph.com"
-Repository = "https://github.com/tirth8205/code-review-graph"
-Documentation = "https://github.com/tirth8205/code-review-graph/blob/main/docs/INDEX.md"
-Changelog = "https://github.com/tirth8205/code-review-graph/blob/main/CHANGELOG.md"
-Issues = "https://github.com/tirth8205/code-review-graph/issues"
+Homepage = "https://github.com/Vex788/code-graph-fullstack"
+Repository = "https://github.com/Vex788/code-graph-fullstack"
+Documentation = "https://github.com/Vex788/code-graph-fullstack/blob/develop/docs/INDEX.md"
+Changelog = "https://github.com/Vex788/code-graph-fullstack/blob/develop/CHANGELOG.md"
+Issues = "https://github.com/Vex788/code-graph-fullstack/issues"
 
 [project.scripts]
 code-review-graph = "code_review_graph.cli:main"
