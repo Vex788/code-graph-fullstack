@@ -1,0 +1,141 @@
+{
+  "baseline": {
+    "code_under_test": "git archive of wave0-green (7eb5e82), before any W1+ change",
+    "command": "python -m code_review_graph.eval.benchmarks.stage_timing --fork <checkout> --fork-ref wave0-green --scale 2000 --repeat 3 --out docs/perf/baseline.json",
+    "ref": "wave0-green"
+  },
+  "machine": {
+    "code_review_graph_version": "2.3.8+fs.5",
+    "cpu_count": 4,
+    "fork_git_head": "7eb5e82a7b83f9f511b394c9e1246977f693d873",
+    "machine": "x86_64",
+    "parse_executor": "auto",
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "python": "3.11.15",
+    "sqlite": "3.45.1",
+    "timestamp_utc": "2026-09-27T15:48:09+00:00"
+  },
+  "notes": [
+    "full_build_s covers parse, store and the post-parse resolvers; full_build() runs them together, so resolvers_s is measured by re-running each resolver on the built graph and parse_store_s is full_build_s minus that sum (an estimate).",
+    "postprocess_s wraps the whole post-build step; postprocess_timing is its own per-stage breakdown. The difference is bare/C++ call-target resolution, which it does not time.",
+    "noop_update and one_file_update time build_or_update_graph(full_rebuild=False), the path hooks and the MCP tool take; each one-file edit is committed first."
+  ],
+  "targets": {
+    "fixture_scale_2000": {
+      "edit_file": "src/main/java/com/acme/service/UserService.java",
+      "full_build": {
+        "full_build_s": 4.7716,
+        "parse_store_s": 4.1932,
+        "postprocess_s": 2.7486,
+        "postprocess_timing": {
+          "communities_s": 0.415498,
+          "flows_s": 0.19001,
+          "fts_s": 0.037959,
+          "signatures_s": 1.452702,
+          "summaries_s": 0.114663
+        },
+        "resolvers_s": {
+          "hcl": 0.0024,
+          "jsp": 0.5283,
+          "python": 0.0015,
+          "rescript": 0.0149,
+          "scoped": 0.0028,
+          "spring": 0.0035,
+          "spring_event": 0.0191,
+          "temporal": 0.0059
+        },
+        "total_s": 7.5202,
+        "warnings": []
+      },
+      "graph": {
+        "edges": 24364,
+        "files": 1999,
+        "nodes": 9224,
+        "parse_errors": 0
+      },
+      "noop_update": {
+        "median_s": 0.1438,
+        "runs_s": [
+          0.1427,
+          0.1528,
+          0.1438
+        ]
+      },
+      "one_file_update": {
+        "dependent_files": 1,
+        "files_updated": 1,
+        "median_s": 1.1959,
+        "postprocess_timing": {
+          "communities_s": 0.00018,
+          "flows_s": 0.079107,
+          "fts_s": 0.033117,
+          "signatures_s": 0.004075,
+          "summaries_s": 0.11455
+        },
+        "runs_s": [
+          1.2784,
+          1.1959,
+          1.1589
+        ]
+      }
+    },
+    "fork": {
+      "edit_file": "code_review_graph/hints.py",
+      "full_build": {
+        "full_build_s": 5.204,
+        "parse_store_s": 4.8422,
+        "postprocess_s": 4.5171,
+        "postprocess_timing": {
+          "communities_s": 0.696152,
+          "flows_s": 0.207311,
+          "fts_s": 0.037301,
+          "signatures_s": 1.157887,
+          "summaries_s": 0.134702
+        },
+        "resolvers_s": {
+          "hcl": 0.0036,
+          "jsp": 0.0026,
+          "python": 0.0206,
+          "rescript": 0.0527,
+          "scoped": 0.0828,
+          "spring": 0.0742,
+          "spring_event": 0.0788,
+          "temporal": 0.0465
+        },
+        "total_s": 9.7211,
+        "warnings": []
+      },
+      "graph": {
+        "edges": 53450,
+        "files": 305,
+        "nodes": 6275,
+        "parse_errors": 0
+      },
+      "noop_update": {
+        "median_s": 0.0421,
+        "runs_s": [
+          0.0421,
+          0.0445,
+          0.0421
+        ]
+      },
+      "one_file_update": {
+        "dependent_files": 2,
+        "files_updated": 1,
+        "median_s": 0.6394,
+        "postprocess_timing": {
+          "communities_s": 0.000187,
+          "flows_s": 0.102367,
+          "fts_s": 0.029675,
+          "signatures_s": 0.006488,
+          "summaries_s": 0.088718
+        },
+        "runs_s": [
+          0.7164,
+          0.6394,
+          0.5728
+        ]
+      }
+    }
+  }
+}
