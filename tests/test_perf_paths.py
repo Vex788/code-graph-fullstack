@@ -259,3 +259,53 @@ def test_java_tests_still_resolve_main_sources(tmp_path):
     walker = CodeParser(repo)
     resolved = walker._resolve_module_to_file("com.acme.Money", str(test), "java")
     assert resolved == main.resolve().as_posix()
+
+
+def _small_repo(root: Path) -> Path:
+    root.mkdir()
+    (root / "small.py").write_text("def small():\n    return 1\n", encoding="utf-8")
+    (root / "big.py").write_text(
+        "def big():\n" + "    x = 1\n" * 40 + "    return x\n", encoding="utf-8",
+    )
+    git(root, "init", "-q")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "init")
+    return root
+
+
+def _indexed(repo: Path) -> set[str]:
+    store = open_store(repo)
+    try:
+        return {Path(path).name for path in store.get_all_files()}
+    finally:
+        store.close()
+
+
+def test_oversized_files_are_skipped_and_reported(tmp_path, monkeypatch):
+    repo = _small_repo(tmp_path / "repo")
+    monkeypatch.setenv("CRG_MAX_FILE_BYTES", "200")
+    result = build(repo)
+    assert result["status"] == "ok"
+    assert _indexed(repo) == {"small.py"}
+    assert result["files_skipped"] == 1
+    assert [entry["file"] for entry in result["skipped_files"]] == ["big.py"]
+    assert result["skipped_files"][0]["bytes"] > 200
+
+
+def test_a_file_that_grows_past_the_limit_leaves_the_graph(tmp_path, monkeypatch):
+    repo = _small_repo(tmp_path / "repo")
+    monkeypatch.setenv("CRG_MAX_FILE_BYTES", "200")
+    build(repo)
+    (repo / "small.py").write_text("def small():\n" + "    y = 2\n" * 40, encoding="utf-8")
+    git(repo, "commit", "-qam", "grow")
+    update = build(repo, full=False)
+    assert update["build_type"] == "incremental"
+    assert update["files_skipped"] == 1
+    assert _indexed(repo) == set()
+
+
+def test_default_file_size_limit_is_two_megabytes(monkeypatch):
+    from code_review_graph import incremental
+
+    monkeypatch.delenv("CRG_MAX_FILE_BYTES", raising=False)
+    assert incremental._max_file_bytes() == 2 * 1024 * 1024

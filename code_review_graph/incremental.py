@@ -1432,6 +1432,48 @@ def collect_all_files(
     return files
 
 
+_SKIPPED_FILES_SHOWN = 50
+
+
+def _max_file_bytes() -> int:
+    return env_int("CRG_MAX_FILE_BYTES", 2 * 1024 * 1024, minimum=1)
+
+
+def _oversized_bytes(path: Path, limit: int) -> Optional[int]:
+    """The file's size when it exceeds *limit*, else None."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    return size if size > limit else None
+
+
+def _drop_oversized(repo_root: Path, rel_paths: list[str]) -> tuple[list[str], list[dict]]:
+    """Split off files over ``CRG_MAX_FILE_BYTES``; they are reported, never parsed."""
+    limit = _max_file_bytes()
+    kept: list[str] = []
+    skipped: list[dict] = []
+    for rel_path in rel_paths:
+        size = _oversized_bytes(repo_root / rel_path, limit)
+        if size is None:
+            kept.append(rel_path)
+        else:
+            skipped.append({"file": rel_path, "bytes": size})
+    return kept, skipped
+
+
+def _skipped_section(skipped: list[dict]) -> dict[str, Any]:
+    if skipped:
+        logger.warning(
+            "Skipped %d file(s) over CRG_MAX_FILE_BYTES=%d, e.g. %s",
+            len(skipped), _max_file_bytes(), skipped[0]["file"],
+        )
+    return {
+        "files_skipped": len(skipped),
+        "skipped_files": sorted(skipped, key=lambda e: e["file"])[:_SKIPPED_FILES_SHOWN],
+    }
+
+
 def _reconcile_stale_files(
     repo_root: Path,
     store: GraphStore,
@@ -1857,7 +1899,9 @@ def full_build(
         ignore_patterns = _load_ignore_patterns(repo_root)
         epoch, pending = _begin_write(repo_root, store, "full", ignore_patterns)
         parser = CodeParser(repo_root)
-        files = collect_all_files(repo_root, recurse_submodules)
+        files, skipped = _drop_oversized(
+            repo_root, collect_all_files(repo_root, recurse_submodules),
+        )
         stale_files = _reconcile_stale_files(repo_root, store, files)
         if store.has_nodes():
             outcome = _parse_and_store(repo_root, store, parser, files)
@@ -1883,6 +1927,7 @@ def full_build(
             "resolver_failures": failures,
             "write_epoch": epoch,
             **_resolver_results_section(resolver_results),
+            **_skipped_section(skipped),
         }
         mark_flows_stale(store, {"full": True})
         return _end_write(store, result, pending, stamp)
@@ -1913,6 +1958,7 @@ def _noop_update_result(changed_files: list[str] | None) -> dict[str, Any]:
         "content_drift_detected": 0,
         "errors": [],
         **_resolver_results_section(dict.fromkeys(RESOLVERS)),
+        **_skipped_section([]),
     }
 
 
@@ -2099,6 +2145,8 @@ def _incremental_update_journaled(
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
+    skipped: list[dict] = []
+    size_limit = _max_file_bytes()
     for rel_path in sorted(all_files):
         if _should_ignore(rel_path, ignore_patterns):
             continue
@@ -2108,6 +2156,12 @@ def _incremental_update_journaled(
                 missing_paths.add(normalize_file_path(abs_path))
             continue
         if parser.detect_language(abs_path) is None:
+            continue
+        size = _oversized_bytes(abs_path, size_limit)
+        if size is not None:
+            # Too large to parse: reported, and its old rows leave the graph.
+            skipped.append({"file": rel_path, "bytes": size})
+            missing_paths.add(normalize_file_path(abs_path))
             continue
         # Quick hash check to skip unchanged files
         try:
@@ -2186,6 +2240,7 @@ def _incremental_update_journaled(
         "resolver_failures": resolver_failures,
         "write_epoch": epoch,
         **_resolver_results_section(resolver_results),
+        **_skipped_section(skipped),
     }
     # An unstamped earlier write may have changed anything.
     mark_flows_stale(store, {"full": True} if recovering else _stop_delta_journal(store))
