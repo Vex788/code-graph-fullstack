@@ -97,3 +97,73 @@ class TestJavaTypeResolution:
             _qn(outer.resolve(), "Outer.Inner"),
             "ActionBean",
         }
+
+
+_SESSION_DAO = (
+    "package com.acme.dao;\n"
+    "import org.hibernate.Session;\n"
+    "public class OrderDao {\n"
+    "    private Session session;\n"
+    "    public void save(Object o) { }\n"
+    "    public void persist(Object o) {\n"
+    "        session.save(o);\n"
+    "        verify(session).save(o);\n"
+    "        save(o);\n"
+    "    }\n"
+    "    static Session verify(Session s) { return s; }\n"
+    "}\n"
+)
+
+
+class TestJavaReceivers:
+    def test_library_receiver_is_marked_external(self, tmp_path):
+        path = _write(tmp_path, f"{SRC}/dao/OrderDao.java", _SESSION_DAO)
+        _, edges = _parse(tmp_path, path)
+        saves = sorted(
+            (e.line, e.target, e.extra.get("receiver_external"), e.extra.get("receiver_expression"))
+            for e in edges if e.kind == "CALLS" and e.target.endswith("save")
+        )
+        assert saves == [
+            (7, "save", True, None),
+            (8, "save", None, True),
+            (9, _qn(path, "OrderDao.save"), None, None),
+        ]
+
+    def test_receiver_edges_never_bind_by_bare_name(self, tmp_path, monkeypatch):
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.incremental import full_build
+
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        path = _write(tmp_path, f"{SRC}/dao/OrderDao.java", _SESSION_DAO)
+        with GraphStore(tmp_path / "graph.db") as store:
+            assert full_build(tmp_path, store)["errors"] == []
+            store.resolve_bare_call_targets()
+            store.commit()
+            callers = {
+                (e.source_qualified, e.line)
+                for e in store.get_edges_by_target(_qn(path, "OrderDao.save"))
+                if e.kind == "CALLS"
+            }
+        assert callers == {(_qn(path, "OrderDao.persist"), 9)}
+
+    def test_callers_of_fallback_skips_typed_member_calls(self, tmp_path, monkeypatch):
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.incremental import full_build, get_db_path
+        from code_review_graph.tools.query import query_graph
+
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        path = _write(tmp_path, f"{SRC}/dao/OrderDao.java", _SESSION_DAO)
+        _write(tmp_path, f"{SRC}/audit/Writer.java", (
+            "package com.acme.audit;\n"
+            "import org.hibernate.Session;\n"
+            "public class Writer {\n"
+            "    public void write(Session session) { session.save(this); }\n"
+            "}\n"
+        ))
+        db = get_db_path(tmp_path)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with GraphStore(db) as store:
+            assert full_build(tmp_path, store)["errors"] == []
+        result = query_graph("callers_of", _qn(path, "OrderDao.save"), repo_root=str(tmp_path))
+        callers = {r["qualified_name"] for r in result["results"]}
+        assert callers == {_qn(path, "OrderDao.persist")}

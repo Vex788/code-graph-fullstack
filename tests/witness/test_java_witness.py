@@ -30,7 +30,6 @@ def test_callers_control_finds_real_callers(built_fixture: Path):
     assert "src/main/java/com/acme/service/UserService.java::UserService.register" in callers
 
 
-@pytest.mark.xfail(strict=True, reason="W3a: session.save() binds to any repo method named save")
 def test_hibernate_session_save_is_not_a_caller_of_user_dao(built_fixture: Path):
     from code_review_graph.tools.query import query_graph
 

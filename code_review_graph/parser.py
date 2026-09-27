@@ -2828,7 +2828,9 @@ class CodeParser:
                 file_path_str,
             )
 
-        edges = self._apply_typed_call_targets(edges, typed_call_targets, language)
+        edges = self._apply_typed_call_targets(
+            edges, typed_call_targets, language, file_path_str, import_map,
+        )
 
         # Resolve bare call targets to qualified names using same-file definitions
         edges = self._resolve_call_targets(nodes, edges, file_path_str)
@@ -4817,7 +4819,7 @@ class CodeParser:
                 resolved.append(edge)
                 continue
             receiver = edge.extra.get("receiver")
-            has_receiver = bool(receiver)
+            has_receiver = bool(receiver) or bool(edge.extra.get("receiver_expression"))
             if (
                 is_go
                 and edge.kind == "CALLS"
@@ -5152,7 +5154,7 @@ class CodeParser:
         file_path: str,
         import_map: dict[str, str],
         defined_names: set[str],
-    ) -> dict[tuple[int, str, str], tuple[str, str, str]]:
+    ) -> dict[tuple[int, str, str], tuple[Optional[str], str, str]]:
         """Collect evidence-backed targets for calls on typed receivers.
 
         The result is keyed by source line, receiver, and method so the normal
@@ -5160,7 +5162,9 @@ class CodeParser:
         typed receivers resolve directly when their class is repository-local.
         PHP variables assigned from ``new Type`` retain a bare parse-time target
         plus the constructed class scope for conservative graph-wide resolution.
-        Unknown or ambiguous types keep their existing bare targets.
+        Unknown or ambiguous types keep their existing bare targets; a known
+        type that is not repository-local is kept as evidence with a ``None``
+        target so the graph never binds the call to a same-named repo method.
         """
         if language not in self._TYPED_CALL_LANGUAGES:
             return {}
@@ -5177,7 +5181,7 @@ class CodeParser:
             "php": {"compound_statement"},
             "csharp": {"block"},
         }.get(language, set())
-        targets: dict[tuple[int, str, str], tuple[str, str, str]] = {}
+        targets: dict[tuple[int, str, str], tuple[Optional[str], str, str]] = {}
 
         def walk(
             node,
@@ -5243,10 +5247,11 @@ class CodeParser:
                         # when the class is not visible in this file: the
                         # graph-wide scoped resolver validates it against
                         # actual Class nodes plus namespace evidence (#612).
+                        # Java classes of the same package need no import.
                         if (
                             receiver in import_map
                             or receiver in defined_names
-                            or language == "csharp"
+                            or language in ("csharp", "java")
                         ):
                             type_name = receiver
                             evidence = "class_receiver"
@@ -5259,9 +5264,11 @@ class CodeParser:
                             import_map,
                             defined_names,
                         )
+                        key = (node.start_point[0] + 1, receiver, method)
                         if target:
-                            key = (node.start_point[0] + 1, receiver, method)
                             targets[key] = (target, type_name, evidence)
+                        elif language == "java":
+                            targets[key] = (None, type_name, evidence)
 
             for child in node.children:
                 walk(child, bindings, class_fields, depth + 1)
@@ -5597,13 +5604,45 @@ class CodeParser:
                 return f"{resolved}.{method}"
         if base_type in defined_names:
             return f"{file_path}::{base_type}.{method}"
+        if language == "java":
+            owner = self._resolve_java_type_target(
+                base_type, file_path, import_map, defined_names,
+            )
+            if "::" in owner:
+                return f"{owner}.{method}"
         return None
 
-    @staticmethod
+    # Receiver types that are never repository classes.
+    _JAVA_LANG_TYPES = frozenset({
+        "Object", "String", "StringBuilder", "StringBuffer", "Integer", "Long",
+        "Short", "Byte", "Double", "Float", "Boolean", "Character", "Number",
+        "Math", "System", "Thread", "Class", "Enum", "Iterable", "Runnable",
+        "CharSequence", "Comparable", "Exception", "RuntimeException", "Throwable",
+    })
+
+    def _java_type_is_external(
+        self, type_name: str, file_path: str, import_map: dict[str, str],
+    ) -> bool:
+        """True when *type_name* is known to live outside the repository."""
+        base = self._base_type_name(type_name) or type_name
+        if base in import_map:
+            imported = import_map[base]
+            if self._resolve_module_to_file(imported, file_path, "java") is not None:
+                return False
+            # Unresolved imports under this file's root package may be a
+            # source layout the walk does not know, not a library.
+            package = import_map.get(_JAVA_PACKAGE_KEY, "")
+            root = ".".join(package.split(".")[:2])
+            return not (root and imported.startswith(root + "."))
+        return base in self._JAVA_LANG_TYPES
+
     def _apply_typed_call_targets(
+        self,
         edges: list[EdgeInfo],
-        targets: dict[tuple[int, str, str], tuple[str, str, str]],
+        targets: dict[tuple[int, str, str], tuple[Optional[str], str, str]],
         language: str,
+        file_path: str = "",
+        import_map: Optional[dict[str, str]] = None,
     ) -> list[EdgeInfo]:
         if not targets:
             return edges
@@ -5619,6 +5658,18 @@ class CodeParser:
                     "receiver_type": type_name,
                     "receiver_resolution": evidence_kind,
                 })
+                if target is None:
+                    if self._java_type_is_external(type_name, file_path, import_map or {}):
+                        extra["receiver_external"] = True
+                    resolved.append(EdgeInfo(
+                        kind=edge.kind,
+                        source=edge.source,
+                        target=edge.target,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                        extra=extra,
+                    ))
+                    continue
                 resolved_target = target
                 if evidence_kind == "constructed_receiver" or language == "csharp":
                     # Keep PHP/C# parse-only CALLS output backward-compatible
@@ -10932,6 +10983,12 @@ class CodeParser:
                         call_extra["go_method_receiver"] = True
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
+                if language == "java" and not receiver and child.type == "method_invocation":
+                    obj = child.child_by_field_name("object")
+                    # ``verify(s).save()`` / ``super.save()``: the method is not
+                    # this class's, so it must not bind to a same-named one.
+                    if obj is not None and obj.type != "this":
+                        call_extra["receiver_expression"] = True
 
             if language == "java" and child.type == "method_invocation":
                 self._emit_spring_webflux_endpoint(
@@ -13880,6 +13937,11 @@ class CodeParser:
                 target = current / rel_path
                 if target.is_file():
                     return str(target.resolve())
+                # Maven/Gradle tests see the main source root too.
+                if current.name == "java" and current.parent.name == "test":
+                    target = current.parent.parent / "main" / "java" / rel_path
+                    if target.is_file():
+                        return str(target.resolve())
                 if current == current.parent:
                     break
                 current = current.parent

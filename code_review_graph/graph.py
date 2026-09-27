@@ -1251,13 +1251,17 @@ class GraphStore:
 
         # bare_name -> [(qualified_name, defining_file)]
         node_lookup: dict[str, list[tuple[str, str]]] = {}
+        # qualified_name -> owning class name, for receiver type evidence
+        node_owner: dict[str, str] = {}
         for row in conn.execute(
-            "SELECT name, qualified_name, file_path FROM nodes "
+            "SELECT name, qualified_name, file_path, parent_name FROM nodes "
             "WHERE kind IN ('Function', 'Test', 'Class')"
         ).fetchall():
             node_lookup.setdefault(row["name"], []).append(
                 (row["qualified_name"], row["file_path"]),
             )
+            if row["parent_name"]:
+                node_owner[row["qualified_name"]] = row["parent_name"].rsplit(".", 1)[-1]
 
         # call-site file -> explicitly imported files
         import_targets: dict[str, set[str]] = {}
@@ -1341,6 +1345,22 @@ class GraphStore:
             if not isinstance(bare_name, str):
                 continue
             candidates = node_lookup.get(bare_name, [])
+            receiver = edge_extra.get("receiver")
+            if kind == "CALLS" and (
+                (receiver and receiver not in ("self", "cls", "this"))
+                or edge_extra.get("receiver_expression")
+            ):
+                # A member call belongs to its receiver's type: without type
+                # evidence (or for a library type) no repo method qualifies.
+                receiver_type = edge_extra.get("receiver_type")
+                if not isinstance(receiver_type, str) or edge_extra.get("receiver_external"):
+                    candidates = []
+                else:
+                    owner_type = receiver_type.rsplit(".", 1)[-1]
+                    candidates = [
+                        candidate for candidate in candidates
+                        if node_owner.get(candidate[0]) == owner_type
+                    ]
 
             context_file = edge["file_path"]
             imported_files = import_targets.get(context_file, set())

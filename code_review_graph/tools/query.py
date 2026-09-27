@@ -57,6 +57,19 @@ _QUERY_PATTERNS = {
 _JAVA_FQN_PART = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 _MAX_FQN_CANDIDATES = 100
 
+# Statically typed languages: a member call there belongs to the receiver's
+# type, so a bare-name match on a receiver edge is not evidence of a caller.
+_TYPED_RECEIVER_LANGUAGES = frozenset({
+    "java", "kotlin", "csharp", "cpp", "go", "rust", "scala", "swift",
+    "typescript", "tsx", "dart",
+})
+
+
+def _is_member_call(extra: dict[str, Any]) -> bool:
+    receiver = extra.get("receiver")
+    lexical = receiver in ("self", "cls", "this")
+    return bool((receiver and not lexical) or extra.get("receiver_expression"))
+
 
 def _looks_like_java_method_fqn(target: str) -> bool:
     """Return whether *target* has a package/Class/method-like shape."""
@@ -559,6 +572,10 @@ def query_graph(
                         "ambiguous_targets" in e.extra
                         or "unresolved_targets" in e.extra
                         or (node.language == "cpp" and e.extra.get("receiver"))
+                        or (
+                            node.language in _TYPED_RECEIVER_LANGUAGES
+                            and _is_member_call(e.extra)
+                        )
                     ):
                         continue
                     if cpp_overload_count > 1:
