@@ -237,6 +237,8 @@ def test_windows_server_still_prewarms_before_mcp_run(monkeypatch, tmp_path):
     events: list[str] = []
     policy = object()
     monkeypatch.delenv("CRG_TOOLS", raising=False)
+    # Prewarm runs only for the sentence-transformers (legacy/local) profiles.
+    monkeypatch.setenv("CRG_EMBEDDINGS", "legacy")
     monkeypatch.setattr(crg_main, "_default_repo_root", None)
     # The fake policy must be installed while sys.platform is still POSIX:
     # on Python 3.14 asyncio's module __getattr__ only tolerates the missing
@@ -260,7 +262,7 @@ def test_windows_server_still_prewarms_before_mcp_run(monkeypatch, tmp_path):
     monkeypatch.setattr(
         embeddings,
         "prewarm_local_embeddings",
-        lambda: events.append("prewarm"),
+        lambda _model=None: events.append("prewarm"),
     )
     monkeypatch.setattr(
         crg_main.mcp,

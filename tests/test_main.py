@@ -525,3 +525,98 @@ class TestApplyToolFilter:
         crg_main._apply_tool_filter(" query_graph_tool , semantic_search_nodes_tool ")
         remaining = await self._tool_names()
         assert remaining == {"query_graph_tool", "semantic_search_nodes_tool"}
+
+
+def test_orient_tool_forwards_provider_limit_and_detail_level(monkeypatch):
+    seen: dict = {}
+
+    def fake_orient(**kwargs):
+        seen.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(crg_main, "orient", fake_orient)
+    monkeypatch.setattr(crg_main, "with_provenance", lambda result, _root: result)
+    fn = getattr(crg_main.orient_tool, "fn", crg_main.orient_tool)
+    fn("login flow", repo_root="/tmp/r", provider="fast", limit=3, detail_level="minimal")
+    assert seen == {"query": "login flow", "repo_root": "/tmp/r", "provider": "fast",
+                    "limit": 3, "detail_level": "minimal"}
+    seen.clear()
+    fn("login flow", repo_root="/tmp/r")
+    assert (seen["provider"], seen["limit"], seen["detail_level"]) == (None, 8, "standard")
+
+
+def _windows_start(monkeypatch, tmp_path) -> list:
+    """Run ``main`` as on Windows; returns the recorded start events."""
+    import code_review_graph.embeddings as embeddings
+    from code_review_graph import repo_settings
+
+    events: list = []
+    policy = object()
+    monkeypatch.setattr(crg_main, "_default_repo_root", None)
+    monkeypatch.delenv("CRG_EMBEDDINGS", raising=False)
+    # Installed while sys.platform is still POSIX; see test_embedding_initialization.
+    monkeypatch.setattr(crg_main.asyncio, "WindowsSelectorEventLoopPolicy",
+                        lambda: policy, raising=False)
+    monkeypatch.setattr(crg_main.asyncio, "set_event_loop_policy",
+                        lambda value: events.append("policy") if value is policy else None)
+    monkeypatch.setattr(crg_main.sys, "platform", "win32")
+    monkeypatch.setattr(embeddings, "prewarm_local_embeddings",
+                        lambda model=None: events.append(("prewarm", model)))
+    monkeypatch.setattr(crg_main.mcp, "run", lambda **_kwargs: events.append("run"))
+    repo_settings.clear_cache()
+    crg_main.main(repo_root=str(tmp_path))
+    repo_settings.clear_cache()
+    return events
+
+
+def test_windows_start_skips_prewarm_when_embeddings_are_off(monkeypatch, tmp_path):
+    assert _windows_start(monkeypatch, tmp_path) == ["policy", "run"]
+
+
+def test_windows_start_skips_prewarm_for_non_legacy_profiles(monkeypatch, tmp_path):
+    from code_review_graph.repo_settings import write_section
+
+    write_section(tmp_path, "embeddings", {"enabled": True, "profile": "balanced"})
+    assert _windows_start(monkeypatch, tmp_path) == ["policy", "run"]
+
+
+def test_windows_start_prewarms_the_legacy_profile_model(monkeypatch, tmp_path):
+    from code_review_graph.embedding_providers.profiles import LEGACY
+    from code_review_graph.repo_settings import write_section
+
+    write_section(tmp_path, "embeddings", {"enabled": True, "profile": "legacy"})
+    assert _windows_start(monkeypatch, tmp_path) == [
+        "policy", ("prewarm", LEGACY.model), "run",
+    ]
+
+
+def test_windows_start_prewarms_the_local_provider(monkeypatch, tmp_path):
+    from code_review_graph.repo_settings import write_section
+
+    write_section(tmp_path, "embeddings", {"enabled": True, "profile": "local"})
+    assert _windows_start(monkeypatch, tmp_path) == ["policy", ("prewarm", None), "run"]
+
+
+def test_embed_graph_help_points_at_embeddings_enable(monkeypatch, tmp_path):
+    fn = getattr(crg_main.embed_graph_tool, "fn", crg_main.embed_graph_tool)
+    assert "code-review-graph embeddings enable" in (docs_module.embed_graph.__doc__ or "")
+    assert "code-review-graph embeddings enable" in (fn.__doc__ or "")
+
+    class _NoProvider:
+        available = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class _Store:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(docs_module, "EmbeddingStore", _NoProvider)
+    monkeypatch.setattr(docs_module, "_get_store", lambda _root: (_Store(), tmp_path))
+    result = docs_module.embed_graph(repo_root=str(tmp_path))
+    assert result["status"] == "error"
+    assert "code-review-graph embeddings enable" in result["error"]

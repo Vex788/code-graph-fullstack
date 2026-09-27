@@ -38,6 +38,7 @@ from .prompts import (
     pre_merge_check_prompt,
     review_changes_prompt,
 )
+from .repo_settings import load_embedding_settings
 from .tools import (
     apply_refactor_func,
     batch_query,
@@ -490,11 +491,12 @@ def semantic_search_nodes_tool(
 ) -> dict:
     """Search for code entities by name, keyword, or semantic similarity.
 
-    Uses vector embeddings for semantic search when available (run embed_graph_tool
-    first, with a provider of your choice: "local" needs sentence-transformers,
-    "openai" / "google" / "minimax" / "voyage" need their respective env vars).
-    Falls back to FTS5 / keyword matching when no matching embeddings exist for
-    the given provider.
+    Embeddings are off by default, so this is FTS5 / keyword search until a
+    repository enables them (`code-review-graph embeddings enable --profile
+    balanced`; cloud providers "openai" / "google" / "minimax" / "voyage"
+    need their env vars). The response's ``search_mode`` says which search
+    produced the results, ``embeddings_state`` is off, ready, stale or
+    unavailable, and ``warning`` explains any fallback to keyword search.
 
     Args:
         query: Search string to match against node names.
@@ -504,9 +506,9 @@ def semantic_search_nodes_tool(
         model: Embedding model for query vectors. Must match the model used
                during embed_graph. Falls back to CRG_EMBEDDING_MODEL env var
                (local), CRG_OPENAI_MODEL (openai), or CRG_VOYAGE_MODEL (voyage).
-        provider: Embedding provider: "local" (default), "openai", "google",
-                  "minimax", or "voyage". Must match the provider used during
-                  embed_graph.
+        provider: Embedding provider for this call: "local", "openai",
+                  "google", "minimax", or "voyage". The repository's embedding
+                  settings decide when omitted.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
     """
     root = _resolve_repo_root(repo_root)
@@ -523,6 +525,10 @@ async def embed_graph_tool(
     provider: Optional[str] = None,
 ) -> dict:
     """Compute vector embeddings for all graph nodes to enable semantic search.
+
+    Embeddings are off by default; `code-review-graph embeddings enable
+    --profile balanced` turns them on for the repository and keeps them
+    current on updates. This tool is a one-off embed with an explicit provider.
 
     Requires: pip install code-review-graph[embeddings] (local provider only;
     cloud providers use stdlib urllib).
@@ -1209,19 +1215,32 @@ def cross_repo_search_tool(
 
 
 @mcp.tool()
-def orient_tool(query: str, repo_root: Optional[str] = None) -> dict:
+def orient_tool(
+    query: str,
+    repo_root: Optional[str] = None,
+    provider: Optional[str] = None,
+    limit: int = 8,
+    detail_level: str = "standard",
+) -> dict:
     """One-call codebase mini-map for a task string.
 
-    Returns top functions/classes (hybrid FTS+vector), top files,
-    matching communities and 1-line stats. Use FIRST for orientation
-    instead of 3-4 separate search calls.
+    Returns top functions/classes (keyword search, hybrid with vectors when
+    embeddings are enabled), top files, matching communities and 1-line
+    stats. Use FIRST for orientation instead of 3-4 separate search calls.
 
     Args:
         query: Natural-language or symbol-ish task description.
         repo_root: Repository root path. Auto-detected if omitted.
+        provider: Embedding provider for this call; the repository's
+            embedding settings decide when omitted.
+        limit: Maximum top functions/classes. Default: 8.
+        detail_level: "standard", or "minimal" for names and locations only.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(orient(query=query, repo_root=root), root)
+    return with_provenance(orient(
+        query=query, repo_root=root, provider=provider, limit=limit,
+        detail_level=detail_level,
+    ), root)
 
 
 @mcp.tool()
@@ -1450,9 +1469,14 @@ def main(
             # locks the loop needs). #385 added ``asyncio.to_thread`` to peer
             # tools but cannot fix this case — the dangerous initialization has
             # to happen on the main thread before any worker thread is spawned.
-            from .embeddings import prewarm_local_embeddings
+            # Only the sentence-transformers profiles load torch; the rest stay lazy.
+            settings = load_embedding_settings(root)
+            if settings.enabled and settings.profile in ("legacy", "local"):
+                from .embedding_providers.profiles import LEGACY
+                from .embeddings import prewarm_local_embeddings
 
-            prewarm_local_embeddings()
+                legacy_model = LEGACY.model if settings.profile == "legacy" else None
+                prewarm_local_embeddings(settings.model or legacy_model)
 
         if transport == "stdio":
             # Stdio MCP must keep stdout strictly JSON-RPC. FastMCP's banner/update
