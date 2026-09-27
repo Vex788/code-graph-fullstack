@@ -95,18 +95,40 @@ def _java_fqn_candidates(store: GraphStore, target: str) -> list[GraphNode] | No
 
     parts = target.split(".")
     class_name, method_name = parts[-2:]
+    # Filter by name and language in SQL: a common method name (save, get)
+    # has far more matches than any fixed search limit would return.
+    rows = store._conn.execute(
+        "SELECT * FROM nodes WHERE name = ? AND lower(language) = 'java' "
+        "AND kind IN ('Function', 'Test') "
+        "AND (parent_name = ? OR parent_name LIKE ? OR file_path LIKE ? "
+        "OR qualified_name LIKE ?) ORDER BY qualified_name",
+        (
+            method_name, class_name, f"%.{class_name}", f"%/{class_name}.java",
+            f"%{class_name}.{method_name}%",
+        ),
+    ).fetchall()
     matches: list[GraphNode] = []
-    for candidate in store.search_nodes(method_name, limit=_MAX_FQN_CANDIDATES):
-        if candidate.language.lower() != "java" or candidate.name != method_name:
-            continue
+    for candidate in map(store._row_to_node, rows):
         parent_name = candidate.parent_name or ""
         parent_match = parent_name.rsplit(".", 1)[-1] == class_name
         file_match = Path(candidate.file_path).stem == class_name
-        qualified_tail = candidate.qualified_name.rsplit("::", 1)[-1]
+        qualified_tail = candidate.qualified_name.rsplit("::", 1)[-1].split("(", 1)[0]
         qualified_match = qualified_tail.endswith(f"{class_name}.{method_name}")
         if parent_match or file_match or qualified_match:
             matches.append(candidate)
     return matches
+
+
+def _overload_nodes(store: GraphStore, target: str) -> list[GraphNode]:
+    """Nodes whose identity is ``target(...)``: the overloads behind a base name."""
+    if "::" not in target or target.endswith(")"):
+        return []
+    rows = store._conn.execute(
+        "SELECT * FROM nodes WHERE qualified_name >= ? AND qualified_name < ? "
+        "ORDER BY qualified_name",
+        (f"{target}(", f"{target})"),
+    ).fetchall()
+    return [store._row_to_node(row) for row in rows]
 
 
 def _rank_disambiguation_candidates(
@@ -134,7 +156,7 @@ _MERGE_MAX_CANDIDATES = 5
 
 
 def _overload_label(node: GraphNode) -> str:
-    """``name(params)`` from a C++ overload's qualified name."""
+    """``name(params)`` from a C++ or Java overload's qualified name."""
     tail = node.qualified_name.rsplit("::", 1)[-1]
     start = tail.find(f"{node.name}(")
     return _sanitize_name(tail[start:] if start >= 0 else tail)
@@ -162,6 +184,7 @@ def _merge_candidates(
     results: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     seen: set[str] = set()
+    seen_edges: set[str] = set()
 
     def add(result: dict[str, Any], via: str) -> None:
         key = result.get("qualified_name") or repr(sorted(result.items()))
@@ -175,31 +198,49 @@ def _merge_candidates(
             pattern, candidate.qualified_name, detail_level="standard",
             max_results=max_results, _store=store_root,
         )
+        sub_results = sub.get("results", [])
+        # Name-only fallback matches are the same for every same-named
+        # candidate: report them once and keep them out of group counts.
+        name_only = sum(1 for r in sub_results if r.get("target_resolution") == "unresolved")
         groups.append({
             "name": _sanitize_name(candidate.name),
             "qualified_name": _sanitize_name(candidate.qualified_name),
             "parent_name": _sanitize_name(candidate.parent_name)
             if candidate.parent_name else candidate.parent_name,
             "line_start": candidate.line_start,
-            "result_count": sub.get("result_count", 0),
+            "result_count": sub.get("result_count", 0) - name_only,
         })
         via = (
             _overload_label(candidate) if overload_set
             else _sanitize_name(candidate.qualified_name)
         )
-        for result in sub.get("results", []):
-            add(result, via)
-        edges.extend(sub.get("edges", []))
+        for result in sub_results:
+            unresolved = result.get("target_resolution") == "unresolved"
+            add(result, "name_only" if unresolved else via)
+        for edge in sub.get("edges", []):
+            edge_key = repr(sorted(edge.items()))
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                edges.append(edge)
 
     if overload_set and pattern == "callers_of":
         store = store_root[0]
         overload_qns = {c.qualified_name for c in candidates}
         first = candidates[0]
-        for edge in store.iter_edges_by_target_name(
+        # Unbound calls keep the bare name (C++) or the Java base name ``C.m``.
+        bare_edges = list(store.iter_edges_by_target_name(
             first.name, language=first.language or None,
-        ):
+        ))
+        for base in sorted({c.qualified_name.split("(", 1)[0] for c in candidates}):
+            if "::" in base and base not in overload_qns:
+                bare_edges.extend(store.iter_edges_by_target(base))
+        for edge in bare_edges:
             ambiguous = edge.extra.get("ambiguous_targets")
-            if not isinstance(ambiguous, list) or not set(ambiguous) <= overload_qns:
+            if (
+                edge.kind != "CALLS"
+                or not isinstance(ambiguous, list)
+                or not set(ambiguous) <= overload_qns
+            ):
                 continue
             caller = store.get_node(edge.source_qualified)
             if caller:
@@ -463,11 +504,14 @@ def query_graph(
         raw_config_target = pattern == "consumers_of" and "::" not in target
         if pattern != "file_summary" and not raw_config_target:
             node = store.get_node(target)
+            abs_target = normalize_file_path(root / target)
             if not node:
-                abs_target = normalize_file_path(root / target)
                 node = store.get_node(abs_target)
             if not node:
-                java_candidates = _java_fqn_candidates(store, target)
+                overloads = _overload_nodes(store, target) or _overload_nodes(store, abs_target)
+                java_candidates = (
+                    overloads if overloads else _java_fqn_candidates(store, target)
+                )
                 candidates = (
                     java_candidates
                     if java_candidates is not None
@@ -494,7 +538,9 @@ def query_graph(
                     )
                     ranked = _rank_disambiguation_candidates(candidates, target)
                     bare_name = (
-                        target.rsplit(".", 1)[-1] if java_candidates is not None else target
+                        candidates[0].name if overloads
+                        else target.rsplit(".", 1)[-1] if java_candidates is not None
+                        else target
                     )
                     if (
                         pattern in _MERGE_PATTERNS
@@ -578,7 +624,10 @@ def query_graph(
                         )
                     ):
                         continue
-                    if cpp_overload_count > 1:
+                    # Neither a bare name proves which overload was called.
+                    if cpp_overload_count > 1 or (
+                        node.language == "java" and node.qualified_name.endswith(")")
+                    ):
                         continue
                     if e.source_qualified not in seen_sources:
                         seen_sources.add(e.source_qualified)

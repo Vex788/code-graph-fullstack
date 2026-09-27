@@ -55,6 +55,29 @@ def test_same_method_in_two_java_classes_is_answered_per_candidate(tmp_path):
     assert len(result["candidates"]) == 2
 
 
+def test_name_only_fallback_callers_are_tagged_once_and_not_counted(tmp_path):
+    root, store = _make_repo(tmp_path)
+    try:
+        for module in ("a.py", "b.py"):
+            store.upsert_node(_function(root, module, "helper", language="python"))
+        store.upsert_node(_function(root, "c.py", "caller", language="python"))
+        store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f"{root / 'c.py'}::caller", target="helper",
+            file_path=str(root / "c.py"), line=12,
+        ))
+        store.commit()
+    finally:
+        store.close()
+
+    result = query_graph("callers_of", "helper", str(root))
+
+    assert result["resolution"] == "per_candidate"
+    assert [(r["name"], r["via"]) for r in result["results"]] == [("caller", "name_only")]
+    assert [g["result_count"] for g in result["groups"]] == [0, 0]
+    assert result["result_count"] == 1
+    assert len(result["edges"]) == 1
+
+
 def test_cpp_overload_set_unions_callers_including_ambiguous_calls(tmp_path):
     source_path = tmp_path / "IWorkspace.cpp"
     source_path.write_text(

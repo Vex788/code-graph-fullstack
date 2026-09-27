@@ -55,6 +55,10 @@ CONTAINS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorI
 CONTAINS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean.save	now
 CONTAINS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean.load	now
 CONTAINS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean.list	now
+CONTAINS	src/main/java/com/acme/model/Money.java	src/main/java/com/acme/model/Money.java::Money	now
+CONTAINS	src/main/java/com/acme/model/Money.java::Money	src/main/java/com/acme/model/Money.java::Money.plus	now
+CONTAINS	src/main/java/com/acme/model/Money.java::Money	src/main/java/com/acme/model/Money.java::Money.format	now
+CONTAINS	src/main/java/com/acme/dao/UserDao.java::UserDao	src/main/java/com/acme/dao/UserDao.java::UserDao$1	now
 INCLUDES	web/WEB-INF/jsp/order/view.jsp	web/WEB-INF/jsp/common/header.jspf	now
 INCLUDES	web/WEB-INF/jsp/order/view.jsp	web/WEB-INF/jsp/common/footer.jspf	now
 INCLUDES	web/WEB-INF/jsp/user/list.jsp	web/WEB-INF/jsp/common/header.jspf	now
@@ -64,10 +68,6 @@ REFERENCES	web/WEB-INF/jsp/common/header.jspf	web/js/common.js	now
 REFERENCES	web/WEB-INF/jsp/user/list.jsp	web/js/user.js	now
 REFERENCES	web/js/invoice.js::loadInvoice	web/js/invoice.js::renderInvoiceTotal	now
 RENDERS	web/WEB-INF/jsp/order/view.jsp	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	now
-CONTAINS	src/main/java/com/acme/model/Money.java	src/main/java/com/acme/model/Money.java::Money	target
-CONTAINS	src/main/java/com/acme/model/Money.java::Money	src/main/java/com/acme/model/Money.java::Money.plus	target
-CONTAINS	src/main/java/com/acme/model/Money.java::Money	src/main/java/com/acme/model/Money.java::Money.format	target
-CONTAINS	src/main/java/com/acme/dao/UserDao.java::UserDao	src/main/java/com/acme/dao/UserDao.java::UserDao$1	target
 INJECTS	src/main/java/com/acme/web/action/VendorInvoiceActionBean.java::VendorInvoiceActionBean	src/main/java/com/acme/service/InvoiceService.java::InvoiceService	target
 INJECTS	src/main/java/com/acme/web/action/UserListActionBean.java::UserListActionBean	src/main/java/com/acme/service/UserService.java::UserService	target
 INJECTS	src/main/java/com/acme/web/action/OrderActionBean.java::OrderActionBean	src/main/java/com/acme/service/OrderService.java::OrderService	target

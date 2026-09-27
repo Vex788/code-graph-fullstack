@@ -17,7 +17,6 @@ from ._golden import GraphEdges, load_rows
 from .conftest import FIXTURE_SRC, GOLDEN_TSV, open_store
 
 _TARGET_REASONS = {
-    "CONTAINS": "W3a: records and anonymous classes (Outer$1) get Class nodes",
     "INJECTS": "W3a: @SpringBean fields emit INJECTS",
     "HANDLES": "W5a: @HandlesEvent/@DefaultHandler bind to the @UrlBinding endpoint",
     "FORWARDS_TO": "W5a: ForwardResolution/RedirectResolution edges",

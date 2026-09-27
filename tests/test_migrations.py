@@ -273,7 +273,8 @@ def test_v9_db_upgrades_to_v10(tmp_path):
         triggers = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall()}
         assert set(FTS_TRIGGERS) <= triggers
-        assert _meta(conn, "index_generation") == str(INDEX_GENERATION)
+        # built by the legacy indexer: generation 1, so the next update rebuilds
+        assert _meta(conn, "index_generation") == "1"
         assert _meta(conn, "reader_compat") == str(READER_COMPAT)
         assert _meta(conn, "min_writer_version") == str(MIN_WRITER_VERSION)
         assert _meta(conn, "write_epoch_open") == _meta(conn, "write_epoch_closed")
@@ -285,7 +286,7 @@ def test_v10_generation_from_legacy_key(tmp_path):
     cases = [
         ("legacy", populated, "1", 1),
         ("unknown", populated, None, 0),
-        ("empty", (), None, 1),
+        ("empty", (), None, INDEX_GENERATION),
     ]
     for label, nodes, legacy, expected in cases:
         db = tmp_path / f"{label}.db"
@@ -299,7 +300,7 @@ def test_index_generation_falls_back_to_legacy_key():
     conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     assert get_index_generation(conn) is None
     conn.execute("INSERT INTO metadata VALUES ('cpp_identity_version', '1')")
-    assert get_index_generation(conn) == INDEX_GENERATION
+    assert get_index_generation(conn) == 1
     conn.close()
 
 

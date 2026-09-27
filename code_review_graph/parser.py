@@ -1856,6 +1856,39 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     return modules
 
 
+def java_arity_matches(qualified: str, arg_count: int) -> bool:
+    """Whether a Java method identity accepts *arg_count* arguments.
+
+    Only overloads carry ``(T1,T2)``; a bare identity says nothing about
+    arity. A trailing array parameter may be varargs.
+    """
+    tail = qualified.rsplit("::", 1)[-1]
+    open_paren = tail.find("(")
+    if open_paren < 0 or not tail.endswith(")"):
+        return True
+    params = tail[open_paren + 1:-1]
+    types = params.split(",") if params else []
+    if arg_count == len(types):
+        return True
+    return bool(types) and types[-1].endswith("[]") and arg_count >= len(types) - 1
+
+
+def java_overload_candidates(
+    entries: list[tuple[str, Optional[str]]],
+    scope: Optional[str],
+    arg_count: int,
+) -> list[str]:
+    """Narrow same-named Java methods by the caller's class, then by arity."""
+    candidates = [qualified for qualified, parent in entries if parent == scope]
+    if not candidates:
+        candidates = [qualified for qualified, _ in entries]
+    if len(candidates) > 1:
+        by_arity = [q for q in candidates if java_arity_matches(q, arg_count)]
+        if by_arity:
+            candidates = by_arity
+    return candidates
+
+
 def _is_test_file(path: str, repo_root: Optional[Path] = None) -> bool:
     """Classify *path* by test naming; relative to *repo_root* when given.
 
@@ -4761,6 +4794,7 @@ class CodeParser:
 
         is_cpp = any(node.language == "cpp" for node in nodes)
         is_go = any(node.language == "go" for node in nodes)
+        is_java = any(node.language == "java" for node in nodes)
 
         def cpp_resolution_extra(
             extra: dict,
@@ -4964,6 +4998,26 @@ class CodeParser:
             ):
                 entries = candidate_entries(edge.target, edge.kind)
                 candidates = [qualified for qualified, _ in entries]
+                if (
+                    is_java
+                    and len(entries) > 1
+                    and isinstance(edge.extra.get("arg_count"), int)
+                ):
+                    candidates = java_overload_candidates(
+                        callable_symbols.get(edge.target) or entries,
+                        source_scopes.get(edge.source),
+                        edge.extra["arg_count"],
+                    )
+                    if len(candidates) > 1:
+                        resolved.append(EdgeInfo(
+                            kind=edge.kind,
+                            source=edge.source,
+                            target=edge.target,
+                            file_path=edge.file_path,
+                            line=edge.line,
+                            extra=cpp_resolution_extra(edge.extra, "ambiguous", candidates),
+                        ))
+                        continue
                 if is_cpp and entries:
                     source_scope = source_scopes.get(edge.source)
                     preferred_scopes: list[Optional[str]] = []
@@ -6614,6 +6668,18 @@ class CodeParser:
                 # `call` covers both `require` and method invocation). If it
                 # was not an import, fall through to call extraction below
                 # rather than dropping it.
+
+            # --- Java anonymous classes (new T() { ... }) ---
+            if (
+                language == "java"
+                and node_type == "object_creation_expression"
+                and self._extract_java_anonymous_class(
+                    child, source, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                )
+            ):
+                continue
 
             # --- Calls ---
             if node_type in call_types:
@@ -9816,6 +9882,177 @@ class CodeParser:
         package = import_map.get(_JAVA_PACKAGE_KEY, "")
         return f"{package}.{normalized}" if package else normalized
 
+    _JAVA_NAMED_TYPE_DECLARATIONS = frozenset({
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "annotation_type_declaration",
+    })
+
+    def _extract_java_anonymous_class(
+        self,
+        creation,
+        source: bytes,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Give ``new T() { ... }`` a Class node named like javac: ``Outer$N``."""
+        body = next((c for c in creation.children if c.type == "class_body"), None)
+        if body is None or not enclosing_class:
+            return False
+        # The constructor call itself belongs to the enclosing scope.
+        self._extract_calls(
+            creation, source, "java", file_path, nodes, edges,
+            enclosing_class, enclosing_func, import_map, defined_names, _depth,
+        )
+        name = f"{enclosing_class}${self._java_anonymous_index(creation)}"
+        qualified = self._qualify(name, file_path, None)
+        line = creation.start_point[0] + 1
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=name,
+            file_path=file_path,
+            line_start=line,
+            line_end=creation.end_point[0] + 1,
+            language="java",
+            extra={"anonymous": True},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=self._qualify(enclosing_class, file_path, None),
+            target=qualified,
+            file_path=file_path,
+            line=line,
+        ))
+        type_node = creation.child_by_field_name("type")
+        base = self._java_erased_type_name(type_node) if type_node is not None else None
+        if base:
+            edges.append(EdgeInfo(
+                kind="INHERITS",
+                source=qualified,
+                target=self._resolve_java_type_target(
+                    base, file_path, import_map or {}, defined_names or set(),
+                ),
+                file_path=file_path,
+                line=line,
+            ))
+        for part in creation.children:
+            if part.type == "argument_list":
+                self._extract_from_tree(
+                    part, source, "java", file_path, nodes, edges,
+                    enclosing_class=enclosing_class, enclosing_func=enclosing_func,
+                    import_map=import_map, defined_names=defined_names,
+                    _depth=_depth + 1,
+                )
+        self._extract_from_tree(
+            body, source, "java", file_path, nodes, edges,
+            enclosing_class=name, enclosing_func=None,
+            import_map=import_map, defined_names=defined_names,
+            _depth=_depth + 1,
+        )
+        return True
+
+    @classmethod
+    def _java_anonymous_index(cls, creation) -> int:
+        """1-based source-order index among the enclosing class's anonymous classes."""
+        container = creation.parent
+        while container is not None and not (
+            container.type in cls._JAVA_NAMED_TYPE_DECLARATIONS
+            or (
+                container.type == "class_body"
+                and container.parent is not None
+                and container.parent.type == "object_creation_expression"
+            )
+        ):
+            container = container.parent
+        if container is None:
+            return 1
+        index = 0
+        stack = list(reversed(container.children))
+        while stack:
+            node = stack.pop()
+            if node.type in cls._JAVA_NAMED_TYPE_DECLARATIONS:
+                continue
+            children = node.children
+            if node.type == "object_creation_expression" and any(
+                c.type == "class_body" for c in children
+            ):
+                index += 1
+                if node.start_byte == creation.start_byte and node.end_byte == creation.end_byte:
+                    return index
+                # A nested body numbers its own anonymous classes.
+                children = [c for c in children if c.type != "class_body"]
+            stack.extend(reversed(children))
+        return index + 1
+
+    _JAVA_CALLABLE_TYPES = frozenset({
+        "method_declaration", "constructor_declaration", "compact_constructor_declaration",
+    })
+
+    @classmethod
+    def _java_method_identity(cls, node, name: str) -> str:
+        """``name`` or, for an overloaded name, ``name(T1,T2)`` with erased types.
+
+        Only overloads carry a signature so a method's identity stays stable
+        until a same-named sibling appears in its class body.
+        """
+        parent = node.parent
+        name_bytes = name.encode("utf-8")
+        same_named = 0
+        for sibling in parent.children if parent is not None else ():
+            if sibling.type not in cls._JAVA_CALLABLE_TYPES:
+                continue
+            sibling_name = sibling.child_by_field_name("name")
+            if sibling_name is not None and sibling_name.text == name_bytes:
+                same_named += 1
+                if same_named > 1:
+                    break
+        if same_named < 2:
+            return name
+        return f"{name}({','.join(cls._java_parameter_types(node))})"
+
+    @classmethod
+    def _java_parameter_types(cls, node) -> list[str]:
+        """Erased simple parameter type names; varargs become arrays."""
+        parameters = node.child_by_field_name("parameters")
+        if parameters is None:
+            return []
+        types: list[str] = []
+        for param in parameters.named_children:
+            if param.type == "formal_parameter":
+                type_node = param.child_by_field_name("type")
+                suffix = ""
+            elif param.type == "spread_parameter":
+                type_node = next(
+                    (
+                        sub for sub in param.named_children
+                        if sub.type not in ("modifiers", "variable_declarator")
+                    ),
+                    None,
+                )
+                suffix = "[]"
+            else:
+                continue
+            if type_node is not None:
+                types.append(cls._java_erased_simple_type(type_node) + suffix)
+        return types
+
+    @classmethod
+    def _java_erased_simple_type(cls, node) -> str:
+        """``java.util.List<String>[]`` -> ``List[]``."""
+        if node.type == "array_type":
+            element = node.child_by_field_name("element")
+            dimensions = node.child_by_field_name("dimensions")
+            dims = "[]" * dimensions.text.count(b"[") if dimensions is not None else "[]"
+            return (cls._java_erased_simple_type(element) if element else "?") + dims
+        erased = cls._java_erased_type_name(node)
+        text = erased or node.text.decode("utf-8", errors="replace")
+        return text.rsplit(".", 1)[-1].strip()
+
     @staticmethod
     def _java_erased_type_name(node) -> Optional[str]:
         """Return a Java type as written minus type arguments, or None."""
@@ -10619,6 +10856,8 @@ class CodeParser:
                 container_scope = enclosing_class
             if cpp_params is not None:
                 params = cpp_params
+        elif language == "java":
+            identity_name = self._java_method_identity(child, name)
 
         qualified = self._qualify(identity_name, file_path, parent_name)
         ret_type = self._get_return_type(child, language, source)
@@ -10983,6 +11222,13 @@ class CodeParser:
                         call_extra["go_method_receiver"] = True
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
+                if language == "java" and child.type == "method_invocation":
+                    arguments = child.child_by_field_name("arguments")
+                    if arguments is not None:
+                        call_extra["arg_count"] = sum(
+                            1 for arg in arguments.named_children
+                            if arg.type not in ("line_comment", "block_comment")
+                        )
                 if language == "java" and not receiver and child.type == "method_invocation":
                     obj = child.child_by_field_name("object")
                     # ``verify(s).save()`` / ``super.save()``: the method is not

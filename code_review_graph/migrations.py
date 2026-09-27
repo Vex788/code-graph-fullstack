@@ -20,9 +20,11 @@ logger = logging.getLogger(__name__)
 
 # Graph content generation. Bump when an indexer change needs a full rebuild.
 # Replaces the ``cpp_identity_version`` key, which is still read for compat.
-INDEX_GENERATION = 1
+INDEX_GENERATION = 2
 _LEGACY_GENERATION_KEY = "cpp_identity_version"
 _LEGACY_GENERATION_VALUE = "1"
+# The generation a graph stamped only with the legacy key was built at.
+_LEGACY_INDEX_GENERATION = 1
 
 # Oldest schema a reader must understand to read a database written at the
 # latest schema. v10 only drops indexes and adds a column and triggers, so a
@@ -500,7 +502,7 @@ def get_index_generation(conn: sqlite3.Connection) -> Optional[int]:
         value = _get_meta(conn, "index_generation")
         if value is None:
             legacy = _get_meta(conn, _LEGACY_GENERATION_KEY)
-            return INDEX_GENERATION if legacy == _LEGACY_GENERATION_VALUE else None
+            return _LEGACY_INDEX_GENERATION if legacy == _LEGACY_GENERATION_VALUE else None
         return int(value)
     except (sqlite3.OperationalError, ValueError):
         return None
@@ -530,11 +532,12 @@ def _migrate_v10(conn: sqlite3.Connection) -> None:
     legacy = _get_meta(conn, _LEGACY_GENERATION_KEY)
     has_nodes = conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone() is not None
     # A populated graph without the identity key came from an older indexer.
-    generation = (
-        INDEX_GENERATION
-        if legacy == _LEGACY_GENERATION_VALUE or not has_nodes
-        else 0
-    )
+    if not has_nodes:
+        generation = INDEX_GENERATION
+    elif legacy == _LEGACY_GENERATION_VALUE:
+        generation = _LEGACY_INDEX_GENERATION
+    else:
+        generation = 0
     conn.executemany(
         "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
         [

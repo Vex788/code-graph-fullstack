@@ -44,7 +44,6 @@ def test_hibernate_session_save_is_not_a_caller_of_user_dao(built_fixture: Path)
     assert false_callers == set()
 
 
-@pytest.mark.xfail(strict=True, reason="W3a: Java overloads collapse into one node")
 def test_user_dao_save_overloads_are_distinct_nodes(built_fixture: Path):
     rows = _rows(
         built_fixture,

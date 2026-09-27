@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from typing import TYPE_CHECKING
+
+from .parser import java_arity_matches
 
 if TYPE_CHECKING:
     from .graph import GraphStore
@@ -36,10 +39,104 @@ def resolve_spring_di_calls(store: GraphStore) -> dict:
     """Resolve Java CALLS edges whose receiver is a Spring-injected field.
 
     Safe to call multiple times — already-resolved edges (targets containing
-    ``::``) are skipped.
+    ``::``) are skipped. Afterwards, calls aimed at an overloaded method's
+    base name are bound to one overload (see :func:`bind_java_overload_targets`).
 
     Returns a dict with resolution counts for telemetry.
     """
+    stats = _resolve_injected_receivers(store)
+    stats["overloads_bound"] = bind_java_overload_targets(store._conn)
+    return stats
+
+
+def _overload_base(qualified: str) -> str | None:
+    """``f::C.save(User)`` -> ``f::C.save``; None for a non-overload identity."""
+    paren = qualified.find("(", qualified.rfind("::") + 2)
+    return qualified[:paren] if paren > 0 and qualified.endswith(")") else None
+
+
+def bind_java_overload_targets(conn: sqlite3.Connection) -> int:
+    """Bind Java CALLS targeting ``C.m`` to the overload ``C.m(T..)`` their arity fits.
+
+    The parser resolves cross-file calls to ``file::Class.method`` without
+    seeing the target file, so an overloaded method's callers point at a
+    name no node carries. One arity match binds; several keep the base name
+    with ``ambiguous_targets``. ``java_overload`` marks the edge so it
+    re-binds when the overload set changes.
+    """
+    overloads: dict[str, list[str]] = {}
+    for row in conn.execute(
+        "SELECT qualified_name FROM nodes WHERE language = 'java' "
+        "AND kind IN ('Function', 'Test') AND qualified_name LIKE '%)'"
+    ):
+        base = _overload_base(row[0])
+        if base:
+            overloads.setdefault(base, []).append(row[0])
+
+    select = (
+        "SELECT id, source_qualified, target_qualified, file_path, line, extra "
+        "FROM edges WHERE kind = 'CALLS' AND "
+    )
+    rows = {
+        row[0]: row
+        for base in overloads
+        for row in conn.execute(select + "target_qualified = ?", (base,))
+    }
+    for row in conn.execute(select + "extra LIKE '%\"java_overload\"%'"):
+        rows.setdefault(row[0], row)
+
+    changed = 0
+    for edge_id, source, target, file_path, line, raw_extra in rows.values():
+        try:
+            extra = json.loads(raw_extra or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(extra, dict):
+            continue
+        base = (_overload_base(target) if extra.get("java_overload") else None) or target
+        candidates = sorted(overloads.get(base, []))
+        arg_count = extra.get("arg_count")
+        if candidates and isinstance(arg_count, int):
+            candidates = [q for q in candidates if java_arity_matches(q, arg_count)] or candidates
+        new_extra = {
+            key: value for key, value in extra.items()
+            if key not in (
+                "java_overload", "ambiguous_targets",
+                "ambiguous_target_count", "ambiguous_targets_truncated",
+            )
+        }
+        if len(candidates) == 1:
+            new_target = candidates[0]
+            new_extra["java_overload"] = True
+        elif candidates:
+            new_target = base
+            new_extra.update({
+                "java_overload": True,
+                "ambiguous_targets": candidates[:20],
+                "ambiguous_target_count": len(candidates),
+                "ambiguous_targets_truncated": len(candidates) > 20,
+            })
+        else:
+            # The overload set is gone: the base is a plain method again.
+            new_target = base
+        if new_target == target and new_extra == extra:
+            continue
+        serialized = json.dumps(new_extra)
+        conn.execute(
+            "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+            (new_target, serialized, edge_id),
+        )
+        # Tests' TESTED_BY mirrors copy the CALLS target as their source.
+        conn.execute(
+            "UPDATE edges SET source_qualified = ?, extra = ? WHERE kind = 'TESTED_BY' "
+            "AND source_qualified = ? AND target_qualified = ? AND file_path = ? AND line = ?",
+            (new_target, serialized, target, source, file_path, line),
+        )
+        changed += 1
+    return changed
+
+
+def _resolve_injected_receivers(store: GraphStore) -> dict:
     conn = store._conn
 
     # Only process Java files
