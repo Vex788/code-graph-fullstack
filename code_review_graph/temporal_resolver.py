@@ -45,6 +45,11 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
 
     Returns a dict with resolution counts for telemetry.
     """
+    with store.transaction():
+        return _resolve_temporal_calls(store)
+
+
+def _resolve_temporal_calls(store: GraphStore) -> dict:
     conn = store._conn
 
     java_files: set[str] = {
@@ -183,9 +188,6 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
             "Temporal resolved: %s → %s (receiver=%s, interface=%s)",
             source_qual, new_target, receiver, interface_bare,
         )
-
-    if resolved:
-        conn.commit()
 
     logger.info("Temporal resolver: resolved %d CALLS edges in %d Java files",
                 resolved, len(java_files))

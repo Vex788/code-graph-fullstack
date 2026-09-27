@@ -369,7 +369,6 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     html_pages = _graph_pages(conn, "html")
     scripts = _graph_scripts(conn)
     if not jsp_pages and not html_pages and not scripts:
-        conn.commit()
         store._invalidate_cache()
         return dict(_STATS_ZERO)
 
@@ -545,7 +544,6 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         edge_rows,
     )
-    conn.commit()
     store._invalidate_cache()
 
     result = {

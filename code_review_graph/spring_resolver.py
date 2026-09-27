@@ -44,8 +44,9 @@ def resolve_spring_di_calls(store: GraphStore) -> dict:
 
     Returns a dict with resolution counts for telemetry.
     """
-    stats = _resolve_injected_receivers(store)
-    stats["overloads_bound"] = bind_java_overload_targets(store._conn)
+    with store.transaction():
+        stats = _resolve_injected_receivers(store)
+        stats["overloads_bound"] = bind_java_overload_targets(store._conn)
     return stats
 
 
@@ -359,9 +360,6 @@ def _resolve_injected_receivers(store: GraphStore) -> dict:
             "Spring resolved: %s → %s (was %s, receiver=%s)",
             source_qual, new_target, method_name, receiver,
         )
-
-    if resolved:
-        conn.commit()
 
     logger.info("Spring DI resolver: resolved %d CALLS edges in %d Java files",
                 resolved, len(java_files))
