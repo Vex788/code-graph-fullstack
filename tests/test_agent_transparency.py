@@ -401,11 +401,13 @@ def test_semantic_search_minimal_reports_hidden_returned_results(tmp_path):
     finally:
         store.close()
 
+    # Minimal mode honours the caller's limit instead of a fixed 5.
     result = semantic_search_nodes(
-        "do_thing", limit=10, repo_root=str(root), detail_level="minimal",
+        "do_thing", limit=3, repo_root=str(root), detail_level="minimal",
     )
-    assert len(result["results"]) == 5
-    assert result["results_omitted"] == 5
+    assert len(result["results"]) == 3
+    assert result["results_omitted"] == 0
+    assert result["result_count"] == 3
 
 
 def test_impact_minimal_reports_nodes_omitted(tmp_path, monkeypatch):

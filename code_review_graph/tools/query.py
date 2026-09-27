@@ -1087,17 +1087,23 @@ def semantic_search_nodes(
         detail_level: "standard" (full output) or "minimal" (summary only).
 
     Returns:
-        Ranked list of matching nodes.
+        Ranked list of matching nodes, the ``search_mode`` that produced them,
+        ``embeddings_state`` (off|ready|stale|unavailable) and a ``warning``
+        whenever semantic search was wanted but keyword search answered alone.
     """
     store, root = _get_store(repo_root)
     try:
         mode_out: list[str] = []
+        info: dict[str, Any] = {}
         results = hybrid_search(
             store, query, kind=kind, limit=limit, context_files=context_files,
             model=model, provider=provider, _out_mode=mode_out,
+            repo_root=str(root), _out_info=info,
         )
 
         search_mode = mode_out[0] if mode_out else "keyword"
+        embeddings_state = info.get("embeddings_state", "off")
+        warning = info.get("warning")
 
         summary = f"Found {len(results)} node(s) matching '{query}'" + (
             f" (kind={kind})" if kind else ""
@@ -1116,17 +1122,20 @@ def semantic_search_nodes(
                     for k in ("name", "kind", "file_path", "score")
                     if k in r
                 }
-                for r in results[:5]
+                for r in results[:limit]
             ]
             minimal_response: dict[str, Any] = {
                 "status": "ok",
                 "query": query,
                 "search_mode": search_mode,
+                "embeddings_state": embeddings_state,
                 "summary": summary,
                 "results": minimal_results,
                 "result_count": len(results),
                 "results_omitted": max(0, len(results) - len(minimal_results)),
             }
+            if warning:
+                minimal_response["warning"] = warning
             if confidence:
                 minimal_response["confidence"] = confidence
             return minimal_response
@@ -1135,9 +1144,12 @@ def semantic_search_nodes(
             "status": "ok",
             "query": query,
             "search_mode": search_mode,
+            "embeddings_state": embeddings_state,
             "summary": summary,
             "results": results,
         }
+        if warning:
+            result["warning"] = warning
         if confidence:
             result["confidence"] = confidence
         result["_hints"] = generate_hints(
