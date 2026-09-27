@@ -2998,6 +2998,45 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
         handler.dispatch(DirDeletedEvent(path))
 
 
+# Coarse filesystem timestamps can trail time.time() slightly.
+_STARTUP_WINDOW_SLACK_SECONDS = 1.0
+
+
+def _paths_changed_since(
+    repo_root: Path, ignore_patterns: list[str], since: float,
+) -> list[Path]:
+    """Files modified after *since*, plus every file of a directory changed after it.
+
+    A directory's mtime covers files moved in with their old timestamps.
+    Ignored trees and symlinked directories are not walked.
+    """
+    threshold = since - _STARTUP_WINDOW_SLACK_SECONDS
+    changed: list[Path] = []
+    for directory, dirnames, filenames in os.walk(repo_root):
+        base = Path(directory)
+        relative = base.relative_to(repo_root)
+        dirnames[:] = [
+            name for name in dirnames
+            if name != ".git"
+            and not (base / name).is_symlink()
+            and not _should_ignore((relative / name).as_posix(), ignore_patterns)
+        ]
+        try:
+            fresh_directory = base.stat().st_mtime >= threshold
+        except OSError:
+            continue
+        for name in filenames:
+            path = base / name
+            if _should_ignore((relative / name).as_posix(), ignore_patterns):
+                continue
+            try:
+                if fresh_directory or path.lstat().st_mtime >= threshold:
+                    changed.append(path)
+            except OSError:
+                continue
+    return changed
+
+
 def _install_sigterm_interrupt() -> Callable[[], None]:
     """Make SIGTERM unwind like Ctrl+C, and return an undo callable.
 
@@ -3051,17 +3090,18 @@ def watch(
         RuntimeError: if a watch update fails, or if the filesystem observer
             stops running.
     """
-    from watchdog.events import DirCreatedEvent, DirDeletedEvent
+    from watchdog.events import DirCreatedEvent, DirDeletedEvent, FileModifiedEvent
     from watchdog.observers import Observer
 
     # One boundary, once: ``--repo .`` reaches here relative, and every path
     # comparison below — stored file paths, watch keys, event paths — assumes
     # they are all spelled the same way.
     repo_root = _canonical_repo_root(repo_root)
+    ignore_patterns = _load_ignore_patterns(repo_root)
     supervisor = _WatchSupervisor(
         None,
         repo_root,
-        _load_ignore_patterns(repo_root),
+        ignore_patterns,
         health_path=_watch_health_path(repo_root),
     )
     # The first build of a large repository takes minutes.  Without a
@@ -3071,6 +3111,7 @@ def watch(
 
     # Edits made while no watcher ran produce no events: reconcile against
     # the last stamped commit plus a drift and stale-file sweep.
+    reconcile_started = time.time()
     initial = incremental_update(
         repo_root,
         store,
@@ -3087,6 +3128,10 @@ def watch(
     supervisor.schedule_initial(handler)
     handler.start()
     observer.start()
+    # What changed after the reconciliation looked and before the observer
+    # listened produced no event; replay it through the debouncer.
+    for path in _paths_changed_since(repo_root, ignore_patterns, reconcile_started):
+        handler.dispatch(FileModifiedEvent(str(path)))
     supervisor.report_health(observer_alive=True, force=True)
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
