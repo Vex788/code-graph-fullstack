@@ -634,3 +634,74 @@ class TestFlows:
             "WHERE f.id IS NULL"
         ).fetchall()
         assert len(orphans) == 0, f"found {len(orphans)} orphaned memberships"
+
+
+class TestAnchoredEntryPoints:
+    """Decorator patterns match whole decorator names; Stripes handlers are entries."""
+
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    def _called(self, name: str, decorators: list[str], **kwargs) -> str:
+        """Add a method that something calls, so only its decorators can make it an entry."""
+        path = kwargs.pop("path", "A.java")
+        node = NodeInfo(
+            kind="Function", name=name, file_path=path, line_start=1, line_end=2,
+            language=kwargs.pop("language", "java"), parent_name=kwargs.pop("parent", "A"),
+            extra={"decorators": decorators}, **kwargs,
+        )
+        self.store.upsert_node(node)
+        qualified = f"{path}::{node.parent_name}.{name}" if node.parent_name else f"{path}::{name}"
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source="Caller.java::Caller.run", target=qualified,
+            file_path="Caller.java", line=1,
+        ))
+        self.store.commit()
+        return qualified
+
+    def _entries(self) -> set[str]:
+        return {n.qualified_name for n in detect_entry_points(self.store)}
+
+    def test_substrings_and_bare_override_are_not_entries(self):
+        plain = {
+            self._called("getContext", ["Override"]),
+            self._called("props", ["ConfigurationProperties"]),
+            self._called("tx", ["Transactional"]),
+            self._called("find", ["NamedQueryHint"]),
+        }
+        assert plain.isdisjoint(self._entries())
+
+    def test_framework_decorators_still_match(self):
+        entries = {
+            self._called("index", ["app.get(\"/\")"], language="python", parent=None, path="a.py"),
+            self._called("cases", ["pytest.mark.parametrize(\"x\", [1])"],
+                         language="python", parent=None, path="t.py"),
+            self._called("dataSource", ["org.springframework.context.annotation.Bean"]),
+            self._called("view", ["DefaultHandler"]),
+            self._called("save", ["HandlesEvent(\"save\")"]),
+        }
+        assert entries <= self._entries()
+
+    def test_resolution_methods_on_action_beans_are_entries(self):
+        for source, target in (
+            ("Base.java::Base", "ActionBean"),
+            ("Order.java::Order", "Base.java::Base"),
+        ):
+            self.store.upsert_edge(EdgeInfo(
+                kind="INHERITS", source=source, target=target, file_path=source[:-6], line=1,
+            ))
+        handler = self._called("place", [], path="Order.java", parent="Order",
+                               return_type="Resolution")
+        helper = self._called("total", [], path="Order.java", parent="Order", return_type="long")
+        elsewhere = self._called("go", [], path="Other.java", parent="Other",
+                                 return_type="Resolution")
+        entries = self._entries()
+        assert handler in entries
+        assert helper not in entries
+        assert elsewhere not in entries

@@ -30,6 +30,7 @@ def list_flows(
     limit: int = 50,
     kind: str | None = None,
     detail_level: str = "standard",
+    offset: int = 0,
 ) -> dict[str, Any]:
     """List execution flows in the codebase, sorted by criticality.
 
@@ -46,11 +47,16 @@ def list_flows(
         detail_level: "standard" (default) returns full flow data;
                       "minimal" returns only name, criticality, and
                       node_count per flow.
+        offset: Flows to skip in sort order (default 0); pass the previous
+                response's ``next_offset`` for the next page.
 
     Returns:
-        Flows with criticality scores, plus ``total`` and ``truncated``.
+        Flows with criticality scores, plus ``total``, ``truncated`` and
+        ``next_offset`` (None on the last page).
     """
     _validate_positive_int(limit, "limit")
+    if isinstance(offset, bool) or offset < 0:
+        raise ValueError("offset must be an integer greater than or equal to 0")
 
     store, root = _get_store(repo_root)
     try:
@@ -70,7 +76,11 @@ def list_flows(
                         filtered.append(f)
             flows = filtered
 
-        flows, total, truncated = _bounded(flows, limit, _MAX_FLOWS)
+        total = len(flows)
+        flows, _, _ = _bounded(flows[offset:], limit, _MAX_FLOWS)
+        end = offset + len(flows)
+        next_offset = end if end < total else None
+        truncated = next_offset is not None
 
         if detail_level == "minimal":
             flows = [
@@ -91,6 +101,7 @@ def list_flows(
             "flows": flows,
             "total": total,
             "truncated": truncated,
+            "next_offset": next_offset,
         }
         result["_hints"] = generate_hints(
             "list_flows", result, get_session()

@@ -21,6 +21,11 @@ def resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
     exists in the source file's directory. Local module sources are also
     connected to a parsed target file, preferring ``main.tf``.
     """
+    with store.transaction():
+        return _resolve_hcl_module_references(store)
+
+
+def _resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
     conn = store._conn  # intentional: bounded post-build maintenance pass
     node_rows = conn.execute(
         "SELECT name, qualified_name, file_path, kind "
@@ -97,7 +102,6 @@ def resolve_hcl_module_references(store: GraphStore) -> dict[str, int]:
         "UPDATE edges SET target_qualified = ? WHERE id = ?",
         reference_updates + import_updates,
     )
-    conn.commit()
     if reference_updates or import_updates:
         store._invalidate_cache()
 

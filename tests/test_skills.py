@@ -18,7 +18,9 @@ else:  # pragma: no cover - Python 3.10 backport
 from code_review_graph import skills as skills_module
 from code_review_graph.skills import (
     _CLAUDE_MD_SECTION_MARKER,
+    CRG_HOOK_MARKER,
     PLATFORMS,
+    SettingsNotWrittenError,
     _copilot_vscode_detected,
     _cursor_hook_scripts,
     _detect_serve_command,
@@ -376,6 +378,48 @@ class TestShippedHooksFiles:
                 f"hooks.json command lacks the stdin drain prefix: {command!r}"
             )
 
+    def _command(self, event: str, matcher: str) -> str:
+        data = json.loads((self.HOOKS_DIR / "hooks.json").read_text(encoding="utf-8"))
+        entry = next(e for e in data[event] if e["matcher"] == matcher)
+        return entry["hooks"][0]["command"]
+
+    def _run(self, command: str, tmp_path: Path, rc: int | None):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        log = tmp_path / "calls.log"
+        path = f"{bin_dir}:/usr/bin:/bin"
+        if rc is not None:
+            fake = bin_dir / "code-review-graph"
+            fake.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexit {rc}\n')
+            fake.chmod(0o755)
+        result = subprocess.run(
+            ["sh", "-c", command], input="{}", capture_output=True, text=True,
+            env={"PATH": path, "HOME": str(tmp_path)}, cwd=tmp_path, timeout=30,
+        )
+        return result, log
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX hook commands")
+    @pytest.mark.parametrize(("rc", "expected"), [(0, 0), (75, 0), (1, 1), (2, 1), (None, 0)])
+    def test_update_hook_skips_lock_busy_but_reports_failures(self, tmp_path, rc, expected):
+        command = self._command("PostToolUse", "Write|Edit|Bash")
+        result, log = self._run(command, tmp_path, rc)
+        assert result.returncode == expected, result.stderr
+        if rc is not None:
+            assert "--if-locked=skip" in log.read_text()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX hook commands")
+    def test_worktree_build_is_detached_and_guarded(self, tmp_path):
+        command = self._command("PostToolUse", "EnterWorktree")
+        assert "nohup code-review-graph build --if-locked=skip" in command
+        assert command.rstrip().endswith("&")
+        result, _ = self._run(command, tmp_path, None)
+        assert result.returncode == 0
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX hook commands")
+    def test_session_start_without_binary_is_silent(self, tmp_path):
+        result, _ = self._run(self._command("SessionStart", ""), tmp_path, None)
+        assert result.returncode == 0 and not result.stderr
+
     def test_session_start_script_drains_stdin(self):
         script = (self.HOOKS_DIR / "session-start.sh").read_text(encoding="utf-8")
         assert "cat >/dev/null" in script, (
@@ -532,6 +576,237 @@ class TestInstallHooks:
     def test_creates_claude_directory(self, tmp_path):
         install_hooks(tmp_path)
         assert (tmp_path / ".claude").is_dir()
+
+
+class TestSafeSettingsMerge:
+    """The installer never destroys a settings file it cannot rewrite faithfully."""
+
+    JSONC = (
+        "{\n"
+        "  // keep me\n"
+        '  "model": "opus",\n'
+        '  "permissions": {"allow": ["Bash(ls:*)"],},\n'
+        "}\n"
+    )
+
+    def test_jsonc_file_is_left_alone_and_patch_printed(self, tmp_path, capsys):
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(self.JSONC, encoding="utf-8")
+
+        assert install_hooks(tmp_path) == 1
+
+        assert settings.read_text(encoding="utf-8") == self.JSONC
+        assert not (settings.parent / "settings.json.bak").exists()
+        err = capsys.readouterr().err
+        patch_text = err.split("Merge this into it by hand:\n", 1)[1]
+        assert "PostToolUse" in json.loads(patch_text)["hooks"]
+
+    def test_unparsable_file_is_left_alone(self, tmp_path, capsys):
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"model": ', encoding="utf-8")
+
+        assert install_hooks(tmp_path) == 1
+
+        assert settings.read_text(encoding="utf-8") == '{"model": '
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_non_object_hooks_is_left_alone(self, tmp_path):
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"hooks": ["x"]}', encoding="utf-8")
+
+        assert install_hooks(tmp_path) == 1
+        assert settings.read_text(encoding="utf-8") == '{"hooks": ["x"]}'
+
+    def test_reinstall_is_a_no_op(self, tmp_path):
+        assert install_hooks(tmp_path) == 0
+        settings = tmp_path / ".claude" / "settings.json"
+        first = settings.read_text(encoding="utf-8")
+        assert install_hooks(tmp_path) == 0
+        assert settings.read_text(encoding="utf-8") == first
+        assert not (settings.parent / "settings.json.bak").exists()
+        assert [p.name for p in settings.parent.iterdir()] == ["settings.json"]
+
+    def test_older_command_is_replaced_in_place_not_duplicated(self, tmp_path):
+        pre_marker = next(
+            c for c in skills_module.legacy_hook_commands()
+            if "update --skip-flows --repo" in c
+        )
+        older_marked = f"code-review-graph update --old-flag {CRG_HOOK_MARKER}"
+        user_hook = {"matcher": "Edit", "hooks": [{"type": "command", "command": "lint"}]}
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"hooks": {
+            "PostToolUse": [
+                {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": pre_marker}]},
+                user_hook,
+            ],
+            "Stop": [{"hooks": [{"type": "command", "command": older_marked}]}],
+        }}), encoding="utf-8")
+
+        assert install_hooks(tmp_path) == 0
+
+        hooks = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
+        expected = generate_hooks_config(tmp_path)["hooks"]
+        assert hooks["PostToolUse"] == [*expected["PostToolUse"], user_hook]
+        assert hooks["SessionStart"] == expected["SessionStart"]
+        # Our entry under an event we no longer use is dropped, not left stale.
+        assert "Stop" not in hooks
+
+    def test_mixed_group_keeps_user_hook(self, tmp_path):
+        own = generate_hooks_config(tmp_path)["hooks"]["PostToolUse"][0]["hooks"][0]
+        mixed = {"matcher": "Edit|Write", "hooks": [own, {"type": "command", "command": "fmt"}]}
+        settings = tmp_path / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"hooks": {"PostToolUse": [mixed]}}), encoding="utf-8")
+
+        assert install_hooks(tmp_path) == 0
+
+        post = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+        commands = [h["command"] for entry in post for h in entry["hooks"]]
+        assert commands.count(own["command"]) == 1
+        assert "fmt" in commands
+
+    def test_generated_commands_carry_marker(self, tmp_path):
+        for config in (generate_hooks_config(tmp_path), generate_codex_hooks_config(tmp_path)):
+            for entries in config["hooks"].values():
+                for entry in entries:
+                    for hook in entry["hooks"]:
+                        assert hook["command"].endswith(CRG_HOOK_MARKER)
+
+    def test_codex_jsonc_raises_without_writing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("code_review_graph.skills.Path.home", lambda: tmp_path)
+        hooks_path = tmp_path / ".codex" / "hooks.json"
+        hooks_path.parent.mkdir()
+        hooks_path.write_text(self.JSONC, encoding="utf-8")
+        with pytest.raises(SettingsNotWrittenError) as err:
+            install_codex_hooks(tmp_path / "repo")
+        assert err.value.patch is not None
+        assert hooks_path.read_text(encoding="utf-8") == self.JSONC
+
+    def test_codex_upgrade_replaces_pre_marker_entry(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("code_review_graph.skills.Path.home", lambda: tmp_path)
+        hooks_path = tmp_path / ".codex" / "hooks.json"
+        hooks_path.parent.mkdir()
+        old = (
+            "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1"
+            " && code-review-graph update --skip-flows || true"
+        )
+        hooks_path.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "Write|Edit|Bash", "hooks": [{"type": "command", "command": old}]},
+        ]}}), encoding="utf-8")
+        install_codex_hooks(tmp_path / "repo")
+        post = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+        assert post == generate_codex_hooks_config(tmp_path)["hooks"]["PostToolUse"]
+
+    def test_gemini_jsonc_raises_without_writing(self, tmp_path):
+        settings = tmp_path / ".gemini" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(self.JSONC, encoding="utf-8")
+        with pytest.raises(SettingsNotWrittenError):
+            install_gemini_cli_hooks(tmp_path)
+        assert settings.read_text(encoding="utf-8") == self.JSONC
+
+
+def _run_sh(script: Path, env_path: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["sh", str(script)], capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PATH": env_path}, stdin=subprocess.DEVNULL,
+    )
+
+
+def _fake_crg(bin_dir: Path, log: Path, rc: int = 0) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "code-review-graph"
+    fake.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexit {rc}\n', encoding="utf-8")
+    fake.chmod(0o755)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX hook scripts")
+class TestGitHookChaining:
+    @pytest.fixture(autouse=True)
+    def _hermetic_git(self, monkeypatch):
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+
+    def _hook(self, tmp_path: Path, content: str | None = None) -> Path:
+        hook = tmp_path / ".git" / "hooks" / "pre-commit"
+        hook.parent.mkdir(parents=True)
+        if content is not None:
+            hook.write_text(content, encoding="utf-8")
+            hook.chmod(0o755)
+        return hook
+
+    def test_block_goes_before_trailing_exit_and_runs(self, tmp_path):
+        hook = self._hook(tmp_path, "#!/bin/sh\necho user\nexit 0\n")
+        install_git_hook(tmp_path)
+        text = hook.read_text(encoding="utf-8")
+        assert text.index("detect-changes") < text.rindex("exit 0")
+        log = tmp_path / "calls.log"
+        _fake_crg(tmp_path / "bin", log)
+        result = _run_sh(hook, f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+        assert result.returncode == 0
+        assert "detect-changes --brief" in log.read_text()
+
+    def test_exit_status_passthrough_is_preserved(self, tmp_path):
+        hook = self._hook(tmp_path, "#!/bin/sh\nfalse\nexit $?\n")
+        install_git_hook(tmp_path)
+        log = tmp_path / "calls.log"
+        _fake_crg(tmp_path / "bin", log)
+        result = _run_sh(hook, f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+        assert result.returncode == 1
+        assert "update" in log.read_text()
+
+    def test_legacy_block_is_replaced_in_place(self, tmp_path):
+        legacy = (
+            "#!/bin/sh\necho user\n"
+            "#!/bin/sh\n"
+            f"{skills_module.GIT_HOOK_MARKER}\n"
+            "if command -v code-review-graph >/dev/null 2>&1; then\n"
+            "    code-review-graph update || true\n"
+            "    code-review-graph detect-changes --brief || true\n"
+            "fi\n"
+            "echo after\n"
+        )
+        hook = self._hook(tmp_path, legacy)
+        install_git_hook(tmp_path)
+        text = hook.read_text(encoding="utf-8")
+        assert text.count("#!/bin/sh") == 1
+        assert text.count("detect-changes") == 1
+        assert text.index("echo user") < text.index("detect-changes") < text.index("echo after")
+        assert skills_module.GIT_HOOK_END_MARKER in text
+
+    def test_reinstall_is_byte_identical(self, tmp_path):
+        hook = self._hook(tmp_path, "#!/bin/bash\necho user\n")
+        install_git_hook(tmp_path)
+        first = hook.read_text(encoding="utf-8")
+        install_git_hook(tmp_path)
+        assert hook.read_text(encoding="utf-8") == first
+
+    def test_non_shell_hook_is_left_alone(self, tmp_path):
+        original = "#!/usr/bin/env python3\nprint('pre-commit framework')\n"
+        hook = self._hook(tmp_path, original)
+        assert install_git_hook(tmp_path) is None
+        assert hook.read_text(encoding="utf-8") == original
+
+    def test_uninstall_removes_exactly_our_block(self, tmp_path):
+        from code_review_graph import uninstall
+
+        original = "#!/bin/sh\necho user\nexit 0\n"
+        hook = self._hook(tmp_path, original)
+        install_git_hook(tmp_path)
+        report = uninstall.UninstallReport()
+        uninstall._remove_git_hook(tmp_path, report, dry_run=False)
+        assert hook.read_text(encoding="utf-8") == original
+
+    def test_uninstall_removes_file_we_created(self, tmp_path):
+        from code_review_graph import uninstall
+
+        hook = self._hook(tmp_path)
+        install_git_hook(tmp_path)
+        uninstall._remove_git_hook(tmp_path, uninstall.UninstallReport(), dry_run=False)
+        assert not hook.exists()
 
 
 class TestGenerateCodexHooksConfig:
@@ -1733,17 +2008,16 @@ class TestInstallCursorHooks:
             crg_hooks = [h for h in entries if "crg-" in h.get("command", "")]
             assert len(crg_hooks) == 1, f"{event} has {len(crg_hooks)} crg hooks after reinstall"
 
-    def test_handles_corrupt_existing_json(self, tmp_path):
+    def test_leaves_corrupt_existing_json_untouched(self, tmp_path):
         cursor_dir = tmp_path / ".cursor"
         cursor_dir.mkdir(parents=True)
         (cursor_dir / "hooks.json").write_text("not valid json{{{")
 
         with patch("code_review_graph.skills.Path.home", return_value=tmp_path):
-            result = install_cursor_hooks()
+            with pytest.raises(SettingsNotWrittenError):
+                install_cursor_hooks()
 
-        assert result.exists()
-        data = json.loads(result.read_text())
-        assert data["version"] == 1
+        assert (cursor_dir / "hooks.json").read_text() == "not valid json{{{"
 
 
 class TestKiroPlatform:

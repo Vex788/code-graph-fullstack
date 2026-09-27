@@ -7,6 +7,7 @@ Extracts structural nodes (classes, functions, imports, types) and edges
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import html
 import importlib
@@ -452,9 +453,27 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PARSER_LOAD_TIMEOUT_SECONDS = 5.0
 _PARSER_PROBE_RESULTS: dict[str, bool] = {}
+# Failed probes run ahead of use (see probe_grammars) and not yet logged.
+_PARSER_PROBE_UNREPORTED: set[str] = set()
 _PARSER_PROBE_FAILURE_DETAILS: dict[str, str] = {}
 _PARSER_PROBE_LOCK = threading.Lock()
-_EXPECTED_PARSER_LOAD_ERRORS = (ImportError, LookupError, OSError, ValueError)
+
+
+def _language_pack_error_types() -> tuple[type[Exception], ...]:
+    """Return the language pack's base error class when it defines one (1.x)."""
+    try:
+        language_pack = importlib.import_module("tree_sitter_language_pack")
+    except ImportError:
+        return ()
+    error_type = getattr(language_pack, "Error", None)
+    if isinstance(error_type, type) and issubclass(error_type, Exception):
+        return (error_type,)
+    return ()
+
+
+_EXPECTED_PARSER_LOAD_ERRORS: tuple[type[BaseException], ...] = (
+    ImportError, LookupError, OSError, ValueError, *_language_pack_error_types(),
+)
 
 
 def _parser_load_timeout_seconds() -> float:
@@ -522,6 +541,9 @@ def _parser_load_probe_succeeds(
     with _PARSER_PROBE_LOCK:
         cached = _PARSER_PROBE_RESULTS.get(grammar)
         if cached is not None:
+            if grammar in _PARSER_PROBE_UNREPORTED:
+                _PARSER_PROBE_UNREPORTED.discard(grammar)
+                logger.warning("Skipping unavailable tree-sitter parser for %s", grammar)
             return cached
         timeout = (
             _parser_load_timeout_seconds()
@@ -546,6 +568,40 @@ def _parser_load_probe_succeeds(
         return result
 
 
+def probe_grammars(grammars) -> dict[str, bool]:
+    """Probe the uncached *grammars* concurrently; return their cached results.
+
+    A process pool's workers start with an empty cache, so the parent probes
+    once and hands the results to each worker (:func:`seed_parser_probes`).
+    """
+    wanted = list(dict.fromkeys(grammars))
+    with _PARSER_PROBE_LOCK:
+        pending = [grammar for grammar in wanted if grammar not in _PARSER_PROBE_RESULTS]
+    if pending:
+        timeout = _parser_load_timeout_seconds()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
+            outcomes = list(pool.map(lambda g: _run_parser_load_probe(g, timeout), pending))
+        with _PARSER_PROBE_LOCK:
+            for grammar, ok in zip(pending, outcomes):
+                if grammar not in _PARSER_PROBE_RESULTS:
+                    _PARSER_PROBE_RESULTS[grammar] = ok
+                    if not ok:
+                        # Some languages never load their grammar: warn on use.
+                        _PARSER_PROBE_UNREPORTED.add(grammar)
+    with _PARSER_PROBE_LOCK:
+        return {g: _PARSER_PROBE_RESULTS[g] for g in wanted if g in _PARSER_PROBE_RESULTS}
+
+
+def seed_parser_probes(results: dict[str, bool]) -> None:
+    """Pool-worker initializer: adopt the parent's grammar probe results."""
+    with _PARSER_PROBE_LOCK:
+        for grammar, ok in results.items():
+            if grammar not in _PARSER_PROBE_RESULTS:
+                _PARSER_PROBE_RESULTS[grammar] = ok
+                if not ok:
+                    _PARSER_PROBE_UNREPORTED.add(grammar)
+
+
 def _mark_parser_unavailable(grammar: str) -> None:
     """Prevent repeated parent-process loads after an expected failure."""
     with _PARSER_PROBE_LOCK:
@@ -557,6 +613,7 @@ def _clear_parser_probe_cache() -> None:
     with _PARSER_PROBE_LOCK:
         _PARSER_PROBE_RESULTS.clear()
         _PARSER_PROBE_FAILURE_DETAILS.clear()
+        _PARSER_PROBE_UNREPORTED.clear()
 
 
 def _load_tree_sitter_parser(grammar: str):
@@ -935,7 +992,10 @@ _CLASS_TYPES: dict[str, list[str]] = {
     # impl_item is a scope for methods, not a second type definition. It is
     # dispatched separately so repeated impl blocks cannot overwrite structs.
     "rust": ["struct_item", "enum_item", "trait_item"],
-    "java": ["class_declaration", "interface_declaration", "enum_declaration"],
+    "java": [
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "annotation_type_declaration",
+    ],
     "c": ["struct_specifier", "type_definition"],
     "cpp": ["class_specifier", "struct_specifier"],
     "csharp": [
@@ -1017,12 +1077,20 @@ _TS_TYPE_DECLARATIONS = frozenset({
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
     "python": ["function_definition"],
-    "javascript": ["function_declaration", "method_definition", "arrow_function"],
-    "typescript": ["function_declaration", "method_definition", "arrow_function"],
-    "tsx": ["function_declaration", "method_definition", "arrow_function"],
+    "javascript": [
+        "function_declaration", "method_definition", "arrow_function", "function_expression",
+    ],
+    "typescript": [
+        "function_declaration", "method_definition", "arrow_function", "function_expression",
+    ],
+    "tsx": [
+        "function_declaration", "method_definition", "arrow_function", "function_expression",
+    ],
     "go": ["function_declaration", "method_declaration"],
     "rust": ["function_item", "function_signature_item"],
-    "java": ["method_declaration", "constructor_declaration"],
+    "java": [
+        "method_declaration", "constructor_declaration", "compact_constructor_declaration",
+    ],
     "c": ["function_definition"],
     "cpp": ["function_definition", "declaration", "field_declaration"],
     "csharp": ["method_declaration", "constructor_declaration"],
@@ -1241,23 +1309,21 @@ _TEST_PATTERNS = [
     re.compile(r"_spec$"),
 ]
 
+# Matched against repo-relative POSIX paths. Directory and prefix patterns
+# are anchored to a path segment, so ``com/acme/latest/`` is not a test dir.
 _TEST_FILE_PATTERNS = [
-    re.compile(r"test_.*\.py$"),
+    re.compile(r"(^|/)test_[^/]*\.py$"),
     re.compile(r".*_test\.py$"),
     re.compile(r".*\.test\.[jt]sx?$"),
     re.compile(r".*\.spec\.[jt]sx?$"),
     re.compile(r".*_test\.go$"),
-    re.compile(r"tests?/"),
-    re.compile(r"[\\/]__tests__[\\/]"),
+    re.compile(r"(^|/)(tests?|__tests__)/"),
     re.compile(r".*_test\.dart$"),
-    re.compile(r"test[_-].*\.[rR]$"),
-    re.compile(r"tests/testthat/"),
+    re.compile(r"(^|/)test[_-][^/]*\.[rR]$"),
     re.compile(r".*Test\.kt$"),
     re.compile(r".*Test\.java$"),
     re.compile(r".*_test\.resi?$"),
     re.compile(r".*\.test\.resi?$"),
-    re.compile(r"test/runtests\.jl$"),
-    re.compile(r"test/.*\.jl$"),
 ]
 
 _TEST_RUNNER_NAMES = frozenset({
@@ -1285,9 +1351,10 @@ _SPRING_STEREOTYPE_ANNOTATIONS = frozenset({
     "EventListener",
 })
 
-# Spring DI injection annotations (field/setter/constructor-level)
+# Spring DI injection annotations (field/setter/constructor-level). Stripes'
+# @SpringBean injects a Spring bean into an ActionBean field.
 _SPRING_INJECT_ANNOTATIONS = frozenset({
-    "Autowired", "Inject", "Resource",
+    "Autowired", "Inject", "Resource", "SpringBean",
 })
 _SPRING_PLACEHOLDER_RE = re.compile(r"\$\{([^{}]+)\}")
 
@@ -1327,6 +1394,8 @@ _SPRING_SCHEDULED_ANNOTATIONS = frozenset({"Scheduled", "Schedules"})
 _SPRING_EVENT_LISTENER_ANNOTATIONS = frozenset({"EventListener"})
 _SPRING_EVENT_PUBLISH_METHODS = frozenset({"publishEvent"})
 _JAVA_PACKAGE_KEY = "__crg_java_package__"
+# ``import static a.B.m;`` maps this key + ``m`` to the owner class ``a.B``.
+_JAVA_STATIC_IMPORT_KEY = "__crg_java_static__:"
 _SPRING_REQUEST_PREFIX_KEY = "__crg_spring_request_prefix__:"
 _JS_IMPORT_ORIGINAL_PREFIX_KEY = "__crg_js_import_original__:"
 _SPRING_REQUEST_MAPPINGS = {
@@ -1837,19 +1906,65 @@ def _scan_rescript_modules(cleaned: str, offset_to_line) -> list[dict]:
     return modules
 
 
-def _is_test_file(path: str) -> bool:
-    return any(p.search(path) for p in _TEST_FILE_PATTERNS)
+def java_arity_matches(qualified: str, arg_count: int) -> bool:
+    """Whether a Java method identity accepts *arg_count* arguments.
+
+    Only overloads carry ``(T1,T2)``; a bare identity says nothing about
+    arity. A trailing array parameter may be varargs.
+    """
+    tail = qualified.rsplit("::", 1)[-1]
+    open_paren = tail.find("(")
+    if open_paren < 0 or not tail.endswith(")"):
+        return True
+    params = tail[open_paren + 1:-1]
+    types = params.split(",") if params else []
+    if arg_count == len(types):
+        return True
+    return bool(types) and types[-1].endswith("[]") and arg_count >= len(types) - 1
+
+
+def java_overload_candidates(
+    entries: list[tuple[str, Optional[str]]],
+    scope: Optional[str],
+    arg_count: int,
+) -> list[str]:
+    """Narrow same-named Java methods by the caller's class, then by arity."""
+    candidates = [qualified for qualified, parent in entries if parent == scope]
+    if not candidates:
+        candidates = [qualified for qualified, _ in entries]
+    if len(candidates) > 1:
+        by_arity = [q for q in candidates if java_arity_matches(q, arg_count)]
+        if by_arity:
+            candidates = by_arity
+    return candidates
+
+
+def _is_test_file(path: str, repo_root: Optional[Path] = None) -> bool:
+    """Classify *path* by test naming; relative to *repo_root* when given.
+
+    Directories above the repository root (a checkout under ``~/tests/``)
+    must not turn every file into a test.
+    """
+    rel = path.replace("\\", "/")
+    if repo_root is not None:
+        root = str(repo_root).replace("\\", "/").rstrip("/") + "/"
+        if rel.startswith(root):
+            rel = rel[len(root):]
+    return any(p.search(rel) for p in _TEST_FILE_PATTERNS)
 
 
 def _is_test_function(
-    name: str, file_path: str, decorators: tuple[str, ...] = (),
+    name: str,
+    file_path: str,
+    decorators: tuple[str, ...] = (),
+    repo_root: Optional[Path] = None,
 ) -> bool:
     """A function is a test if its name matches test patterns, it lives
     in a test file and has a test-runner name, or it has a @Test annotation.
     """
     if any(p.search(name) for p in _TEST_PATTERNS):
         return True
-    if _is_test_file(file_path) and name in _TEST_RUNNER_NAMES:
+    if _is_test_file(file_path, repo_root) and name in _TEST_RUNNER_NAMES:
         return True
     if decorators and any(d in _TEST_ANNOTATIONS for d in decorators):
         return True
@@ -2452,6 +2567,8 @@ class CodeParser:
         # referrer resolves exactly as it would in a build where the forgotten
         # files never existed on disk. See ``forget.forget_files``.
         self._excluded_files: set[str] = set()
+        # Per-file sequence numbers for anonymous JS callbacks (``ready$1``).
+        self._js_callback_seq: dict[str, int] = {}
         self._export_symbol_cache: dict[str, Optional[str]] = {}
         self._tsconfig_resolver = TsconfigResolver()
         # Per-parse cache of Dart pubspec root lookups; see #87
@@ -2490,6 +2607,17 @@ class CodeParser:
                 self._function_types[custom.name] = list(custom.function_node_types)
                 self._import_types[custom.name] = list(custom.import_node_types)
                 self._call_types[custom.name] = list(custom.call_node_types)
+
+    def grammars_for(self, paths) -> set[str]:
+        """The tree-sitter grammars that parsing *paths* loads first."""
+        grammars: set[str] = set()
+        for path in paths:
+            language = self.detect_language(Path(path))
+            if language is None:
+                continue
+            custom = self._custom_languages.get(language)
+            grammars.add(custom.grammar if custom is not None else language)
+        return grammars
 
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
@@ -2629,6 +2757,7 @@ class CodeParser:
         language = self.detect_language(path, source)
         if not language:
             return [], []
+        self._js_callback_seq = {}
 
         parser = None
         tree = None
@@ -2740,7 +2869,7 @@ class CodeParser:
         file_path_str = normalize_file_path(path)
 
         # File node
-        test_file = _is_test_file(file_path_str)
+        test_file = _is_test_file(file_path_str, self._repo_root)
         file_extra: dict = {}
         # C#: record the namespace(s) this file declares so query-time
         # fallbacks can resolve namespace-form IMPORTS_FROM targets (from
@@ -2796,7 +2925,9 @@ class CodeParser:
                 file_path_str,
             )
 
-        edges = self._apply_typed_call_targets(edges, typed_call_targets, language)
+        edges = self._apply_typed_call_targets(
+            edges, typed_call_targets, language, file_path_str, import_map,
+        )
 
         # Resolve bare call targets to qualified names using same-file definitions
         edges = self._resolve_call_targets(nodes, edges, file_path_str)
@@ -2822,9 +2953,8 @@ class CodeParser:
 
         return nodes, edges
 
-    @staticmethod
     def _file_only_result(
-        path: Path, source: bytes, language: str,
+        self, path: Path, source: bytes, language: str,
     ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
         """File-node-only result: an accepted file with nothing to extract.
 
@@ -2843,7 +2973,7 @@ class CodeParser:
                 line_start=1,
                 line_end=source.count(b"\n") + 1,
                 language=language,
-                is_test=_is_test_file(file_path_str),
+                is_test=_is_test_file(file_path_str, self._repo_root),
             )
         ], []
 
@@ -3009,7 +3139,7 @@ class CodeParser:
                 line_start=1,
                 line_end=source.count(b"\n") + 1,
                 language="blade",
-                is_test=_is_test_file(file_path),
+                is_test=_is_test_file(file_path, self._repo_root),
             ),
         ]
         edges: list[EdgeInfo] = []
@@ -3036,7 +3166,7 @@ class CodeParser:
 
         tree = vue_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = _is_test_file(file_path_str, self._repo_root)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -3158,7 +3288,7 @@ class CodeParser:
 
         tree = svelte_parser.parse(source)
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = _is_test_file(file_path_str, self._repo_root)
 
         all_nodes: list[NodeInfo] = [NodeInfo(
             kind="File",
@@ -3346,7 +3476,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language=kernel_lang,
-                is_test=_is_test_file(file_path_str),
+                is_test=_is_test_file(file_path_str, self._repo_root),
             )], []
 
         return self._parse_notebook_cells(path, cells, kernel_lang)
@@ -3365,7 +3495,7 @@ class CodeParser:
             default_language: Default language for the File node.
         """
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = _is_test_file(file_path_str, self._repo_root)
 
         # Group cells by language
         lang_cells: dict[str, list[CellInfo]] = {}
@@ -3569,7 +3699,7 @@ class CodeParser:
                 line_start=1,
                 line_end=1,
                 language="python",
-                is_test=_is_test_file(file_path_str),
+                is_test=_is_test_file(file_path_str, self._repo_root),
             )
             file_node.extra["notebook_format"] = "databricks_py"
             return [file_node], []
@@ -3602,7 +3732,7 @@ class CodeParser:
         statements = _vbnet_logical_lines(cleaned)
         file_path = normalize_file_path(path)
         line_count = text.count("\n") + 1
-        test_file = _is_test_file(file_path)
+        test_file = _is_test_file(file_path, self._repo_root)
 
         nodes = [NodeInfo(
             kind="File",
@@ -3843,7 +3973,7 @@ class CodeParser:
                 key = ((scope or "").casefold(), name.casefold())
                 member_index = member_nodes.get(key)
                 if member_index is None:
-                    is_test = _is_test_function(name, file_path)
+                    is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
                     extra = {"vbnet_kind": member_kind}
                     if type_params:
                         extra["vbnet_type_parameters"] = type_params
@@ -4023,7 +4153,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = _is_test_file(file_path_str, self._repo_root)
         is_interface = path.suffix.lower() == ".resi"
 
         # Strip comments and string/backtick literal content so downstream
@@ -4115,7 +4245,7 @@ class CodeParser:
             if not is_top_level(off, parent):
                 continue  # nested local `let` — not a structural node
             line_start = offset_to_line(off)
-            is_test_fn = _is_test_function(name, file_path_str)
+            is_test_fn = _is_test_function(name, file_path_str, repo_root=self._repo_root)
             let_entries.append({
                 "name": name,
                 "start_off": off,
@@ -4430,7 +4560,7 @@ class CodeParser:
         """
         text = source.decode("utf-8", errors="replace")
         file_path_str = normalize_file_path(path)
-        test_file = _is_test_file(file_path_str)
+        test_file = _is_test_file(file_path_str, self._repo_root)
 
         nodes: list[NodeInfo] = []
         edges: list[EdgeInfo] = []
@@ -4728,6 +4858,7 @@ class CodeParser:
 
         is_cpp = any(node.language == "cpp" for node in nodes)
         is_go = any(node.language == "go" for node in nodes)
+        is_java = any(node.language == "java" for node in nodes)
 
         def cpp_resolution_extra(
             extra: dict,
@@ -4786,7 +4917,7 @@ class CodeParser:
                 resolved.append(edge)
                 continue
             receiver = edge.extra.get("receiver")
-            has_receiver = bool(receiver)
+            has_receiver = bool(receiver) or bool(edge.extra.get("receiver_expression"))
             if (
                 is_go
                 and edge.kind == "CALLS"
@@ -4931,6 +5062,42 @@ class CodeParser:
             ):
                 entries = candidate_entries(edge.target, edge.kind)
                 candidates = [qualified for qualified, _ in entries]
+                static_owner = edge.extra.get("static_import_owner")
+                if is_java and not entries and isinstance(static_owner, str):
+                    # A same-file method shadows the static import; none here.
+                    owner = self._resolve_java_type_target(static_owner, file_path, {}, set())
+                    if "::" in owner:
+                        owner_file, _, owner_class = owner.partition("::")
+                        simple = owner_class.rsplit(".", 1)[-1]
+                        resolved.append(EdgeInfo(
+                            kind=edge.kind,
+                            source=edge.source,
+                            target=f"{owner_file}::{simple}.{edge.target}",
+                            file_path=edge.file_path,
+                            line=edge.line,
+                            extra=edge.extra,
+                        ))
+                        continue
+                if (
+                    is_java
+                    and len(entries) > 1
+                    and isinstance(edge.extra.get("arg_count"), int)
+                ):
+                    candidates = java_overload_candidates(
+                        callable_symbols.get(edge.target) or entries,
+                        source_scopes.get(edge.source),
+                        edge.extra["arg_count"],
+                    )
+                    if len(candidates) > 1:
+                        resolved.append(EdgeInfo(
+                            kind=edge.kind,
+                            source=edge.source,
+                            target=edge.target,
+                            file_path=edge.file_path,
+                            line=edge.line,
+                            extra=cpp_resolution_extra(edge.extra, "ambiguous", candidates),
+                        ))
+                        continue
                 if is_cpp and entries:
                     source_scope = source_scopes.get(edge.source)
                     preferred_scopes: list[Optional[str]] = []
@@ -5121,7 +5288,7 @@ class CodeParser:
         file_path: str,
         import_map: dict[str, str],
         defined_names: set[str],
-    ) -> dict[tuple[int, str, str], tuple[str, str, str]]:
+    ) -> dict[tuple[int, str, str], tuple[Optional[str], str, str]]:
         """Collect evidence-backed targets for calls on typed receivers.
 
         The result is keyed by source line, receiver, and method so the normal
@@ -5129,7 +5296,9 @@ class CodeParser:
         typed receivers resolve directly when their class is repository-local.
         PHP variables assigned from ``new Type`` retain a bare parse-time target
         plus the constructed class scope for conservative graph-wide resolution.
-        Unknown or ambiguous types keep their existing bare targets.
+        Unknown or ambiguous types keep their existing bare targets; a known
+        type that is not repository-local is kept as evidence with a ``None``
+        target so the graph never binds the call to a same-named repo method.
         """
         if language not in self._TYPED_CALL_LANGUAGES:
             return {}
@@ -5146,7 +5315,7 @@ class CodeParser:
             "php": {"compound_statement"},
             "csharp": {"block"},
         }.get(language, set())
-        targets: dict[tuple[int, str, str], tuple[str, str, str]] = {}
+        targets: dict[tuple[int, str, str], tuple[Optional[str], str, str]] = {}
 
         def walk(
             node,
@@ -5212,10 +5381,11 @@ class CodeParser:
                         # when the class is not visible in this file: the
                         # graph-wide scoped resolver validates it against
                         # actual Class nodes plus namespace evidence (#612).
+                        # Java classes of the same package need no import.
                         if (
                             receiver in import_map
                             or receiver in defined_names
-                            or language == "csharp"
+                            or language in ("csharp", "java")
                         ):
                             type_name = receiver
                             evidence = "class_receiver"
@@ -5228,9 +5398,11 @@ class CodeParser:
                             import_map,
                             defined_names,
                         )
+                        key = (node.start_point[0] + 1, receiver, method)
                         if target:
-                            key = (node.start_point[0] + 1, receiver, method)
                             targets[key] = (target, type_name, evidence)
+                        elif language == "java":
+                            targets[key] = (None, type_name, evidence)
 
             for child in node.children:
                 walk(child, bindings, class_fields, depth + 1)
@@ -5566,13 +5738,45 @@ class CodeParser:
                 return f"{resolved}.{method}"
         if base_type in defined_names:
             return f"{file_path}::{base_type}.{method}"
+        if language == "java":
+            owner = self._resolve_java_type_target(
+                base_type, file_path, import_map, defined_names,
+            )
+            if "::" in owner:
+                return f"{owner}.{method}"
         return None
 
-    @staticmethod
+    # Receiver types that are never repository classes.
+    _JAVA_LANG_TYPES = frozenset({
+        "Object", "String", "StringBuilder", "StringBuffer", "Integer", "Long",
+        "Short", "Byte", "Double", "Float", "Boolean", "Character", "Number",
+        "Math", "System", "Thread", "Class", "Enum", "Iterable", "Runnable",
+        "CharSequence", "Comparable", "Exception", "RuntimeException", "Throwable",
+    })
+
+    def _java_type_is_external(
+        self, type_name: str, file_path: str, import_map: dict[str, str],
+    ) -> bool:
+        """True when *type_name* is known to live outside the repository."""
+        base = self._base_type_name(type_name) or type_name
+        if base in import_map:
+            imported = import_map[base]
+            if self._resolve_module_to_file(imported, file_path, "java") is not None:
+                return False
+            # Unresolved imports under this file's root package may be a
+            # source layout the walk does not know, not a library.
+            package = import_map.get(_JAVA_PACKAGE_KEY, "")
+            root = ".".join(package.split(".")[:2])
+            return not (root and imported.startswith(root + "."))
+        return base in self._JAVA_LANG_TYPES
+
     def _apply_typed_call_targets(
+        self,
         edges: list[EdgeInfo],
-        targets: dict[tuple[int, str, str], tuple[str, str, str]],
+        targets: dict[tuple[int, str, str], tuple[Optional[str], str, str]],
         language: str,
+        file_path: str = "",
+        import_map: Optional[dict[str, str]] = None,
     ) -> list[EdgeInfo]:
         if not targets:
             return edges
@@ -5588,6 +5792,18 @@ class CodeParser:
                     "receiver_type": type_name,
                     "receiver_resolution": evidence_kind,
                 })
+                if target is None:
+                    if self._java_type_is_external(type_name, file_path, import_map or {}):
+                        extra["receiver_external"] = True
+                    resolved.append(EdgeInfo(
+                        kind=edge.kind,
+                        source=edge.source,
+                        target=edge.target,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                        extra=extra,
+                    ))
+                    continue
                 resolved_target = target
                 if evidence_kind == "constructed_receiver" or language == "csharp":
                     # Keep PHP/C# parse-only CALLS output backward-compatible
@@ -6514,6 +6730,18 @@ class CodeParser:
             ):
                 continue
 
+            # --- JS/TS anonymous callbacks: $(document).ready(function () {...}) ---
+            if (
+                language in ("javascript", "typescript", "tsx")
+                and node_type in ("function_expression", "arrow_function")
+                and self._extract_js_callback(
+                    child, source, language, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                )
+            ):
+                continue
+
             # --- Functions ---
             if node_type in func_types and self._extract_functions(
                 child, source, language, file_path, nodes, edges,
@@ -6532,6 +6760,18 @@ class CodeParser:
                 # `call` covers both `require` and method invocation). If it
                 # was not an import, fall through to call extraction below
                 # rather than dropping it.
+
+            # --- Java anonymous classes (new T() { ... }) ---
+            if (
+                language == "java"
+                and node_type == "object_creation_expression"
+                and self._extract_java_anonymous_class(
+                    child, source, file_path, nodes, edges,
+                    enclosing_class, enclosing_func,
+                    import_map, defined_names, _depth,
+                )
+            ):
+                continue
 
             # --- Calls ---
             if node_type in call_types:
@@ -6729,7 +6969,7 @@ class CodeParser:
             )
             if fn_name is None:
                 return False
-            is_test = _is_test_function(fn_name, file_path)
+            is_test = _is_test_function(fn_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(fn_name, file_path, enclosing_class)
             nodes.append(NodeInfo(
@@ -7727,7 +7967,9 @@ class CodeParser:
             if lhs is not None and lhs.type == "call_expression":
                 name = self._julia_short_func_name(lhs)
                 if name:
-                    is_test = _is_test_function(name, file_path, ())
+                    is_test = _is_test_function(
+                        name, file_path, (), repo_root=self._repo_root,
+                    )
                     kind = "Test" if is_test else "Function"
                     lexical_parent = self._julia_scope_join(
                         enclosing_class, enclosing_func,
@@ -8152,7 +8394,7 @@ class CodeParser:
         # Check for anonymous function: local foo = function(...) end
         for expr in expr_list.children:
             if expr.type == "function_definition":
-                is_test = _is_test_function(var_name, file_path)
+                is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
                 kind = "Test" if is_test else "Function"
                 qualified = self._qualify(var_name, file_path, enclosing_class)
                 params = self._get_params(expr, language, source)
@@ -8233,7 +8475,7 @@ class CodeParser:
         if not table_name or not method_name:
             return False
 
-        is_test = _is_test_function(method_name, file_path)
+        is_test = _is_test_function(method_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(method_name, file_path, table_name)
         params = self._get_params(child, language, source)
@@ -8395,7 +8637,7 @@ class CodeParser:
         if not name:
             return False
 
-        is_test = _is_test_function(name, file_path)
+        is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(name, file_path, enclosing_class)
 
@@ -8678,6 +8920,102 @@ class CodeParser:
     _JS_FUNC_VALUE_TYPES = frozenset(
         {"arrow_function", "function_expression", "function"},
     )
+    # Callee methods whose first string argument names the event handled.
+    _JS_EVENT_BINDERS = frozenset({
+        "on", "one", "off", "bind", "live", "delegate", "addEventListener",
+    })
+
+    def _extract_js_callback(
+        self,
+        child,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Name an anonymous function passed to a call after that call.
+
+        ``$(document).ready(function () {...})`` becomes ``ready$1`` and
+        ``$(x).on("click", () => {...})`` ``on_click$1``, numbered per file
+        in source order, so calls inside are attributed to the callback
+        instead of the enclosing function or file.
+        """
+        arguments = child.parent
+        if (
+            arguments is None
+            or arguments.type != "arguments"
+            or child.child_by_field_name("name") is not None
+        ):
+            return False
+        call = arguments.parent
+        callee = call.child_by_field_name("function") if call is not None else None
+        if callee is None:
+            return False
+        if callee.type == "member_expression":
+            prop = callee.child_by_field_name("property")
+            base = prop.text.decode("utf-8", errors="replace") if prop is not None else ""
+        elif callee.type == "identifier":
+            base = callee.text.decode("utf-8", errors="replace")
+        else:
+            return False
+        if not base:
+            return False
+        # Test-runner callbacks already belong to their synthetic Test node.
+        if _is_test_file(file_path, self._repo_root) and (
+            base in _TEST_RUNNER_NAMES
+            or (self._get_base_call_name(call, source) or base) in _TEST_RUNNER_NAMES
+        ):
+            return False
+        if base in self._JS_EVENT_BINDERS:
+            event = next((a for a in arguments.named_children if a.type == "string"), None)
+            if event is not None:
+                label = re.sub(r"\W+", "_", event.text.decode("utf-8", errors="replace"))
+                label = label.strip("_")
+                if label:
+                    base = f"{base}_{label}"
+        seq = self._js_callback_seq
+        seq[base] = seq.get(base, 0) + 1
+        name = f"{base}${seq[base]}"
+        qualified = self._qualify(name, file_path, enclosing_class)
+        line = child.start_point[0] + 1
+        nodes.append(NodeInfo(
+            kind="Function",
+            name=name,
+            file_path=file_path,
+            line_start=line,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            params=self._get_params(child, language, source),
+            extra={"js_callback": True},
+        ))
+        scope = (
+            self._qualify(enclosing_func, file_path, enclosing_class)
+            if enclosing_func
+            else self._qualify(enclosing_class, file_path, None)
+            if enclosing_class
+            else file_path
+        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS", source=scope, target=qualified, file_path=file_path, line=line,
+        ))
+        # Passed as a value: the enclosing scope hands it to the framework.
+        edges.append(EdgeInfo(
+            kind="REFERENCES", source=scope, target=qualified, file_path=file_path, line=line,
+        ))
+        self._extract_from_tree(
+            child, source, language, file_path, nodes, edges,
+            enclosing_class=enclosing_class, enclosing_func=name,
+            import_map=import_map, defined_names=defined_names,
+            _depth=_depth + 1,
+        )
+        return True
 
     def _extract_js_var_functions(
         self,
@@ -8720,7 +9058,7 @@ class CodeParser:
             if not var_name or not func_node:
                 continue
 
-            is_test = _is_test_function(var_name, file_path)
+            is_test = _is_test_function(var_name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(var_name, file_path, enclosing_class)
             params = self._get_params(func_node, language, source)
@@ -8792,7 +9130,7 @@ class CodeParser:
         if not prop_name or not func_node:
             return False
 
-        is_test = _is_test_function(prop_name, file_path)
+        is_test = _is_test_function(prop_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(prop_name, file_path, enclosing_class)
         params = self._get_params(func_node, language, source)
@@ -8900,7 +9238,7 @@ class CodeParser:
         if member_name is None:
             return False
 
-        is_test = _is_test_function(member_name, file_path)
+        is_test = _is_test_function(member_name, file_path, repo_root=self._repo_root)
         kind = "Test" if is_test else "Function"
         qualified = self._qualify(member_name, file_path, enclosing_class)
         params = self._get_params(right, language, source)
@@ -9732,6 +10070,220 @@ class CodeParser:
         package = import_map.get(_JAVA_PACKAGE_KEY, "")
         return f"{package}.{normalized}" if package else normalized
 
+    _JAVA_NAMED_TYPE_DECLARATIONS = frozenset({
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "record_declaration", "annotation_type_declaration",
+    })
+
+    def _extract_java_anonymous_class(
+        self,
+        creation,
+        source: bytes,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Give ``new T() { ... }`` a Class node named like javac: ``Outer$N``."""
+        body = next((c for c in creation.children if c.type == "class_body"), None)
+        if body is None or not enclosing_class:
+            return False
+        # The constructor call itself belongs to the enclosing scope.
+        self._extract_calls(
+            creation, source, "java", file_path, nodes, edges,
+            enclosing_class, enclosing_func, import_map, defined_names, _depth,
+        )
+        name = f"{enclosing_class}${self._java_anonymous_index(creation)}"
+        qualified = self._qualify(name, file_path, None)
+        line = creation.start_point[0] + 1
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=name,
+            file_path=file_path,
+            line_start=line,
+            line_end=creation.end_point[0] + 1,
+            language="java",
+            extra={"anonymous": True},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=self._qualify(enclosing_class, file_path, None),
+            target=qualified,
+            file_path=file_path,
+            line=line,
+        ))
+        type_node = creation.child_by_field_name("type")
+        base = self._java_erased_type_name(type_node) if type_node is not None else None
+        if base:
+            edges.append(EdgeInfo(
+                kind="INHERITS",
+                source=qualified,
+                target=self._resolve_java_type_target(
+                    base, file_path, import_map or {}, defined_names or set(),
+                ),
+                file_path=file_path,
+                line=line,
+            ))
+        for part in creation.children:
+            if part.type == "argument_list":
+                self._extract_from_tree(
+                    part, source, "java", file_path, nodes, edges,
+                    enclosing_class=enclosing_class, enclosing_func=enclosing_func,
+                    import_map=import_map, defined_names=defined_names,
+                    _depth=_depth + 1,
+                )
+        self._extract_from_tree(
+            body, source, "java", file_path, nodes, edges,
+            enclosing_class=name, enclosing_func=None,
+            import_map=import_map, defined_names=defined_names,
+            _depth=_depth + 1,
+        )
+        return True
+
+    @classmethod
+    def _java_anonymous_index(cls, creation) -> int:
+        """1-based source-order index among the enclosing class's anonymous classes."""
+        container = creation.parent
+        while container is not None and not (
+            container.type in cls._JAVA_NAMED_TYPE_DECLARATIONS
+            or (
+                container.type == "class_body"
+                and container.parent is not None
+                and container.parent.type == "object_creation_expression"
+            )
+        ):
+            container = container.parent
+        if container is None:
+            return 1
+        index = 0
+        stack = list(reversed(container.children))
+        while stack:
+            node = stack.pop()
+            if node.type in cls._JAVA_NAMED_TYPE_DECLARATIONS:
+                continue
+            children = node.children
+            if node.type == "object_creation_expression" and any(
+                c.type == "class_body" for c in children
+            ):
+                index += 1
+                if node.start_byte == creation.start_byte and node.end_byte == creation.end_byte:
+                    return index
+                # A nested body numbers its own anonymous classes.
+                children = [c for c in children if c.type != "class_body"]
+            stack.extend(reversed(children))
+        return index + 1
+
+    _JAVA_CALLABLE_TYPES = frozenset({
+        "method_declaration", "constructor_declaration", "compact_constructor_declaration",
+    })
+
+    @classmethod
+    def _java_method_identity(cls, node, name: str) -> str:
+        """``name`` or, for an overloaded name, ``name(T1,T2)`` with erased types.
+
+        Only overloads carry a signature so a method's identity stays stable
+        until a same-named sibling appears in its class body.
+        """
+        parent = node.parent
+        name_bytes = name.encode("utf-8")
+        same_named = 0
+        for sibling in parent.children if parent is not None else ():
+            if sibling.type not in cls._JAVA_CALLABLE_TYPES:
+                continue
+            sibling_name = sibling.child_by_field_name("name")
+            if sibling_name is not None and sibling_name.text == name_bytes:
+                same_named += 1
+                if same_named > 1:
+                    break
+        if same_named < 2:
+            return name
+        return f"{name}({','.join(cls._java_parameter_types(node))})"
+
+    @classmethod
+    def _java_parameter_types(cls, node) -> list[str]:
+        """Erased simple parameter type names; varargs become arrays."""
+        parameters = node.child_by_field_name("parameters")
+        if parameters is None:
+            return []
+        types: list[str] = []
+        for param in parameters.named_children:
+            if param.type == "formal_parameter":
+                type_node = param.child_by_field_name("type")
+                suffix = ""
+            elif param.type == "spread_parameter":
+                type_node = next(
+                    (
+                        sub for sub in param.named_children
+                        if sub.type not in ("modifiers", "variable_declarator")
+                    ),
+                    None,
+                )
+                suffix = "[]"
+            else:
+                continue
+            if type_node is not None:
+                types.append(cls._java_erased_simple_type(type_node) + suffix)
+        return types
+
+    @classmethod
+    def _java_erased_simple_type(cls, node) -> str:
+        """``java.util.List<String>[]`` -> ``List[]``."""
+        if node.type == "array_type":
+            element = node.child_by_field_name("element")
+            dimensions = node.child_by_field_name("dimensions")
+            dims = "[]" * dimensions.text.count(b"[") if dimensions is not None else "[]"
+            return (cls._java_erased_simple_type(element) if element else "?") + dims
+        erased = cls._java_erased_type_name(node)
+        text = erased or node.text.decode("utf-8", errors="replace")
+        return text.rsplit(".", 1)[-1].strip()
+
+    @staticmethod
+    def _java_erased_type_name(node) -> Optional[str]:
+        """Return a Java type as written minus type arguments, or None."""
+        if node.type == "generic_type":
+            head = next(
+                (
+                    sub for sub in node.children
+                    if sub.type in ("type_identifier", "scoped_type_identifier")
+                ),
+                None,
+            )
+            return CodeParser._java_erased_type_name(head) if head is not None else None
+        if node.type in ("type_identifier", "scoped_type_identifier"):
+            return node.text.decode("utf-8", errors="replace")
+        return None
+
+    def _resolve_java_type_target(
+        self,
+        type_name: str,
+        file_path: str,
+        import_map: dict[str, str],
+        defined_names: set[str],
+    ) -> str:
+        """Qualify a Java type to its repository Class node, else return it unchanged.
+
+        Same-file classes win, then single-type imports, then the package
+        (which also covers same-package classes that need no import).
+        """
+        head = type_name.split(".", 1)[0]
+        if "." not in type_name and type_name in defined_names:
+            return self._qualify(type_name, file_path, None)
+        if head[:1].islower() or head in import_map or _JAVA_PACKAGE_KEY in import_map:
+            module = self._resolve_java_type_identity(type_name, import_map)
+        else:
+            # Default package: a sibling file of the same name.
+            module = type_name
+        resolved = self._resolve_module_to_file(module, file_path, "java")
+        if not resolved:
+            return type_name
+        simple = type_name.rsplit(".", 1)[-1]
+        stem = Path(resolved).stem
+        return self._qualify(simple, resolved, None if stem == simple else stem)
+
     @staticmethod
     def _descendants_of_type(node, node_type: str) -> list:
         matches: list = []
@@ -10328,6 +10880,10 @@ class CodeParser:
         # Inheritance edges
         bases = self._get_bases(child, language, source)
         for base in bases:
+            if language == "java":
+                base = self._resolve_java_type_target(
+                    base, file_path, import_map or {}, defined_names or set(),
+                )
             edges.append(EdgeInfo(
                 kind="INHERITS",
                 source=self._qualify(
@@ -10340,9 +10896,22 @@ class CodeParser:
 
         # Spring DI: emit INJECTS edges for injected dependencies
         if language == "java":
+            first_injection = len(edges)
             self._emit_spring_injections(
                 child, name, class_annotations, language, file_path, edges,
             )
+            for index in range(first_injection, len(edges)):
+                injection = edges[index]
+                edges[index] = EdgeInfo(
+                    kind=injection.kind,
+                    source=injection.source,
+                    target=self._resolve_java_type_target(
+                        injection.target, file_path, import_map or {}, defined_names or set(),
+                    ),
+                    file_path=injection.file_path,
+                    line=injection.line,
+                    extra=injection.extra,
+                )
             self._emit_spring_config_edges(
                 child, name, enclosing_class, file_path, edges,
             )
@@ -10445,12 +11014,12 @@ class CodeParser:
         if deco_list:
             decorators = tuple(deco_list)
 
-        is_test = _is_test_function(name, file_path, decorators)
+        is_test = _is_test_function(name, file_path, decorators, repo_root=self._repo_root)
         # PHPUnit's name convention is ``test*`` (not only ``test_*``).
         if (
             language == "php"
             and child.type == "method_declaration"
-            and _is_test_file(file_path)
+            and _is_test_file(file_path, self._repo_root)
             and name.startswith("test")
         ):
             is_test = True
@@ -10488,6 +11057,8 @@ class CodeParser:
                 container_scope = enclosing_class
             if cpp_params is not None:
                 params = cpp_params
+        elif language == "java":
+            identity_name = self._java_method_identity(child, name)
 
         qualified = self._qualify(identity_name, file_path, parent_name)
         ret_type = self._get_return_type(child, language, source)
@@ -10739,7 +11310,7 @@ class CodeParser:
         if (
             call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and _is_test_file(file_path, self._repo_root)
             and call_name not in _TEST_RUNNER_NAMES
         ):
             effective_call_name = (
@@ -10750,7 +11321,7 @@ class CodeParser:
         if (
             effective_call_name
             and language in ("javascript", "typescript", "tsx")
-            and _is_test_file(file_path)
+            and _is_test_file(file_path, self._repo_root)
             and effective_call_name in _TEST_RUNNER_NAMES
         ):
             test_desc = self._get_test_description(child, source)
@@ -10841,6 +11412,13 @@ class CodeParser:
                     call_name = method_name
                 if receiver:
                     call_extra["receiver"] = receiver
+                    # ``utils.helper()`` / ``api.load()`` on an imported module
+                    # or namespace: the import is the evidence for the target.
+                    if (
+                        language in ("python", "javascript", "typescript", "tsx")
+                        and receiver in (import_map or {})
+                    ):
+                        call_extra["receiver_import"] = True
                     if (
                         language == "go"
                         and _go_receiver_bindings is not None
@@ -10852,6 +11430,22 @@ class CodeParser:
                         call_extra["go_method_receiver"] = True
                 if language == "java" and child.type == "method_reference":
                     call_extra["call_syntax"] = "method_reference"
+                if language == "java" and child.type == "method_invocation":
+                    arguments = child.child_by_field_name("arguments")
+                    if arguments is not None:
+                        call_extra["arg_count"] = sum(
+                            1 for arg in arguments.named_children
+                            if arg.type not in ("line_comment", "block_comment")
+                        )
+                static_owner = (import_map or {}).get(f"{_JAVA_STATIC_IMPORT_KEY}{call_name}")
+                if language == "java" and not receiver and static_owner:
+                    call_extra["static_import_owner"] = static_owner
+                if language == "java" and not receiver and child.type == "method_invocation":
+                    obj = child.child_by_field_name("object")
+                    # ``verify(s).save()`` / ``super.save()``: the method is not
+                    # this class's, so it must not bind to a same-named one.
+                    if obj is not None and obj.type != "this":
+                        call_extra["receiver_expression"] = True
 
             if language == "java" and child.type == "method_invocation":
                 self._emit_spring_webflux_endpoint(
@@ -13550,6 +14144,11 @@ class CodeParser:
             if not text.startswith("import "):
                 return
             imported = text[len("import "):].rstrip(";").strip()
+            if language == "java" and imported.startswith("static "):
+                owner, _, member = imported[len("static "):].strip().rpartition(".")
+                if owner and member and member != "*":
+                    import_map[f"{_JAVA_STATIC_IMPORT_KEY}{member}"] = owner
+                return
             if imported.startswith("static ") or imported.endswith(".*"):
                 return
             original, separator, alias = imported.partition(" as ")
@@ -13795,12 +14394,19 @@ class CodeParser:
             if module.endswith(".*"):
                 return None  # wildcard import — can't resolve to one file
             rel_path = module.replace(".", "/") + ".java"
+            # The walk ends at the repository root: nothing above it is indexed.
+            top = self._repo_root
             current = caller_dir
             while True:
                 target = current / rel_path
                 if target.is_file():
                     return str(target.resolve())
-                if current == current.parent:
+                # Maven/Gradle tests see the main source root too.
+                if current.name == "java" and current.parent.name == "test":
+                    target = current.parent.parent / "main" / "java" / rel_path
+                    if target.is_file():
+                        return str(target.resolve())
+                if current == current.parent or current == top:
                     break
                 current = current.parent
             # Static import: ``pkg.Class.member`` — strip member, try again
@@ -13813,7 +14419,7 @@ class CodeParser:
                     target = current / rel_path2
                     if target.is_file():
                         return str(target.resolve())
-                    if current == current.parent:
+                    if current == current.parent or current == top:
                         break
                     current = current.parent
 
@@ -15336,6 +15942,9 @@ class CodeParser:
 
     def _get_return_type(self, node, language: str, source: bytes) -> Optional[str]:
         """Extract return type annotation if present."""
+        if language == "java":
+            type_node = node.child_by_field_name("type")
+            return type_node.text.decode("utf-8", errors="replace") if type_node else None
         for child in node.children:
             if child.type in ("type", "return_type", "type_annotation", "return_type_definition"):
                 return child.text.decode("utf-8", errors="replace")
@@ -15356,21 +15965,26 @@ class CodeParser:
                         if arg.type in ("identifier", "attribute"):
                             bases.append(arg.text.decode("utf-8", errors="replace"))
         elif language == "java":
-            # Java: superclass and super_interfaces wrap the keyword
-            # (extends/implements) around type_identifier children.
-            # Taking .text would include the keyword (e.g. "implements Foo").
-            # Drill into the children to extract bare type names.
+            # Java: superclass, super_interfaces (classes, records) and
+            # extends_interfaces (interfaces) wrap the keyword around the
+            # types. Type arguments are erased: ``GenericDao<User>`` is
+            # ``GenericDao``.
             for child in node.children:
                 if child.type == "superclass":
-                    for sub in child.children:
-                        if sub.type in ("type_identifier", "generic_type"):
-                            bases.append(sub.text.decode("utf-8", errors="replace"))
-                elif child.type == "super_interfaces":
-                    for sub in child.children:
-                        if sub.type == "type_list":
-                            for ident in sub.children:
-                                if ident.type in ("type_identifier", "generic_type"):
-                                    bases.append(ident.text.decode("utf-8", errors="replace"))
+                    types = child.children
+                elif child.type in ("super_interfaces", "extends_interfaces"):
+                    types = [
+                        ident
+                        for sub in child.children
+                        if sub.type == "type_list"
+                        for ident in sub.children
+                    ]
+                else:
+                    continue
+                for sub in types:
+                    erased = self._java_erased_type_name(sub)
+                    if erased:
+                        bases.append(erased)
         elif language == "csharp":
             # C# wraps ``: Base, IFace`` in a base_list. Iterate named type
             # entries so punctuation is excluded while qualified/generic names
@@ -15603,7 +16217,11 @@ class CodeParser:
             # import/using package.Class
             parts = text.split()
             if len(parts) >= 2:
-                imports.append(parts[-1].rstrip(";"))
+                target = parts[-1].rstrip(";")
+                # ``import static a.B.*`` depends on class ``a.B`` itself.
+                if language == "java" and "static" in parts and target.endswith(".*"):
+                    target = target[:-2]
+                imports.append(target)
         elif language == "kotlin":
             # tree-sitter-kotlin folds any comment that follows the LAST import
             # into that import_header node, so the node text is not a module
@@ -16232,7 +16850,7 @@ class CodeParser:
 
         if right.type == "function_definition" and left.type == "identifier":
             name = left.text.decode("utf-8", errors="replace")
-            is_test = _is_test_function(name, file_path)
+            is_test = _is_test_function(name, file_path, repo_root=self._repo_root)
             kind = "Test" if is_test else "Function"
             qualified = self._qualify(name, file_path, enclosing_class)
             params = self._get_params(right, language, source)

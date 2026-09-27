@@ -354,7 +354,8 @@ class TestJavaParsing:
         inherits = [e for e in self.edges if e.kind == "INHERITS"]
         # InMemoryRepo implements UserRepository + CachedRepo extends InMemoryRepo
         assert len(inherits) >= 2
-        targets = {e.target for e in inherits}
+        # Same-file types resolve to their Class node.
+        targets = {e.target.rsplit("::", 1)[-1] for e in inherits}
         assert "UserRepository" in targets
         assert "InMemoryRepo" in targets
 
@@ -3355,7 +3356,8 @@ class TestSpringDIParsing:
         injects = [e for e in self.edges if e.kind == "INJECTS"]
         # NotificationService has @Autowired OrderRepository field
         field_edges = [e for e in injects if e.extra.get("injection_type") == "field"]
-        targets = {e.target for e in field_edges}
+        # Same-file types resolve to their Class node.
+        targets = {e.target.rsplit("::", 1)[-1] for e in field_edges}
         assert "OrderRepository" in targets
 
     def test_autowired_field_source_is_class(self):
@@ -3368,7 +3370,8 @@ class TestSpringDIParsing:
         injects = [e for e in self.edges if e.kind == "INJECTS"]
         lombok_edges = [e for e in injects
                         if e.extra.get("injection_type") == "constructor_lombok"]
-        targets = {e.target for e in lombok_edges}
+        # Same-file types resolve to their Class node.
+        targets = {e.target.rsplit("::", 1)[-1] for e in lombok_edges}
         # OrderService has two final injected fields
         assert "OrderRepository" in targets
         assert "NotificationService" in targets
@@ -3383,7 +3386,8 @@ class TestSpringDIParsing:
         injects = [e for e in self.edges if e.kind == "INJECTS"]
         ctor_edges = [e for e in injects
                       if e.extra.get("injection_type") == "constructor"]
-        targets = {e.target for e in ctor_edges}
+        # Same-file types resolve to their Class node.
+        targets = {e.target.rsplit("::", 1)[-1] for e in ctor_edges}
         # AuditLogger has @Autowired constructor with OrderRepository param
         assert "OrderRepository" in targets
 

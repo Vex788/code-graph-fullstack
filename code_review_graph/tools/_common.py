@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import sqlite3
 import subprocess
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from ..constants import env_float
 from ..graph import GraphStore
-from ..incremental import find_project_root, get_db_path
+from ..incremental import GitUnavailableError, find_project_root, get_db_path
 from ..parser import normalize_file_path
 
 _PROVENANCE_READ_TIMEOUT_SECONDS = 0.05
 _PROVENANCE_GIT_TIMEOUT_SECONDS = 1.0
+# git status on every tool call; slower than this reads as git unavailable.
+_RECEIPT_GIT_TIMEOUT_SECONDS = 5.0
+# Rapid successive tool calls reuse one receipt; see _receipt_cache_key.
+_RECEIPT_TTL_DEFAULT_SECONDS = 2.0
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +32,46 @@ def _error_response(
 ) -> dict[str, Any]:
     """Build a standardised error response dict."""
     return {"status": status, "error": message, "summary": message, **extra}
+
+
+def schema_error_response(exc: Exception) -> dict[str, Any]:
+    """Contract error shape for a database newer than this build."""
+    message = str(exc)
+    return {
+        "status": "error", "error_code": "schema_too_new",
+        "message": message, "error": message, "summary": message,
+    }
+
+
+def building_response(readiness: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A writer holds the graph (build or migration); retry after it finishes."""
+    message = (
+        "The graph is being built or migrated by another process. "
+        "Retry shortly, or check build_or_update_graph(status_only=True)."
+    )
+    response: dict[str, Any] = {
+        "status": "building",
+        "reason": "building",
+        "summary": message,
+        "next_tool_suggestions": ["build_or_update_graph_tool"],
+    }
+    if readiness is not None:
+        response["readiness"] = readiness
+    return response
+
+
+def read_git_head_state(root: Path) -> tuple[str, str | None]:
+    """Return ``(git_state, head_sha)`` using the readiness git states.
+
+    ``not_a_repo`` when *root* has no ``.git``; ``unavailable`` when git
+    failed, timed out, or has no HEAD yet.
+    """
+    from ..readiness import GIT_NOT_A_REPO, GIT_OK, GIT_UNAVAILABLE
+
+    if not (root / ".git").exists():
+        return GIT_NOT_A_REPO, None
+    head = _read_live_git_head(root)
+    return (GIT_OK, head) if head else (GIT_UNAVAILABLE, None)
 
 
 def _read_live_git_head(root: Path) -> str | None:
@@ -57,6 +105,48 @@ def _read_live_git_head(root: Path) -> str | None:
     return head_sha or None
 
 
+def _provenance_from_rows(
+    rows: dict[str, Any], live_head: Callable[[], str | None],
+) -> dict[str, Any]:
+    """Legacy receipt fields from metadata rows; *live_head* is read only if needed."""
+    provenance: dict[str, Any] = {}
+    updated_at = rows.get("last_updated")
+    if isinstance(updated_at, str) and updated_at:
+        provenance["updated_at"] = updated_at
+        try:
+            built_at = datetime.fromisoformat(updated_at)
+            # Match aware timestamps with an aware ``now`` in the same
+            # timezone; None preserves the stored naive/local format.
+            now = datetime.now(tz=built_at.tzinfo)
+            provenance["age_seconds"] = max(
+                0, int((now - built_at).total_seconds()),
+            )
+        except (OverflowError, TypeError, ValueError):
+            # A malformed timestamp only removes the derived age. The raw
+            # timestamp and independently valid branch/SHA remain useful.
+            pass
+
+    head_sha = rows.get("git_head_sha")
+    if isinstance(head_sha, str) and head_sha:
+        provenance["built_at_sha"] = head_sha
+    if provenance:
+        branch = rows.get("git_branch")
+        if isinstance(branch, str) and branch:
+            provenance["built_on_branch"] = branch
+        live_head_sha = live_head()
+        if live_head_sha:
+            provenance["head_sha"] = live_head_sha
+            if isinstance(head_sha, str) and head_sha:
+                provenance["head_matches_build"] = live_head_sha == head_sha
+            else:
+                # A graph in a git repo that never recorded the commit it
+                # was built at cannot be compared to HEAD at all. Saying
+                # nothing here reads downstream as "current", which is the
+                # one answer we know to be unsupported.
+                provenance["missing_build_anchor"] = True
+    return provenance
+
+
 def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
     """Return best-effort build metadata for one repository's graph.
 
@@ -88,53 +178,217 @@ def graph_provenance(repo_root: str | None = None) -> dict[str, Any] | None:
         finally:
             connection.close()
 
-        provenance: dict[str, Any] = {}
-        updated_at = rows.get("last_updated")
-        if isinstance(updated_at, str) and updated_at:
-            provenance["updated_at"] = updated_at
-            try:
-                built_at = datetime.fromisoformat(updated_at)
-                # Match aware timestamps with an aware ``now`` in the same
-                # timezone; None preserves the stored naive/local format.
-                now = datetime.now(tz=built_at.tzinfo)
-                provenance["age_seconds"] = max(
-                    0, int((now - built_at).total_seconds()),
-                )
-            except (OverflowError, TypeError, ValueError):
-                # A malformed timestamp only removes the derived age. The raw
-                # timestamp and independently valid branch/SHA remain useful.
-                pass
-
-        head_sha = rows.get("git_head_sha")
-        if isinstance(head_sha, str) and head_sha:
-            provenance["built_at_sha"] = head_sha
-        if provenance:
-            branch = rows.get("git_branch")
-            if isinstance(branch, str) and branch:
-                provenance["built_on_branch"] = branch
-            live_head_sha = _read_live_git_head(root)
-            if live_head_sha:
-                provenance["head_sha"] = live_head_sha
-                if isinstance(head_sha, str) and head_sha:
-                    provenance["head_matches_build"] = live_head_sha == head_sha
-                else:
-                    # A graph in a git repo that never recorded the commit it
-                    # was built at cannot be compared to HEAD at all. Saying
-                    # nothing here reads downstream as "current", which is the
-                    # one answer we know to be unsupported.
-                    provenance["missing_build_anchor"] = True
-        return provenance or None
+        return _provenance_from_rows(rows, lambda: _read_live_git_head(root)) or None
     except Exception:
         return None
 
 
+def _runtime_matches_source() -> bool:
+    """False once the installed package on disk differs from the loaded one.
+
+    A long-lived MCP server keeps running old code after an upgrade; the
+    version literal in ``__init__.py`` is the cheapest honest witness.
+    """
+    import re
+
+    from .. import __version__
+
+    init = Path(__file__).resolve().parents[1] / "__init__.py"
+    try:
+        match = re.search(
+            r'^__version__\s*=\s*["\']([^"\']+)["\']',
+            init.read_text(encoding="utf-8"), re.MULTILINE,
+        )
+    except OSError:
+        return False
+    return bool(match) and match.group(1) == __version__
+
+
+def _receipt_etag(parts: list[Any]) -> str:
+    import hashlib
+    import json as _json
+
+    blob = _json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+_receipt_cache: dict[str, tuple[float, tuple[Any, ...], dict[str, Any]]] = {}
+_receipt_cache_lock = threading.Lock()
+
+
+def clear_receipt_cache() -> None:
+    with _receipt_cache_lock:
+        _receipt_cache.clear()
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _read_small(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _git_dirs(root: Path) -> tuple[Path, Path] | None:
+    """``(git_dir, common_dir)``; a linked worktree's ``.git`` is a pointer file."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git, dot_git
+    pointer = _read_small(dot_git)
+    if not pointer or not pointer.startswith("gitdir:"):
+        return None
+    git_dir = Path(pointer[len("gitdir:"):].strip())
+    if not git_dir.is_absolute():
+        git_dir = root / git_dir
+    common = _read_small(git_dir / "commondir")
+    common_dir = (git_dir / common) if common else git_dir
+    return git_dir, common_dir
+
+
+_INDEX_KEY_POS = 4
+
+
+def _receipt_cache_key(root: Path, db_path: Path) -> tuple[Any, ...]:
+    """Everything cheap whose change must drop a cached receipt at once.
+
+    Graph writes land in the WAL before a checkpoint touches the database file,
+    so both are stat'ed. Edits to untracked files are only seen after the TTL.
+    """
+    from ..locking import probe
+
+    wal = _stat_key(Path(f"{db_path}-wal"))
+    key: list[Any] = [
+        # A reader's open creates an empty WAL; empty holds nothing the db lacks.
+        str(root), _stat_key(db_path), wal if wal and wal[1] else None,
+        probe(db_path).held,
+    ]
+    dirs = _git_dirs(root)
+    if dirs is not None:
+        git_dir, common_dir = dirs
+        head = _read_small(git_dir / "HEAD")
+        ref = None
+        if head and head.startswith("ref:"):
+            name = head[len("ref:"):].strip()
+            ref = _read_small(git_dir / name) or _read_small(common_dir / name)
+        key += [_stat_key(git_dir / "index"), head, ref,
+                _stat_key(common_dir / "packed-refs")]
+    return tuple(key)
+
+
+def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
+    """The contract ``_graph`` receipt: legacy provenance plus readiness.
+
+    Never raises. A database newer than this build yields an error-shaped
+    receipt (``status: error``, ``error_code: schema_too_new``). Receipts are
+    reused for ``CRG_RECEIPT_TTL`` seconds (default 2, 0 disables) while the
+    graph, the writer lock, the git index and HEAD are unchanged.
+    """
+    try:
+        root = _resolve_root(repo_root)
+        db_path = get_db_path(root, read_only=True)
+    except Exception:
+        return None
+    ttl = env_float("CRG_RECEIPT_TTL", _RECEIPT_TTL_DEFAULT_SECONDS)
+    if ttl <= 0:
+        return _compute_graph_receipt(root, db_path)
+    try:
+        key = _receipt_cache_key(root, db_path)
+    except OSError:
+        logger.warning("Could not key the graph receipt cache for %s", root, exc_info=True)
+        return _compute_graph_receipt(root, db_path)
+    now = time.monotonic()
+    with _receipt_cache_lock:
+        hit = _receipt_cache.get(str(root))
+        if hit is not None and hit[1] == key and now - hit[0] < ttl:
+            return copy.deepcopy(hit[2])
+    receipt = _compute_graph_receipt(root, db_path)
+    if receipt is None:
+        return None
+    try:
+        after = _receipt_cache_key(root, db_path)
+    except OSError:
+        return receipt
+    # git status refreshes the index stat cache itself; anything else moving
+    # meanwhile means the receipt may already be old, so it is not kept.
+    if _without_index(after) == _without_index(key):
+        with _receipt_cache_lock:
+            _receipt_cache[str(root)] = (now, after, copy.deepcopy(receipt))
+    return receipt
+
+
+def _without_index(key: tuple[Any, ...]) -> tuple[Any, ...]:
+    return key[:_INDEX_KEY_POS] + key[_INDEX_KEY_POS + 1:]
+
+
+def _compute_graph_receipt(root: Path, db_path: Path) -> dict[str, Any] | None:
+    from ..contract import CONTRACT_VERSION
+    from ..migrations import SchemaTooNewError
+    from ..readiness import GIT_OK, generation_current, head_matches
+    from ..readiness_facts import gather_report
+
+    try:
+        report = gather_report(root, db_path, git_timeout=_RECEIPT_GIT_TIMEOUT_SECONDS)
+    except SchemaTooNewError as exc:
+        return {
+            "status": "error",
+            "error_code": "schema_too_new",
+            "message": str(exc),
+            "contract_version": CONTRACT_VERSION,
+        }
+    except Exception:
+        logger.warning("Could not compute graph readiness for %s", root, exc_info=True)
+        return None
+
+    facts = report.facts
+    readiness = report.readiness
+    if not facts.graph_exists:
+        return {"contract_version": CONTRACT_VERSION, **readiness.to_dict()}
+    git_ok = facts.git_state == GIT_OK
+    receipt = _provenance_from_rows(
+        report.metadata, lambda: facts.head_commit if git_ok else None,
+    )
+    receipt.update({
+        "contract_version": CONTRACT_VERSION,
+        **readiness.to_dict(),
+        "schema_version": report.schema_version,
+        "index_generation": facts.index_generation,
+        "built_at_commit": facts.built_at_commit,
+        "current_sha": facts.head_commit,
+        "failed_files": facts.failed_files,
+        "resolver_failures": facts.resolver_failures,
+        "source_identity": {
+            "source_matches_build": facts.source_matches is True,
+            "index_matches_runtime": facts.schema_current and generation_current(facts),
+            "runtime_matches_source": _runtime_matches_source(),
+            "edited_indexed_count": len((report.drift or {}).get("mismatched", [])),
+        },
+    })
+    if git_ok and facts.built_at_commit:
+        receipt["head_matches_build"] = head_matches(facts)
+    receipt["etag"] = _receipt_etag([
+        report.metadata.get("last_updated"), facts.built_at_commit,
+        facts.write_epoch_open, facts.write_epoch_closed, facts.index_generation,
+        report.schema_version, facts.head_commit, readiness.status.value,
+        facts.failed_files, facts.resolver_failures,
+        receipt["source_identity"]["edited_indexed_count"],
+    ])
+    return receipt
+
+
 def with_provenance(result: Any, repo_root: str | None = None) -> Any:
-    """Attach a ``_graph`` envelope without changing existing fields."""
+    """Attach a ``_graph`` receipt without changing existing fields."""
     if not isinstance(result, dict) or "_graph" in result:
         return result
-    provenance = graph_provenance(repo_root)
-    if provenance:
-        result["_graph"] = provenance
+    receipt = graph_receipt(repo_root)
+    if receipt:
+        result["_graph"] = receipt
     return result
 
 # Common JS/TS builtin method names filtered from callers_of results.
@@ -178,6 +432,15 @@ _BUILTIN_CALL_NAMES: set[str] = {
     "beforeAll", "afterAll", "mock", "spyOn",
     "require", "fetch",
 }
+
+# The names above are JS/TS runtime and library APIs. In other languages a
+# ``get``/``update``/``save`` method is ordinary repository code.
+_BUILTIN_CALL_LANGUAGES = frozenset({"javascript", "typescript", "tsx", "vue", "svelte"})
+
+
+def is_builtin_call_name(name: str, defining_languages: set[str]) -> bool:
+    """True when *name* is a JS builtin and no non-JS node defines it."""
+    return name in _BUILTIN_CALL_NAMES and not (defining_languages - _BUILTIN_CALL_LANGUAGES)
 
 
 def _validate_repo_root(path: "Path | str") -> Path:
@@ -363,30 +626,55 @@ def working_tree_drift(
 
     Returns ``missing`` (on disk, never indexed), ``mismatched`` (indexed under
     different bytes), ``deleted`` (indexed, gone from disk), and a ``check``
-    field: ``full``, ``partial`` (hash cap reached) or ``unavailable`` (the
-    graph predates ``indexed_dirty_paths``, so a restored file could hide).
+    field: ``full``, ``partial`` (hash cap reached) or ``unavailable`` (git
+    could not answer, or the graph predates ``indexed_dirty_paths`` so a
+    restored file could hide).
     """
+    return working_tree_drift_conn(root, store._conn, dirty)
+
+
+def read_dirty_paths(root: Path, timeout: float | None = None) -> list[str]:
+    """Staged, unstaged and untracked paths; raises when git cannot answer.
+
+    ``incremental.get_staged_and_unstaged`` returns None on a git failure;
+    freshness checks use this raising variant of the same reader.
+    """
+    from ..incremental import detect_vcs, get_staged_and_unstaged, read_git_dirty_paths
+
+    vcs = detect_vcs(root)
+    if vcs == "svn":
+        dirty = get_staged_and_unstaged(root)
+        if dirty is None:
+            raise GitUnavailableError(f"svn status failed: {root}")
+        return dirty
+    if vcs != "git":
+        raise GitUnavailableError(f"not a git working tree: {root}")
+    return read_git_dirty_paths(root, timeout)
+
+
+def working_tree_drift_conn(
+    root: Path, conn: sqlite3.Connection, dirty: list[str] | None = None,
+) -> dict[str, Any]:
+    """:func:`working_tree_drift` against a raw (possibly read-only) connection."""
     import hashlib
     import json as _json
 
-    from ..incremental import (
-        _is_binary,
-        _load_ignore_patterns,
-        _should_ignore,
-        get_staged_and_unstaged,
-    )
+    from ..incremental import _is_binary, _load_ignore_patterns, _should_ignore
     from ..parser import CodeParser, normalize_file_path
 
     result: dict[str, Any] = {
         "missing": [], "mismatched": [], "deleted": [], "check": "full",
     }
     try:
-        live = list(dirty) if dirty is not None else get_staged_and_unstaged(root)
-    except (OSError, subprocess.SubprocessError):
+        live = list(dirty) if dirty is not None else read_dirty_paths(root)
+    except (OSError, subprocess.SubprocessError, GitUnavailableError):
         result["check"] = "unavailable"
         return result
 
-    indexed_dirty = store.get_metadata("indexed_dirty_paths")
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = ?", ("indexed_dirty_paths",),
+    ).fetchone()
+    indexed_dirty = None if row is None else row[0]
     if indexed_dirty is None:
         # No build-time snapshot: a file restored to HEAD content after the
         # build is invisible here. Say so rather than hashing the whole tree.
@@ -421,7 +709,7 @@ def working_tree_drift(
     if not lookup:
         return result
     placeholders = ", ".join("?" * len(lookup))
-    indexed = dict(store._conn.execute(
+    indexed = dict(conn.execute(
         f"SELECT file_path, file_hash FROM nodes WHERE kind = 'File' "
         f"AND file_path IN ({placeholders})",
         lookup,

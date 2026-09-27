@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE hibernate-mapping PUBLIC
+    "-//Hibernate/Hibernate Mapping DTD 3.0//EN"
+    "http://www.hibernate.org/dtd/hibernate-mapping-3.0.dtd">
+<hibernate-mapping package="com.acme.model">
+  <class name="Order" table="orders">
+    <id name="id" column="order_id">
+      <generator class="native"/>
+    </id>
+    <many-to-one name="customer" class="User" column="customer_id"/>
+    <property name="closed" column="closed" type="boolean"/>
+    <bag name="lines" table="order_lines" cascade="all">
+      <key column="order_id"/>
+      <composite-element class="OrderLine">
+        <property name="sku" column="sku"/>
+        <property name="quantity" column="quantity"/>
+        <property name="unitCents" column="unit_cents"/>
+      </composite-element>
+    </bag>
+  </class>
+</hibernate-mapping>

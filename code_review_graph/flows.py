@@ -25,50 +25,56 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Decorator patterns that indicate a function is a framework entry point.
+# Each must match a decorator's whole name: the text before its argument
+# list, without ``@``. A dotted Java name (``@org.x.Bean``) is also tried by
+# its last segment. ``@Override`` alone says nothing about who calls a method.
+_I = re.IGNORECASE
 _FRAMEWORK_DECORATOR_PATTERNS: list[re.Pattern[str]] = [
     # Python web frameworks
-    re.compile(r"app\.(get|post|put|delete|patch|route|websocket|on_event)", re.IGNORECASE),
-    re.compile(r"router\.(get|post|put|delete|patch|route)", re.IGNORECASE),
-    re.compile(r"blueprint\.(route|before_request|after_request)", re.IGNORECASE),
-    re.compile(r"(before|after)_(request|response)", re.IGNORECASE),
+    re.compile(r"app\.(get|post|put|delete|patch|route|websocket|on_event)", _I),
+    re.compile(r"router\.(get|post|put|delete|patch|route)", _I),
+    re.compile(r"blueprint\.(route|before_request|after_request)", _I),
+    re.compile(r"(\w+\.)?(before|after)_(request|response)", _I),
     # CLI frameworks
-    re.compile(r"click\.(command|group)", re.IGNORECASE),
-    re.compile(r"\w+\.(command|group)\b", re.IGNORECASE),  # Click subgroups: @mygroup.command()
+    re.compile(r"click\.(command|group)", _I),
+    re.compile(r"\w+\.(command|group)", _I),  # Click subgroups: @mygroup.command()
     # Pydantic validators/serializers
-    re.compile(r"(field|model)_(serializer|validator)", re.IGNORECASE),
+    re.compile(r"(field|model)_(serializer|validator)", _I),
     # Task queues
-    re.compile(r"(celery\.)?(task|shared_task|periodic_task)", re.IGNORECASE),
+    re.compile(r"(\w+\.)?(task|shared_task|periodic_task)", _I),
     # Django
-    re.compile(r"receiver", re.IGNORECASE),
-    re.compile(r"api_view", re.IGNORECASE),
-    re.compile(r"\baction\b", re.IGNORECASE),
+    re.compile(r"receiver", _I),
+    re.compile(r"api_view", _I),
+    re.compile(r"action", _I),
     # Testing
-    re.compile(r"pytest\.(fixture|mark)"),
-    re.compile(r"(override_settings|modify_settings)", re.IGNORECASE),
+    re.compile(r"pytest\.(fixture|mark)(\.\w+)*"),
+    re.compile(r"(override_settings|modify_settings)", _I),
     # SQLAlchemy / event systems
-    re.compile(r"(event\.)?listens_for", re.IGNORECASE),
+    re.compile(r"(event\.)?listens_for", _I),
     # Java Spring
-    re.compile(r"(Get|Post|Put|Delete|Patch|RequestMapping)Mapping", re.IGNORECASE),
-    re.compile(r"(Scheduled|EventListener|Bean|Configuration)", re.IGNORECASE),
-    re.compile(r"KafkaListener", re.IGNORECASE),
+    re.compile(r"(Get|Post|Put|Delete|Patch|Request)Mapping", _I),
+    re.compile(r"(Scheduled|EventListener|Bean|Configuration)", _I),
+    re.compile(r"KafkaListener", _I),
     # Temporal Java callbacks are invoked by the workflow runtime.
-    re.compile(r"(WorkflowMethod|ActivityMethod)", re.IGNORECASE),
+    re.compile(r"(WorkflowMethod|ActivityMethod)", _I),
+    # Stripes event handlers and lifecycle interceptors
+    re.compile(r"(DefaultHandler|HandlesEvent|Before|After|ValidationMethod)"),
     # JS/TS frameworks
-    re.compile(r"(Component|Injectable|Controller|Module|Guard|Pipe)", re.IGNORECASE),
-    re.compile(r"(Subscribe|Mutation|Query|Resolver)", re.IGNORECASE),
+    re.compile(r"(Component|Injectable|Controller|Module|Guard|Pipe)", _I),
+    re.compile(r"(Subscribe|Mutation|Query|Resolver)", _I),
     # Express / Koa / Hono route handlers
-    re.compile(r"(app|router)\.(get|post|put|delete|patch|use|all)\b"),
+    re.compile(r"(app|router)\.(get|post|put|delete|patch|use|all)"),
     # Android lifecycle
-    re.compile(r"@(Override|OnLifecycleEvent|Composable)", re.IGNORECASE),
+    re.compile(r"(OnLifecycleEvent|Composable)", _I),
     # Kotlin coroutines / Android ViewModel
-    re.compile(r"(HiltViewModel|AndroidEntryPoint|Inject)", re.IGNORECASE),
+    re.compile(r"(HiltViewModel|AndroidEntryPoint|Inject)", _I),
     # AI/agent frameworks (pydantic-ai, langchain, etc.)
-    re.compile(r"\w+\.(tool|tool_plain|system_prompt|result_validator)\b", re.IGNORECASE),
-    re.compile(r"^tool\b"),  # bare @tool (LangChain, etc.)
+    re.compile(r"\w+\.(tool|tool_plain|system_prompt|result_validator)", _I),
+    re.compile(r"tool"),  # bare @tool (LangChain, etc.)
     # Middleware and exception handlers (Starlette, FastAPI, Sanic)
-    re.compile(r"\w+\.(middleware|exception_handler|on_exception)\b", re.IGNORECASE),
+    re.compile(r"\w+\.(middleware|exception_handler|on_exception)", _I),
     # Generic route decorator (Flask blueprints: @bp.route, @auth_bp.route, etc.)
-    re.compile(r"\w+\.route\b", re.IGNORECASE),
+    re.compile(r"\w+\.route", _I),
 ]
 
 # Name patterns that indicate conventional entry points.
@@ -135,10 +141,42 @@ def _has_framework_decorator(node: GraphNode) -> bool:
     if isinstance(decorators, str):
         decorators = [decorators]
     for dec in decorators:
+        head = str(dec).strip().lstrip("@").split("(", 1)[0].strip()
+        names = (head, head.rsplit(".", 1)[-1]) if "." in head else (head,)
         for pat in _FRAMEWORK_DECORATOR_PATTERNS:
-            if pat.search(dec):
+            if any(pat.fullmatch(name) for name in names):
                 return True
     return False
+
+
+def _stripes_action_beans(store: GraphStore) -> set[tuple[str, str]]:
+    """``(file, class)`` of every class that reaches Stripes ``ActionBean`` via INHERITS."""
+    children: dict[str, list[str]] = {}
+    for source, target in store._conn.execute(
+        "SELECT source_qualified, target_qualified FROM edges WHERE kind = 'INHERITS'"
+    ):
+        parent = target.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+        children.setdefault(parent, []).append(source)
+    beans: set[tuple[str, str]] = set()
+    frontier = ["ActionBean"]
+    while frontier:
+        for child in children.get(frontier.pop(), ()):
+            file_path, _, class_name = child.partition("::")
+            key = (file_path, class_name.rsplit(".", 1)[-1])
+            if key not in beans:
+                beans.add(key)
+                frontier.append(key[1])
+    return beans
+
+
+def _is_stripes_handler(node: GraphNode, action_beans: set[tuple[str, str]]) -> bool:
+    """A method returning a Stripes ``Resolution`` on an ActionBean is an event handler."""
+    return_type = (node.return_type or "").split("<", 1)[0].strip()
+    return (
+        node.language == "java"
+        and return_type.rsplit(".", 1)[-1].endswith("Resolution")
+        and (node.file_path, node.parent_name or "") in action_beans
+    )
 
 
 def _matches_entry_name(node: GraphNode) -> bool:
@@ -171,7 +209,8 @@ def detect_entry_points(
     An entry point is a Function/Test node that either:
     1. Has no incoming CALLS edges (true root), or
     2. Has a framework decorator (e.g. ``@app.get``), or
-    3. Matches a conventional name pattern (``main``, ``test_*``, etc.).
+    3. Matches a conventional name pattern (``main``, ``test_*``, etc.), or
+    4. Returns a Stripes ``Resolution`` from an ``ActionBean`` implementor.
 
     When *include_tests* is False (the default), Test nodes are excluded so
     that flow analysis focuses on production entry points.
@@ -184,35 +223,80 @@ def detect_entry_points(
 
     # Scan all nodes for entry-point candidates.
     candidate_nodes = store.get_nodes_by_kind(["Function", "Test"])
+    action_beans = _stripes_action_beans(store)
 
     entry_points: list[GraphNode] = []
     seen_qn: set[str] = set()
 
     for node in candidate_nodes:
-        if not include_tests and (node.is_test or _is_test_file(node.file_path)):
-            continue
-        if node.extra.get("verilog_kind"):
-            continue
-
-        is_entry = False
-
-        # True root: no one calls this function.
-        if node.qualified_name not in called_qnames:
-            is_entry = True
-
-        # Framework decorator match.
-        if _has_framework_decorator(node):
-            is_entry = True
-
-        # Conventional name match.
-        if _matches_entry_name(node):
-            is_entry = True
-
-        if is_entry and node.qualified_name not in seen_qn:
+        if _is_entry_point(node, called_qnames, action_beans, include_tests) and (
+            node.qualified_name not in seen_qn
+        ):
             entry_points.append(node)
             seen_qn.add(node.qualified_name)
 
     return entry_points
+
+
+def _is_entry_point(
+    node: GraphNode,
+    called_qnames: set[str],
+    action_beans: set[tuple[str, str]],
+    include_tests: bool,
+) -> bool:
+    if not include_tests and (node.is_test or _is_test_file(node.file_path)):
+        return False
+    if node.extra.get("verilog_kind"):
+        return False
+    return (
+        # True root: no one calls this function.
+        node.qualified_name not in called_qnames
+        # Framework decorator match.
+        or _has_framework_decorator(node)
+        # Conventional name match.
+        or _matches_entry_name(node)
+        # Stripes dispatches events to handlers by name, not by call.
+        or bool(action_beans and _is_stripes_handler(node, action_beans))
+    )
+
+
+def _entry_points_among(store: GraphStore, qualified_names: set[str]) -> list[GraphNode]:
+    """:func:`detect_entry_points` restricted to *qualified_names*, filtered in SQL."""
+    conn = store._conn
+    nodes: list[GraphNode] = []
+    called: set[str] = set()
+    for chunk in _chunks(sorted(qualified_names)):
+        marks = ",".join("?" * len(chunk))
+        nodes.extend(
+            store._row_to_node(row) for row in conn.execute(
+                f"SELECT * FROM nodes WHERE kind IN ('Function', 'Test') "  # nosec B608
+                f"AND qualified_name IN ({marks})",
+                chunk,
+            )
+        )
+        called.update(
+            row[0] for row in conn.execute(
+                f"SELECT DISTINCT e.target_qualified FROM edges e "  # nosec B608
+                f"LEFT JOIN nodes n ON n.qualified_name = e.source_qualified "
+                f"WHERE e.kind = 'CALLS' AND (n.kind IS NULL OR n.kind != 'File') "
+                f"AND e.target_qualified IN ({marks})",
+                chunk,
+            )
+        )
+    stripes_candidates = any(
+        node.language == "java" and (node.return_type or "").split("<", 1)[0].strip()
+        .endswith("Resolution")
+        for node in nodes
+    )
+    action_beans = _stripes_action_beans(store) if stripes_candidates else set()
+    return [node for node in nodes if _is_entry_point(node, called, action_beans, False)]
+
+
+_SQL_CHUNK = 450
+
+
+def _chunks(values: list) -> list[list]:
+    return [values[i:i + _SQL_CHUNK] for i in range(0, len(values), _SQL_CHUNK)]
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +389,9 @@ def trace_flows(
         return []
 
     adj = store.load_flow_adjacency()
+    # BFS order follows callee order; sorted, it matches an incremental re-trace.
+    for callees in adj.calls_out.values():
+        callees.sort()
     flows: list[dict] = []
 
     for ep in entry_points:
@@ -421,32 +508,7 @@ def store_flows(store: GraphStore, flows: list[dict]) -> int:
 
         count = 0
         for flow in flows:
-            path_json = json.dumps(flow.get("path", []))
-            conn.execute(
-                """INSERT INTO flows
-                   (name, entry_point_id, depth, node_count, file_count,
-                    criticality, path_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    flow["name"],
-                    flow["entry_point_id"],
-                    flow["depth"],
-                    flow["node_count"],
-                    flow["file_count"],
-                    flow["criticality"],
-                    path_json,
-                ),
-            )
-            flow_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            # Insert memberships.
-            node_ids = flow.get("path", [])
-            for position, node_id in enumerate(node_ids):
-                conn.execute(
-                    "INSERT OR IGNORE INTO flow_memberships (flow_id, node_id, position) "
-                    "VALUES (?, ?, ?)",
-                    (flow_id, node_id, position),
-                )
+            _insert_flow(conn, flow)
             count += 1
 
         conn.commit()
@@ -456,131 +518,253 @@ def store_flows(store: GraphStore, flows: list[dict]) -> int:
     return count
 
 
+def _insert_flow(conn, flow: dict) -> None:
+    cursor = conn.execute(
+        """INSERT INTO flows
+           (name, entry_point_id, depth, node_count, file_count,
+            criticality, path_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            flow["name"],
+            flow["entry_point_id"],
+            flow["depth"],
+            flow["node_count"],
+            flow["file_count"],
+            flow["criticality"],
+            json.dumps(flow.get("path", [])),
+        ),
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO flow_memberships (flow_id, node_id, position) "
+        "VALUES (?, ?, ?)",
+        [(cursor.lastrowid, node_id, position)
+         for position, node_id in enumerate(flow.get("path", []))],
+    )
+
+
 def incremental_trace_flows(
     store: GraphStore,
     changed_files: list[str],
     max_depth: int = 15,
+    *,
+    delta: Optional[dict] = None,
 ) -> int:
-    """Re-trace only flows that touch *changed_files*.  Much faster than full trace.
+    """Re-trace only the flows a graph change can have altered.
 
-    1. Find flow IDs whose memberships reference nodes in *changed_files*.
-    2. Collect the entry-point node IDs of those flows before deleting them.
-    3. Delete only the affected flows and their memberships.
-    4. Re-detect entry points, keeping those in *changed_files* **or** whose
-       node ID was an entry point of a deleted flow.
-    5. BFS-trace each relevant entry point via :func:`_trace_single_flow`.
-    6. INSERT the new flows (without clearing unrelated flows).
+    *delta* is the net change an incremental update journaled (see
+    ``incremental.mark_flows_stale``): the result then equals a full
+    :func:`trace_flows`. Without it the change is approximated from the
+    nodes and edges now in *changed_files*.
 
-    Returns the number of re-traced flows that were stored.
+    A flow is re-traced when its path holds a node that changed, lost or
+    gained outgoing calls or test coverage, or calls a node that appeared or
+    disappeared; an entry point is re-checked when it changed or its
+    incoming calls did. Returns the number of re-traced flows stored.
     """
-    if not changed_files:
-        return 0
-
-    # Graph identity uses POSIX separators (#774); bridge native-separator
-    # caller paths before matching against stored file_path values.
-    changed_files = [normalize_file_path(p) for p in changed_files]
+    if delta is None:
+        if not changed_files:
+            return 0
+        delta = _delta_from_files(store, [normalize_file_path(p) for p in changed_files])
     conn = store._conn
-    changed_file_set = set(changed_files)
+    nodes = set(delta.get("nodes", ()))
+    touched = nodes | set(delta.get("sources", ())) | _callers_of(conn, nodes)
+    status = nodes | set(delta.get("targets", ()))
+    if delta.get("inherits"):
+        status |= _stripes_handler_candidates(conn)
+    gone = set(delta.get("deleted_ids", ()))
+    touched_ids = _node_ids(conn, touched) | gone
+    status_ids = _node_ids(conn, status) | gone
 
-    # ------------------------------------------------------------------
-    # 1. Find affected flow IDs
-    # ------------------------------------------------------------------
-    placeholders = ",".join("?" * len(changed_files))
-    affected_rows = conn.execute(
-        f"SELECT DISTINCT fm.flow_id FROM flow_memberships fm "  # nosec B608
-        f"JOIN nodes n ON n.id = fm.node_id "
-        f"WHERE n.file_path IN ({placeholders})",
-        changed_files,
-    ).fetchall()
-    affected_ids = [r[0] for r in affected_rows]
+    affected: set[int] = set()
+    for chunk in _chunks(sorted(touched_ids)):
+        marks = ",".join("?" * len(chunk))
+        affected.update(row[0] for row in conn.execute(
+            f"SELECT DISTINCT flow_id FROM flow_memberships "  # nosec B608
+            f"WHERE node_id IN ({marks})",
+            chunk,
+        ))
+    for chunk in _chunks(sorted(status_ids)):
+        marks = ",".join("?" * len(chunk))
+        affected.update(row[0] for row in conn.execute(
+            f"SELECT id FROM flows WHERE entry_point_id IN ({marks})",  # nosec B608
+            chunk,
+        ))
+    candidates = touched | status
+    for chunk in _chunks(sorted(affected)):
+        marks = ",".join("?" * len(chunk))
+        candidates.update(row[0] for row in conn.execute(
+            f"SELECT n.qualified_name FROM flows f "  # nosec B608
+            f"JOIN nodes n ON n.id = f.entry_point_id WHERE f.id IN ({marks})",
+            chunk,
+        ))
 
-    # ------------------------------------------------------------------
-    # 2. Collect old entry-point node IDs before deletion
-    # ------------------------------------------------------------------
-    entry_point_ids: set[int] = set()
-    if affected_ids:
-        ep_placeholders = ",".join("?" * len(affected_ids))
-        ep_rows = conn.execute(
-            f"SELECT entry_point_id FROM flows "  # nosec B608
-            f"WHERE id IN ({ep_placeholders})",
-            affected_ids,
-        ).fetchall()
-        entry_point_ids = {r[0] for r in ep_rows}
-
-    # ------------------------------------------------------------------
-    # 3. Delete affected flows and their memberships
-    # ------------------------------------------------------------------
-    # Wrap in an explicit transaction so a crash mid-loop cannot leave
-    # orphaned flow_memberships rows pointing at deleted flows.  See #258.
-    if affected_ids:
-        if conn.in_transaction:
-            conn.commit()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for fid in affected_ids:
-                conn.execute(
-                    "DELETE FROM flow_memberships WHERE flow_id = ?", (fid,),
-                )
-                conn.execute("DELETE FROM flows WHERE id = ?", (fid,))
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-
-    # ------------------------------------------------------------------
-    # 4. Re-detect entry points and filter to relevant ones
-    # ------------------------------------------------------------------
-    entry_points = detect_entry_points(store)
-    relevant_eps = [
-        ep for ep in entry_points
-        if ep.file_path in changed_file_set or ep.id in entry_point_ids
-    ]
-
-    # ------------------------------------------------------------------
-    # 5. BFS-trace each relevant entry point
-    # ------------------------------------------------------------------
+    entry_points = _entry_points_among(store, candidates) if candidates else []
     new_flows: list[dict] = []
-    if relevant_eps:
-        adj = store.load_flow_adjacency()
-        for ep in relevant_eps:
+    if entry_points:
+        adj = _lazy_flow_adjacency(store, entry_points)
+        for ep in entry_points:
             flow = _trace_single_flow(adj, ep, max_depth)
             if flow is not None:
                 new_flows.append(flow)
+    new_flows.sort(key=lambda f: f["criticality"], reverse=True)
 
-    # ------------------------------------------------------------------
-    # 6. INSERT new flows without clearing unrelated ones
-    # ------------------------------------------------------------------
-    count = 0
-    for flow in new_flows:
-        path_json = json.dumps(flow.get("path", []))
-        conn.execute(
-            """INSERT INTO flows
-               (name, entry_point_id, depth, node_count, file_count,
-                criticality, path_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                flow["name"],
-                flow["entry_point_id"],
-                flow["depth"],
-                flow["node_count"],
-                flow["file_count"],
-                flow["criticality"],
-                path_json,
-            ),
-        )
-        flow_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-        node_ids = flow.get("path", [])
-        for position, node_id in enumerate(node_ids):
+    # One transaction: a crash never leaves orphaned memberships (#258).
+    with store.transaction():
+        for chunk in _chunks(sorted(affected)):
+            marks = ",".join("?" * len(chunk))
             conn.execute(
-                "INSERT OR IGNORE INTO flow_memberships (flow_id, node_id, position) "
-                "VALUES (?, ?, ?)",
-                (flow_id, node_id, position),
+                f"DELETE FROM flow_memberships WHERE flow_id IN ({marks})",  # nosec B608
+                chunk,
             )
-        count += 1
+            conn.execute(f"DELETE FROM flows WHERE id IN ({marks})", chunk)  # nosec B608
+        for flow in new_flows:
+            _insert_flow(conn, flow)
+    return len(new_flows)
 
-    conn.commit()
-    return count
+
+def _delta_from_files(store: GraphStore, files: list[str]) -> dict:
+    """Approximate a journaled delta from the current contents of *files*."""
+    conn = store._conn
+    nodes: set[str] = set()
+    targets: set[str] = set()
+    for chunk in _chunks(sorted(set(files))):
+        marks = ",".join("?" * len(chunk))
+        nodes.update(row[0] for row in conn.execute(
+            f"SELECT qualified_name FROM nodes WHERE file_path IN ({marks})",  # nosec B608
+            chunk,
+        ))
+        targets.update(row[0] for row in conn.execute(
+            f"SELECT target_qualified FROM edges "  # nosec B608
+            f"WHERE kind = 'CALLS' AND file_path IN ({marks})",
+            chunk,
+        ))
+    orphans = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT fm.node_id FROM flow_memberships fm "
+            "LEFT JOIN nodes n ON n.id = fm.node_id WHERE n.id IS NULL"
+        )
+    }
+    return {"nodes": nodes, "sources": nodes, "targets": targets, "deleted_ids": orphans}
+
+
+def _callers_of(conn, qualified_names: set[str]) -> set[str]:
+    callers: set[str] = set()
+    for chunk in _chunks(sorted(qualified_names)):
+        marks = ",".join("?" * len(chunk))
+        callers.update(row[0] for row in conn.execute(
+            f"SELECT source_qualified FROM edges "  # nosec B608
+            f"WHERE target_qualified IN ({marks}) AND kind = 'CALLS'",
+            chunk,
+        ))
+    return callers
+
+
+def _node_ids(conn, qualified_names: set[str]) -> set[int]:
+    ids: set[int] = set()
+    for chunk in _chunks(sorted(qualified_names)):
+        marks = ",".join("?" * len(chunk))
+        ids.update(row[0] for row in conn.execute(
+            f"SELECT id FROM nodes WHERE qualified_name IN ({marks})",  # nosec B608
+            chunk,
+        ))
+    return ids
+
+
+def _stripes_handler_candidates(conn) -> set[str]:
+    """Java methods that could be Stripes handlers once inheritance changes."""
+    return {
+        row[0] for row in conn.execute(
+            "SELECT qualified_name FROM nodes WHERE language = 'java' "
+            "AND kind IN ('Function', 'Test') AND return_type LIKE '%Resolution%'"
+        )
+    }
+
+
+class _LazyCalls(dict):
+    """``calls_out`` read from the edge index on first use."""
+
+    def __init__(self, conn) -> None:
+        super().__init__()
+        self._conn = conn
+
+    def get(self, qualified_name, default=None):  # type: ignore[override]
+        if not dict.__contains__(self, qualified_name):
+            self[qualified_name] = [
+                row[0] for row in self._conn.execute(
+                    "SELECT target_qualified FROM edges "
+                    "WHERE kind = 'CALLS' AND source_qualified = ? "
+                    "ORDER BY target_qualified, file_path, line",
+                    (qualified_name,),
+                )
+            ]
+        return dict.get(self, qualified_name, default)
+
+
+class _LazyNodes(dict):
+    """``nodes_by_qn`` read from the node index on first use."""
+
+    def __init__(self, store: GraphStore, by_id: dict[int, GraphNode]) -> None:
+        super().__init__()
+        self._store = store
+        self._by_id = by_id
+        self._missing: set[str] = set()
+
+    def add(self, node: GraphNode) -> None:
+        self[node.qualified_name] = node
+        self._by_id[node.id] = node
+
+    def _load(self, qualified_name) -> None:
+        if dict.__contains__(self, qualified_name) or qualified_name in self._missing:
+            return
+        row = self._store._conn.execute(
+            "SELECT * FROM nodes WHERE qualified_name = ?", (qualified_name,),
+        ).fetchone()
+        if row is None:
+            self._missing.add(qualified_name)
+        else:
+            self.add(self._store._row_to_node(row))
+
+    def get(self, qualified_name, default=None):  # type: ignore[override]
+        self._load(qualified_name)
+        return dict.get(self, qualified_name, default)
+
+    def __contains__(self, qualified_name) -> bool:
+        self._load(qualified_name)
+        return dict.__contains__(self, qualified_name)
+
+
+class _LazyTested(set):
+    """``has_tested_by`` read from the edge index on first use."""
+
+    def __init__(self, conn) -> None:
+        super().__init__()
+        self._conn = conn
+        self._known: dict[str, bool] = {}
+
+    def __contains__(self, qualified_name) -> bool:
+        known = self._known.get(qualified_name)
+        if known is None:
+            known = self._conn.execute(
+                "SELECT 1 FROM edges WHERE source_qualified = ? "
+                "AND kind = 'TESTED_BY' LIMIT 1",
+                (qualified_name,),
+            ).fetchone() is not None
+            self._known[qualified_name] = known
+        return known
+
+
+def _lazy_flow_adjacency(store: GraphStore, entry_points: list[GraphNode]) -> FlowAdjacency:
+    """Adjacency that loads only what the re-traced flows reach."""
+    by_id: dict[int, GraphNode] = {}
+    nodes = _LazyNodes(store, by_id)
+    for ep in entry_points:
+        nodes.add(ep)
+    return FlowAdjacency(
+        calls_out=_LazyCalls(store._conn),
+        has_tested_by=_LazyTested(store._conn),
+        nodes_by_qn=nodes,
+        nodes_by_id=by_id,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -372,9 +372,11 @@ class TestRefreshWiring:
                 "with_provenance",
                 side_effect=lambda result, _root: result,
             ),
+            patch.object(crg_main, "_resolve_root", side_effect=lambda root: root),
+            # The MCP tool delegates the build to a subprocess job.
             patch.object(
                 crg_main,
-                "build_or_update_graph",
+                "run_build_job",
                 return_value={"status": "ok"},
             ) as build,
             patch.object(
@@ -403,7 +405,7 @@ class TestRefreshWiring:
         assert postprocess.call_args.kwargs["embedding_provider"] == "local"
         assert postprocess.call_args.kwargs["embedding_model"] == "test-model"
 
-    def test_cli_build_forwards_exact_scope(self):
+    def test_cli_build_forwards_exact_scope(self, tmp_path):
         from code_review_graph import cli
 
         argv = [
@@ -424,7 +426,7 @@ class TestRefreshWiring:
             ) as graph_store,
             patch(
                 "code_review_graph.incremental.get_db_path",
-                return_value=MagicMock(),
+                return_value=tmp_path / "graph.db",
             ),
             patch(
                 "code_review_graph.tools.build.build_or_update_graph",

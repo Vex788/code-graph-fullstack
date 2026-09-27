@@ -12,6 +12,10 @@ import time
 from collections import deque
 from typing import Any
 
+# Tool names below are the bare names callers pass to generate_hints; hints
+# returned to clients carry the registered ``<name>_tool`` MCP names.
+_TOOL_SUFFIX = "_tool"
+
 # ---- intent categories and their characteristic tool names ----
 
 _INTENT_TOOLS: dict[str, set[str]] = {
@@ -22,7 +26,7 @@ _INTENT_TOOLS: dict[str, set[str]] = {
         "query_graph", "get_flow", "semantic_search_nodes",
     },
     "refactoring": {
-        "refactor", "find_dead_code", "suggest_refactorings",
+        "refactor", "apply_refactor", "find_large_functions",
     },
     "exploring": {
         "list_communities", "get_architecture_overview", "list_flows", "list_graph_stats",
@@ -117,6 +121,10 @@ _WORKFLOW: dict[str, list[dict[str, str]]] = {
         },
     ],
     "detect_changes": [
+        {
+            "tool": "query_graph",
+            "suggestion": "pages_for / included_by on a changed bean or page",
+        },
         {
             "tool": "get_review_context",
             "suggestion": "Build a full review context with source snippets",
@@ -247,19 +255,23 @@ def generate_hints(
     Returns::
 
         {
-            "next_steps": [{"tool": ..., "suggestion": ...}, ...],
+            "next_steps": [{"tool": "<name>_tool", "suggestion": ...}, ...],
             "related": [...],
             "warnings": [...],
         }
 
-    At most ``_MAX_PER_CATEGORY`` items per list.  Tools already called
-    in this session are suppressed from ``next_steps``.
+    At most ``_MAX_PER_CATEGORY`` items per list.  The result's own
+    ``next_tool_suggestions`` come first, so the two lists never disagree;
+    workflow tools already called in this session are suppressed.
     """
+    tool_name = tool_name.removesuffix(_TOOL_SUFFIX)
     # Update session state.
     session.record_tool_call(tool_name)
     session.inferred_intent = infer_intent(session)
 
-    next_steps = _build_next_steps(tool_name, session)
+    next_steps = _merge_steps(
+        _own_suggestions(result), _build_next_steps(tool_name, session),
+    )
     warnings = _extract_warnings(result)
     # Build related BEFORE tracking, so that the current result's files
     # are not yet in files_touched and can appear as suggestions.
@@ -302,6 +314,11 @@ def _track_result(result: dict[str, Any], session: SessionState) -> None:
         session.record_nodes(node_ids)
 
 
+def mcp_tool_name(name: str) -> str:
+    """The registered MCP name for a bare or already-suffixed tool name."""
+    return name if name.endswith(_TOOL_SUFFIX) else name + _TOOL_SUFFIX
+
+
 def _build_next_steps(
     tool_name: str, session: SessionState
 ) -> list[dict[str, str]]:
@@ -311,8 +328,38 @@ def _build_next_steps(
     out: list[dict[str, str]] = []
     for c in candidates:
         if c["tool"] not in called:
-            out.append(c)
+            out.append({**c, "tool": mcp_tool_name(c["tool"])})
     return out
+
+
+def _own_suggestions(result: dict[str, Any]) -> list[dict[str, str]]:
+    """``next_tool_suggestions`` entries (``"tool args -- why"``) as steps."""
+    raw = result.get("next_tool_suggestions")
+    if not isinstance(raw, list):
+        return []
+    steps: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        call, _, why = entry.partition(" -- ")
+        tool, _, args = call.strip().partition(" ")
+        step = {"tool": mcp_tool_name(tool), "suggestion": why.strip() or call.strip()}
+        if args:
+            step["args"] = args.strip()
+        steps.append(step)
+    return steps
+
+
+def _merge_steps(*groups: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Concatenate step lists, keeping the first step per tool."""
+    merged: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for step in group:
+            if step["tool"] not in seen:
+                seen.add(step["tool"])
+                merged.append(step)
+    return merged
 
 
 def _extract_warnings(result: dict[str, Any]) -> list[str]:

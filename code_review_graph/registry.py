@@ -8,12 +8,23 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import tempfile
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any, Callable, TypeVar
 
 from .constants import crg_home
+from .locking import writer_lock
+
+_T = TypeVar("_T")
+
+# Separate from the graph writer token so holding one never admits the other.
+_REGISTRY_TOKEN_ENV = "CRG_REGISTRY_LOCK_TOKEN"
+_REGISTRY_LOCK_WAIT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -38,28 +49,65 @@ class Registry:
         self._path = path or default_registry_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._repos: list[dict[str, str]] = []
+        self._repos: list[dict[str, Any]] = []
+        self._unparsable = False
         self._load()
 
     def _load(self) -> None:
-        """Load registry from disk."""
-        if self._path.exists():
-            try:
-                data = json.loads(self._path.read_text(encoding="utf-8", errors="replace"))
-                self._repos = data.get("repos", [])
-            except (json.JSONDecodeError, KeyError, TypeError):
-                logger.warning("Invalid registry file, starting fresh: %s", self._path)
-                self._repos = []
-        else:
-            self._repos = []
+        """Load registry from disk; an unparsable file reads as empty."""
+        self._repos = []
+        self._unparsable = False
+        if not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError) as exc:
+            logger.warning("Unparsable registry %s (%s); it is kept until backed up", self._path,
+                           exc)
+            self._unparsable = True
+            return
+        entries = data.get("repos") if isinstance(data, dict) else data
+        if not isinstance(entries, list):
+            logger.warning("Registry %s has no repos list; treating it as empty", self._path)
+            self._unparsable = True
+            return
+        self._repos = [
+            dict(entry) for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        ]
 
     def _save(self) -> None:
-        """Write registry to disk."""
+        """Write registry to disk atomically; an unparsable file is backed up first."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        if getattr(self, "_unparsable", False) and self._path.exists():
+            backup = self._path.with_name(
+                f"{self._path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+            )
+            os.replace(self._path, backup)
+            logger.warning("Backed up unparsable registry to %s", backup)
+            self._unparsable = False
         data = {"repos": self._repos}
-        self._path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=f".{self._path.name}.",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            os.replace(tmp, self._path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _mutate(self, change: Callable[[], _T]) -> _T:
+        """Re-read, apply *change*, write: under the thread lock and a file lock,
+        so two processes (or two instances) never drop each other's entries."""
+        with self._lock, writer_lock(
+            self._path, wait=_REGISTRY_LOCK_WAIT_SECONDS, token_env=_REGISTRY_TOKEN_ENV,
+        ):
+            self._load()
+            return change()
 
     def register(
         self, path: str, alias: str | None = None, data_dir: str | None = None,
@@ -94,7 +142,7 @@ class Registry:
                 f"(no .git, .svn, or .code-review-graph): {resolved}"
             )
 
-        with self._lock:
+        def change() -> dict[str, str]:
             # Check for duplicate path
             str_path = str(resolved)
             for entry in self._repos:
@@ -116,6 +164,8 @@ class Registry:
             self._save()
             return new_entry
 
+        return self._mutate(change)
+
     def unregister(self, path_or_alias: str) -> bool:
         """Remove a repository by path or alias.
 
@@ -125,8 +175,9 @@ class Registry:
         Returns:
             True if an entry was removed, False otherwise.
         """
-        with self._lock:
-            resolved = str(Path(path_or_alias).resolve())
+        resolved = str(Path(path_or_alias).resolve())
+
+        def change() -> bool:
             original_len = len(self._repos)
             self._repos = [
                 entry for entry in self._repos
@@ -137,6 +188,8 @@ class Registry:
                 self._save()
                 return True
             return False
+
+        return self._mutate(change)
 
     def list_repos(self) -> list[dict[str, str]]:
         """Return list of all registered repositories.
@@ -191,7 +244,7 @@ class Registry:
         resolved = str(Path(path).resolve())
         data_resolved = str(Path(data_dir).resolve())
 
-        with self._lock:
+        def change() -> dict[str, str]:
             # Check for existing entry
             for entry in self._repos:
                 if entry["path"] == resolved:
@@ -207,6 +260,8 @@ class Registry:
             self._repos.append(new_entry)
             self._save()
             return new_entry
+
+        return self._mutate(change)
 
     def get_data_dir_for_repo(self, path: str) -> str | None:
         """Get the stored data directory for a repository.

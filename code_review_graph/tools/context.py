@@ -8,15 +8,19 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from ..incremental import get_db_path, get_staged_and_unstaged
+from ..incremental import get_db_path
+from ..migrations import SchemaMigrationPending, SchemaTooNewError
 from ..parser import normalize_file_path
+from ..readiness import GIT_OK, GIT_UNAVAILABLE, ReadinessStatus
+from ..readiness_facts import gather_report
 from ._common import (
     _get_store,
     _resolve_root,
+    building_response,
     compact_response,
     graph_provenance,
+    schema_error_response,
     sibling_graph_root,
-    working_tree_drift,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,7 +45,7 @@ def _not_ready(
         "status": "not_ready",
         "reason": reason,
         "summary": summary,
-        "next_tool_suggestions": next_tool_suggestions or ["build_or_update_graph"],
+        "next_tool_suggestions": next_tool_suggestions or ["build_or_update_graph_tool"],
     }
     response.update(extra)
     return response
@@ -62,7 +66,7 @@ def missing_graph_response(root: Path) -> dict[str, Any] | None:
             "Query that root: it is authoritative for everything this branch did "
             "not touch, and silent about symbols the branch adds -- take those "
             "from the diff, not from an empty graph result.",
-            next_tool_suggestions=["orient", "query_graph", "get_impact_radius"],
+            next_tool_suggestions=["orient_tool", "query_graph_tool", "get_impact_radius_tool"],
             graph_repo_root=str(sibling),
             graph_provenance=graph_provenance(str(sibling)),
         )
@@ -120,7 +124,25 @@ def get_minimal_context(
     if missing is not None:
         return missing
 
-    store, root = _get_store(str(root))
+    try:
+        report = gather_report(root, get_db_path(root, read_only=True))
+    except SchemaTooNewError as exc:
+        return schema_error_response(exc)
+    readiness = report.readiness
+    status_block = readiness.to_dict()
+    if readiness.status is ReadinessStatus.BUILDING:
+        return building_response(status_block)
+    if "index_generation_mismatch" in readiness.reasons:
+        return _not_ready(
+            "rebuild_required",
+            "The graph was indexed by an incompatible build. Run a full rebuild.",
+            readiness=status_block,
+        )
+
+    try:
+        store, root = _get_store(str(root))
+    except SchemaMigrationPending:
+        return building_response(status_block)
     try:
         # 1. Quick stats
         stats = store.get_stats()
@@ -128,36 +150,49 @@ def get_minimal_context(
             return _not_ready(
                 "empty_graph",
                 "The graph database contains no nodes. Build the graph before requesting context.",
+                readiness=status_block,
             )
 
-        provenance = graph_provenance(str(root))
-        if provenance and provenance.get("head_matches_build") is False:
+        facts = report.facts
+        if facts.git_state == GIT_UNAVAILABLE:
             return _not_ready(
-                "stale_graph",
-                "The graph was built at a different Git commit. "
-                "Update it before requesting context.",
+                "git_unavailable",
+                "git could not report HEAD or the working tree, so the graph's "
+                "freshness cannot be checked. Fix git, then retry.",
+                readiness=status_block,
             )
-        if provenance and provenance.get("missing_build_anchor"):
+        if facts.git_state == GIT_OK and not facts.built_at_commit:
             return _not_ready(
                 "no_build_anchor",
                 "The graph never recorded the commit it was built at, so its "
                 "freshness cannot be checked. Rebuild it before requesting context.",
+                readiness=status_block,
+            )
+        if "head_moved" in readiness.reasons:
+            return _not_ready(
+                "stale_graph",
+                "The graph was built at a different Git commit. "
+                "Update it before requesting context.",
+                readiness=status_block,
             )
 
         # Commit identity says nothing about uncommitted work. A file the graph
-        # has never seen is the one drift that makes a query answer "no such
-        # symbol", so it blocks; edited-but-indexed files only warn, because
+        # has never seen, or an indexed one that is gone, makes a query lie about
+        # what exists, so it blocks; edited-but-indexed files only warn, because
         # going red there would paint every active editing session red and send
         # agents to grep.
-        dirty = get_staged_and_unstaged(root)
-        drift = working_tree_drift(root, store, dirty)
-        if drift["missing"]:
+        drift = report.drift or {
+            "missing": [], "mismatched": [], "deleted": [], "check": "unavailable",
+        }
+        drifted = drift["missing"] + drift["deleted"]
+        if drifted:
             return _not_ready(
                 "stale_worktree",
-                f"{len(drift['missing'])} file(s) on disk have no node in the graph; "
-                "update it before asking what exists.",
-                drifted_files=[_short(root, p) for p in drift["missing"][:10]],
-                drifted_file_count=len(drift["missing"]),
+                f"{len(drifted)} file(s) on disk have no node in the graph or were "
+                "deleted after indexing; update it before asking what exists.",
+                drifted_files=[_short(root, p) for p in drifted[:10]],
+                drifted_file_count=len(drifted),
+                readiness=status_block,
             )
 
         # 2. Risk from changed files
@@ -218,19 +253,24 @@ def get_minimal_context(
         # 5. Suggest next tools based on task keywords
         task_lower = task.lower()
         if any(w in task_lower for w in ("review", "pr", "merge", "diff")):
-            suggestions = ["detect_changes", "get_affected_flows", "get_review_context"]
+            suggestions = [
+                "detect_changes_tool", "get_affected_flows_tool", "get_review_context_tool",
+            ]
         elif any(w in task_lower for w in ("debug", "bug", "error", "fix")):
-            suggestions = ["semantic_search_nodes", "query_graph", "get_flow"]
+            suggestions = ["semantic_search_nodes_tool", "query_graph_tool", "get_flow_tool"]
         elif any(w in task_lower for w in ("refactor", "rename", "dead", "clean")):
-            suggestions = ["refactor", "find_large_functions", "get_architecture_overview"]
+            suggestions = [
+                "refactor_tool", "find_large_functions_tool",
+                "get_architecture_overview_tool",
+            ]
         elif any(w in task_lower for w in ("onboard", "understand", "explore", "arch")):
             suggestions = [
-                "get_architecture_overview", "list_communities", "list_flows",
+                "get_architecture_overview_tool", "list_communities_tool", "list_flows_tool",
             ]
         else:
             suggestions = [
-                "detect_changes", "semantic_search_nodes",
-                "get_architecture_overview",
+                "detect_changes_tool", "semantic_search_nodes_tool",
+                "get_architecture_overview_tool",
             ]
 
         # Build summary
@@ -253,12 +293,18 @@ def get_minimal_context(
         )
         # The graph still finds these symbols; their bodies and line numbers may
         # be behind the working tree. A label, not a refusal.
-        edited = drift["mismatched"] + drift["deleted"]
+        edited = drift["mismatched"]
         if edited:
             response["stale_files"] = [_short(root, p) for p in edited[:10]]
             response["stale_file_count"] = len(edited)
         if drift["check"] != "full":
             response["content_check"] = drift["check"]
+        if facts.failed_files or facts.resolver_failures:
+            response["failed_files"] = facts.failed_files
+            response["resolver_failures"] = facts.resolver_failures
+        response["readiness"] = status_block
+        # ok only when readiness is ok; partial_index is the contract's degraded value.
+        response["status"] = readiness.status.value
         return response
     finally:
         store.close()

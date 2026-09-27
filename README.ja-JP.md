@@ -1,3 +1,5 @@
+> **Upstream translation; may not reflect this fork — see [README.md](README.md).**
+
 <h1 align="center">code-review-graph</h1>
 
 <p align="center">

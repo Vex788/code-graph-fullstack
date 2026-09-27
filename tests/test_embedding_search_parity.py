@@ -11,6 +11,8 @@ import os
 import random
 import tempfile
 
+import pytest
+
 from code_review_graph.embeddings import EmbeddingStore, _encode_vector
 
 _PROVIDER = "test-provider"
@@ -52,7 +54,7 @@ def test_ranking_parity_matches_for_random_vectors() -> None:
             query_vec = [random.uniform(-1, 1) for _ in range(dim)]
             query_norm = math.sqrt(sum(x * x for x in query_vec))
 
-            import numpy as np
+            np = pytest.importorskip("numpy")  # vectorized path needs [embeddings]
 
             vec_results = store._search_vectorized(np, query_vec, query_norm, _PROVIDER, limit=50)
             py_results = store._search_pure_python(query_vec, _PROVIDER, limit=50)
@@ -90,7 +92,7 @@ def test_stored_zero_row_scores_zero_not_nan() -> None:
             query_vec = [1.0, 0.0, 0.0, 0.0]
             query_norm = 1.0
 
-            import numpy as np
+            np = pytest.importorskip("numpy")  # vectorized path needs [embeddings]
 
             vec_results = dict(
                 store._search_vectorized(np, query_vec, query_norm, _PROVIDER, limit=10)

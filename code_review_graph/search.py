@@ -13,6 +13,12 @@ import sqlite3
 from typing import Any, Optional
 
 from .graph import GraphStore, _sanitize_name
+from .migrations import (
+    create_fts_triggers,
+    drop_fts_triggers,
+    rebuild_fts_in_transaction,
+    split_name_tokens,
+)
 from .parser import normalize_file_path
 
 logger = logging.getLogger(__name__)
@@ -23,11 +29,44 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def disable_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Stop row-level FTS maintenance before a bulk load.
+
+    The index is stale until :func:`rebuild_fts` runs, which also re-enables
+    the triggers.
+    """
+    drop_fts_triggers(conn)
+
+
+def enable_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Resume row-level FTS maintenance (only valid on an in-sync index)."""
+    create_fts_triggers(conn)
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    """Rebuild ``nodes_fts`` from ``nodes`` and re-enable its triggers.
+
+    Runs inside the caller's transaction when one is open, otherwise in its
+    own ``BEGIN IMMEDIATE`` transaction. Returns the number of indexed rows.
+    """
+    if conn.in_transaction:
+        return rebuild_fts_in_transaction(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        count = rebuild_fts_in_transaction(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return count
+
+
 def rebuild_fts_index(store: GraphStore) -> int:
     """Rebuild the FTS5 index from the nodes table.
 
-    Checks whether the ``nodes_fts`` virtual table exists, clears it, then
-    repopulates it from every row in ``nodes``.
+    Drops the sync triggers, recreates ``nodes_fts`` from every row in
+    ``nodes``, then re-creates the triggers, all in one transaction so a
+    crash cannot leave the DB without an FTS table (#259).
 
     Returns:
         Number of rows indexed.
@@ -35,35 +74,10 @@ def rebuild_fts_index(store: GraphStore) -> int:
     # NOTE: rebuild_fts_index uses store._conn directly because it manages
     # the FTS5 virtual table DDL, which is tightly coupled to SQLite internals.
     conn = store._conn
-
-    # Wrap the full DROP + CREATE + INSERT sequence in an explicit transaction
-    # so a crash mid-rebuild cannot leave the DB without an FTS table at all
-    # (DROP succeeded but CREATE/INSERT didn't).  See #259.
     if conn.in_transaction:
         logger.warning("Rolling back uncommitted transaction before BEGIN IMMEDIATE")
         conn.rollback()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        # Drop and recreate the FTS table with content sync to match migration v5
-        conn.execute("DROP TABLE IF EXISTS nodes_fts")
-        conn.execute("""
-            CREATE VIRTUAL TABLE nodes_fts USING fts5(
-                name, qualified_name, file_path, signature,
-                content='nodes', content_rowid='rowid',
-                tokenize='porter unicode61'
-            )
-        """)
-
-        # Rebuild from the content table (nodes) using the FTS5 rebuild command
-        conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
-
-
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-
-    count = conn.execute("SELECT count(*) FROM nodes_fts").fetchone()[0]
+    count = rebuild_fts(conn)
     logger.info("FTS index rebuilt: %d rows indexed", count)
     return count
 
@@ -179,6 +193,34 @@ def rrf_merge(*result_lists: list[tuple[int, float]], k: int = 60) -> list[tuple
 # ---------------------------------------------------------------------------
 
 
+_QUERY_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+# Words that would OR half the index into the candidate list.
+_FTS_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in",
+    "is", "it", "of", "on", "or", "the", "to", "what", "where", "which", "who", "with",
+})
+
+
+def _fts_quote(text: str) -> str:
+    """One FTS5 string literal, so query text can never become an operator."""
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _query_terms(query: str) -> tuple[list[str], list[str], str]:
+    """Words of a query: ``(raw words, distinct name tokens, full token sequence)``.
+
+    The sequence keeps every token in order, as ``name_tokens`` stores it, so
+    a phrase over it matches the same identifier split the same way.
+    """
+    raw = [w for w in _QUERY_WORD_RE.findall(query) if w.lower() not in _FTS_STOPWORDS]
+    sequence = " ".join(split_name_tokens(word) for word in raw).strip()
+    tokens: list[str] = []
+    for tok in sequence.split():
+        if len(tok) >= 2 and tok not in _FTS_STOPWORDS and tok not in tokens:
+            tokens.append(tok)
+    return raw, tokens, sequence
+
+
 def _fts_search(
     conn: sqlite3.Connection,
     query: str,
@@ -186,20 +228,37 @@ def _fts_search(
 ) -> list[tuple[int, float]]:
     """Run an FTS5 BM25 search against the nodes_fts table.
 
+    Phrase hits come first: the whole query as one phrase in any column, or
+    its camelCase/snake_case words as one phrase in ``name_tokens`` (so
+    "vendor invoice" finds ``VendorInvoiceActionBean``). Broader hits follow:
+    any word of a multi-word query, or all parts of a single identifier in
+    any order, so a query never misses because one word is absent.
+
     Returns list of ``(node_id, bm25_score)`` tuples. The BM25 score is
     negated so higher = better (FTS5 returns negative BM25).
     """
-    # Sanitize: wrap in double quotes to prevent FTS5 operator injection
-    safe_query = '"' + query.replace('"', '""') + '"'
+    raw, tokens, sequence = _query_terms(query)
+    phrase = _fts_quote(query)
+    if sequence:
+        phrase += " OR name_tokens : " + _fts_quote(sequence)
+    broad: Optional[str] = None
+    if len(raw) > 1:
+        words = dict.fromkeys([w.lower() for w in raw] + tokens)
+        broad = " OR ".join(_fts_quote(word) for word in words)
+    elif len(tokens) > 1:
+        broad = " AND ".join(_fts_quote(tok) for tok in tokens)
 
+    sql = "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY rank LIMIT ?"
     try:
-        rows = conn.execute(
-            "SELECT rowid, rank FROM nodes_fts WHERE nodes_fts MATCH ? "
-            "ORDER BY rank LIMIT ?",
-            (safe_query, limit),
-        ).fetchall()
         # FTS5 rank is negative BM25 (lower = better), negate for consistency
-        return [(row[0], -row[1]) for row in rows]
+        hits = [(row[0], -row[1]) for row in conn.execute(sql, (phrase, limit)).fetchall()]
+        if broad and len(hits) < limit:
+            seen = {node_id for node_id, _ in hits}
+            for row in conn.execute(sql, (broad, limit)).fetchall():
+                if row[0] not in seen:
+                    seen.add(row[0])
+                    hits.append((row[0], -row[1]))
+        return hits[:limit]
     except sqlite3.OperationalError as e:
         logger.warning("FTS5 search failed: %s", e)
         return []
@@ -216,35 +275,53 @@ def _embedding_search(
     limit: int = 50,
     model: str | None = None,
     provider: str | None = None,
+    repo_root: str | None = None,
+    info: Optional[dict[str, Any]] = None,
 ) -> list[tuple[int, float]]:
     """Run a vector similarity search using the embedding store.
 
-    Returns list of ``(node_id, similarity_score)`` tuples.
-    Gracefully returns an empty list if embeddings are not available.
+    Returns list of ``(node_id, similarity_score)`` tuples, empty when
+    embeddings are off, unavailable or not built yet. *info* (when given)
+    receives ``embeddings_state`` and a ``warning`` explaining any fallback.
     """
+    out = info if info is not None else {}
+    out.setdefault("embeddings_state", "off")
     try:
-        from .embeddings import EmbeddingStore
+        from .embeddings import open_search_store
     except ImportError:
         return []
 
     try:
-        emb_store = EmbeddingStore(store.db_path, provider=provider, model=model)
+        emb_store, state = open_search_store(
+            store.db_path, repo_root=repo_root, provider=provider, model=model,
+        )
+        out["embeddings_state"] = state["state"]
+        if state.get("provider"):
+            out["embeddings_provider"] = state["provider"]
+        if state.get("warning"):
+            out["warning"] = state["warning"]
+        if emb_store is None:
+            return []
         try:
-            if not emb_store.available or emb_store.count() == 0:
-                return []
-
             results = emb_store.search(query, limit=limit)
-            # Map qualified names back to node IDs
-            id_scores: list[tuple[int, float]] = []
-            for qn, score in results:
-                node = store.get_node(qn)
-                if node:
-                    id_scores.append((node.id, score))
-            return id_scores
         finally:
             emb_store.close()
+        # Map qualified names back to node IDs in batched lookups.
+        ids: dict[str, int] = {}
+        names = [qn for qn, _ in results]
+        for i in range(0, len(names), 450):
+            chunk = names[i:i + 450]
+            marks = ",".join("?" * len(chunk))
+            for row in store._conn.execute(
+                f"SELECT id, qualified_name FROM nodes WHERE qualified_name IN ({marks})",  # nosec B608
+                chunk,
+            ):
+                ids[row["qualified_name"]] = row["id"]
+        return [(ids[qn], score) for qn, score in results if qn in ids]
     except Exception as e:
         logger.warning("Embedding search failed: %s", e)
+        out["embeddings_state"] = "unavailable"
+        out["warning"] = f"embedding search failed ({type(e).__name__}); keyword results only"
         return []
 
 
@@ -305,6 +382,9 @@ def _keyword_search(
 # Main hybrid search
 # ---------------------------------------------------------------------------
 
+# Below this many ranked hits the LIKE lane tops the list up.
+_FEW_HITS = 5
+
 
 def hybrid_search(
     store: GraphStore,
@@ -315,6 +395,8 @@ def hybrid_search(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     _out_mode: Optional[list[str]] = None,
+    repo_root: Optional[str] = None,
+    _out_info: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """Hybrid search combining FTS5 BM25 and vector embeddings via RRF.
 
@@ -333,6 +415,12 @@ def hybrid_search(
             ``"hybrid"`` (FTS + embeddings), ``"fts"`` (FTS only),
             ``"semantic"`` (embeddings only), ``"keyword"`` (LIKE fallback),
             or ``"none"`` (empty query, or all search paths returned 0 results).
+        repo_root: Repository whose ``.code-review-graph.toml`` decides
+            whether embeddings are on (derived from the database path when
+            omitted).
+        _out_info: Optional dict that receives ``embeddings_state``
+            (off|ready|stale|unavailable) and a ``warning`` when semantic
+            search was wanted but keyword search had to answer alone.
 
     Returns:
         List of dicts with node metadata and ``score`` field.
@@ -359,8 +447,10 @@ def hybrid_search(
         logger.warning("FTS5 unavailable, will use fallback: %s", e)
 
     # Try embedding search
+    info: dict[str, Any] = _out_info if _out_info is not None else {}
     emb_results = _embedding_search(
         store, query, limit=fetch_limit, model=model, provider=provider,
+        repo_root=repo_root, info=info,
     )
 
     # ------ Phase 2: Merge via RRF or fallback ------
@@ -371,6 +461,15 @@ def hybrid_search(
         if emb_results:
             lists_to_merge.append(emb_results)
         merged = rrf_merge(*lists_to_merge)
+        if len(merged) < _FEW_HITS:
+            # Few ranked hits: substring matches catch spellings FTS tokens miss.
+            seen = {node_id for node_id, _ in merged}
+            floor = merged[-1][1] if merged else 1.0
+            for node_id, _score in _keyword_search(conn, query, limit=fetch_limit):
+                if node_id not in seen:
+                    seen.add(node_id)
+                    floor *= 0.99
+                    merged.append((node_id, floor))
         if _out_mode is not None:
             if fts_results and emb_results:
                 _out_mode.append("hybrid")

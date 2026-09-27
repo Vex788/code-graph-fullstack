@@ -7,6 +7,7 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -23,8 +24,11 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
-from .graph import GraphStore
-from .parser import CodeParser, normalize_file_path
+from .constants import env_float, env_int
+from .graph import STORE_BATCH_FILES, GraphStore
+from .locking import writer_lock
+from .migrations import INDEX_GENERATION, get_index_generation
+from .parser import CodeParser, normalize_file_path, probe_grammars, seed_parser_probes
 from .resolvers import RESOLVERS, run_resolver
 
 _MAX_PARSE_WORKERS = int(os.environ.get("CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))))
@@ -69,16 +73,328 @@ def _select_executor_kind() -> str:
     return "process"
 
 
-def _make_executor(max_workers: int):
-    """Construct the parallel-parse executor selected by [_select_executor_kind]."""
+def _make_executor(max_workers: int, probes: Optional[dict[str, bool]] = None):
+    """Construct the parallel-parse executor selected by [_select_executor_kind].
+
+    Process workers start with the parent's grammar *probes* instead of each
+    spawning its own probe per grammar.
+    """
     if _select_executor_kind() == "thread":
         return concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+    return concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_workers, initializer=seed_parser_probes, initargs=(probes or {},),
+    )
 
 logger = logging.getLogger(__name__)
 
-CPP_IDENTITY_VERSION = "1"
-_CPP_IDENTITY_METADATA_KEY = "cpp_identity_version"
+# Seconds a library writer (MCP build, watcher) waits for the writer lock.
+# The CLI takes the lock itself first, per ``--if-locked``.
+_WRITER_LOCK_WAIT = env_float("CRG_WRITER_LOCK_WAIT", 120.0)
+
+# Write-epoch metadata read by readiness_facts.gather_report.
+_EPOCH_OPEN_KEY = "write_epoch_open"
+_EPOCH_CLOSED_KEY = "write_epoch_closed"
+_FAILED_FILES_KEY = "failed_files"
+_RESOLVER_FAILURES_KEY = "resolver_failures"
+_INDEX_GENERATION_KEY = "index_generation"
+
+FAULT_STAGES = ("parse", "store", "resolvers", "postprocess", "stamp")
+
+
+def fault_point(stage: str) -> None:
+    """Test hook: ``CRG_FAULT_AT=<stage>`` fails the write at that stage.
+
+    ``CRG_FAULT_MODE=kill`` SIGKILLs the process instead of raising.
+    """
+    if os.environ.get("CRG_FAULT_AT") != stage:
+        return
+    if os.environ.get("CRG_FAULT_MODE") == "kill" and hasattr(signal, "SIGKILL"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    raise RuntimeError(f"injected fault at stage {stage!r}")
+
+
+@contextlib.contextmanager
+def store_writer_lock(store: GraphStore, wait: Optional[float] = None):
+    """Hold the writer lock for *store*'s database (re-entrant)."""
+    if str(store.db_path) in ("", ":memory:"):
+        yield None
+        return
+    with writer_lock(store.db_path, wait=_WRITER_LOCK_WAIT if wait is None else wait) as token:
+        yield token
+
+
+def _meta_int(store: GraphStore, key: str) -> int:
+    try:
+        return int(store.get_metadata(key) or 0)
+    except ValueError:
+        return 0
+
+
+def write_epoch_is_open(store: GraphStore) -> bool:
+    """True when a write opened an epoch that no stamp has closed."""
+    return _meta_int(store, _EPOCH_OPEN_KEY) > _meta_int(store, _EPOCH_CLOSED_KEY)
+
+
+def open_write_epoch(store: GraphStore) -> int:
+    """Commit ``write_epoch_open = n + 1`` before any graph write; returns it."""
+    epoch = max(_meta_int(store, _EPOCH_OPEN_KEY), _meta_int(store, _EPOCH_CLOSED_KEY)) + 1
+    store.set_metadata(_EPOCH_OPEN_KEY, str(epoch))
+    return epoch
+
+
+def read_failed_files(store: GraphStore) -> list[str]:
+    raw = store.get_metadata(_FAILED_FILES_KEY)
+    try:
+        value = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def read_resolver_failures(store: GraphStore) -> dict[str, str]:
+    raw = store.get_metadata(_RESOLVER_FAILURES_KEY)
+    try:
+        value = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+
+
+class _VcsState(NamedTuple):
+    vcs: str
+    branch: str
+    revision: str
+    # None: git could not list dirty paths.
+    dirty: Optional[list[str]]
+
+
+def _capture_vcs_state(repo_root: Path) -> _VcsState:
+    """VCS anchor taken when a write starts, stamped when it ends."""
+    vcs = detect_vcs(repo_root)
+    if vcs == "git":
+        branch, sha = _git_branch_info(repo_root)
+        dirty = get_staged_and_unstaged(repo_root)
+        return _VcsState(vcs, branch, sha, sorted(dirty) if dirty is not None else None)
+    if vcs == "svn":
+        branch, rev = _svn_revision_info(repo_root)
+        return _VcsState(vcs, branch, rev, None)
+    return _VcsState(vcs, "", "", None)
+
+
+def stamp_write_epoch(
+    store: GraphStore,
+    epoch: int,
+    *,
+    started_at: str,
+    build_type: str,
+    vcs: _VcsState,
+    ignore_policy: str,
+    failed_files: list[str],
+    resolver_failures: dict[str, str],
+) -> None:
+    """Close *epoch* in one transaction with everything readiness reads.
+
+    Runs last, after parse, store, resolvers and post-processing.
+    """
+    with store.transaction():
+        fault_point("stamp")
+        store.set_metadata("last_updated", started_at)
+        store.set_metadata("last_build_type", build_type)
+        store.set_metadata(_IGNORE_POLICY_METADATA_KEY, ignore_policy)
+        if vcs.vcs == "git":
+            if vcs.branch:
+                store.set_metadata("git_branch", vcs.branch)
+            if vcs.revision:
+                # The build anchor readiness compares with HEAD.
+                store.set_metadata("git_head_sha", vcs.revision)
+            if vcs.dirty is None:
+                # Without a snapshot the drift check reports "unavailable".
+                store.delete_metadata("indexed_dirty_paths")
+            else:
+                store.set_metadata(
+                    "indexed_dirty_paths", json.dumps(vcs.dirty, separators=(",", ":")),
+                )
+        elif vcs.vcs == "svn":
+            if vcs.branch:
+                store.set_metadata("svn_branch", vcs.branch)
+            if vcs.revision:
+                store.set_metadata("svn_revision", vcs.revision)
+        store.set_metadata(_FAILED_FILES_KEY, json.dumps(sorted(set(failed_files))))
+        store.set_metadata(
+            _RESOLVER_FAILURES_KEY, json.dumps(resolver_failures, sort_keys=True),
+        )
+        store.set_metadata(_INDEX_GENERATION_KEY, str(INDEX_GENERATION))
+        store.set_metadata(_EPOCH_CLOSED_KEY, str(epoch))
+
+
+def finish_write(store: GraphStore, result: dict[str, Any]) -> None:
+    """Stamp the epoch a ``stamp=False`` build or update left open.
+
+    Folds post-processing failures (``result["postprocess_failures"]``) into
+    ``resolver_failures`` and sets ``status`` to ``partial`` on any failure.
+    """
+    pending = result.pop("_pending_stamp", None)
+    if pending is None:
+        return
+    failures = dict(result.get("resolver_failures") or {})
+    for key in [k for k in failures if k.startswith("postprocess.")]:
+        if key in (result.get("postprocess_ran") or ()):
+            failures.pop(key)
+    failures.update(result.get("postprocess_failures") or {})
+    result["resolver_failures"] = failures
+    stamp_write_epoch(
+        store,
+        result["write_epoch"],
+        failed_files=result.get("failed_files") or [],
+        resolver_failures=failures,
+        **pending,
+    )
+    store.checkpoint()
+    result["status"] = "partial" if failures or result.get("failed_files") else "ok"
+
+
+# -- Graph delta: what flows and communities must re-derive -----------------
+#
+# An incremental write journals every node and edge change through temporary
+# triggers on its own connection, so resolver rewrites in unchanged files are
+# seen too. The net change is merged into ``flows_stale`` metadata; the next
+# full post-processing consumes it. {"full": true} asks for a full recompute.
+
+_FLOWS_STALE_KEY = "flows_stale"
+_DELTA_LISTS = ("nodes", "sources", "targets", "deleted_ids")
+_MAX_DELTA_ENTRIES = env_int("CRG_MAX_DELTA_ENTRIES", 50_000, minimum=1)
+# Columns flows, communities and embedding text read; line moves are not changes.
+_NODE_COLUMNS = (
+    "kind", "name", "qualified_name", "file_path", "language", "parent_name",
+    "params", "return_type", "modifiers", "is_test", "extra",
+)
+_JOURNAL_TRIGGERS = {
+    "crg_delta_node_insert": (
+        "AFTER INSERT ON main.nodes BEGIN INSERT INTO crg_delta VALUES "
+        "('n', NEW.kind, NEW.qualified_name, NULL, NEW.id, NULL); END"
+    ),
+    "crg_delta_node_delete": (
+        "AFTER DELETE ON main.nodes BEGIN INSERT INTO crg_delta VALUES "
+        "('d', OLD.kind, OLD.qualified_name, NULL, OLD.id, NULL); END"
+    ),
+    "crg_delta_node_update": (
+        "AFTER UPDATE ON main.nodes WHEN "
+        + " OR ".join(f"OLD.{column} IS NOT NEW.{column}" for column in _NODE_COLUMNS)
+        + " BEGIN INSERT INTO crg_delta VALUES "
+        "('n', NEW.kind, NEW.qualified_name, NULL, NEW.id, NULL); "
+        "INSERT INTO crg_delta VALUES ('n', OLD.kind, OLD.qualified_name, NULL, NULL, NULL); END"
+    ),
+    "crg_delta_edge_insert": (
+        "AFTER INSERT ON main.edges BEGIN INSERT INTO crg_delta VALUES "
+        "('+', NEW.kind, NEW.source_qualified, NEW.target_qualified, NULL, NEW.file_path); END"
+    ),
+    "crg_delta_edge_delete": (
+        "AFTER DELETE ON main.edges BEGIN INSERT INTO crg_delta VALUES "
+        "('-', OLD.kind, OLD.source_qualified, OLD.target_qualified, NULL, OLD.file_path); END"
+    ),
+    "crg_delta_edge_update": (
+        "AFTER UPDATE ON main.edges WHEN OLD.kind IS NOT NEW.kind "
+        "OR OLD.source_qualified IS NOT NEW.source_qualified "
+        "OR OLD.target_qualified IS NOT NEW.target_qualified BEGIN "
+        "INSERT INTO crg_delta VALUES "
+        "('-', OLD.kind, OLD.source_qualified, OLD.target_qualified, NULL, OLD.file_path); "
+        "INSERT INTO crg_delta VALUES "
+        "('+', NEW.kind, NEW.source_qualified, NEW.target_qualified, NULL, NEW.file_path); END"
+    ),
+}
+
+
+def _start_delta_journal(store: GraphStore) -> None:
+    conn = store._conn
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS crg_delta "
+        "(op TEXT, kind TEXT, a TEXT, b TEXT, node_id INTEGER, file_path TEXT)"
+    )
+    conn.execute("DELETE FROM temp.crg_delta")
+    for name, body in _JOURNAL_TRIGGERS.items():
+        conn.execute(f"CREATE TEMP TRIGGER IF NOT EXISTS {name} {body}")
+    conn.commit()
+
+
+def _stop_delta_journal(store: GraphStore) -> dict[str, Any]:
+    """Drop the triggers and return the net change they recorded."""
+    conn = store._conn
+    for name in _JOURNAL_TRIGGERS:
+        conn.execute(f"DROP TRIGGER IF EXISTS temp.{name}")
+    nodes: set[str] = set()
+    deleted_ids: set[int] = set()
+    edge_net: dict[tuple[str, str, str], int] = {}
+    for op, kind, a, b, node_id in conn.execute(
+        "SELECT op, kind, a, b, node_id FROM temp.crg_delta"
+    ):
+        if op in ("n", "d"):
+            nodes.add(a)
+            if op == "d":
+                deleted_ids.add(node_id)
+        else:
+            key = (kind, a, b)
+            edge_net[key] = edge_net.get(key, 0) + (1 if op == "+" else -1)
+    conn.execute("DELETE FROM temp.crg_delta")
+    conn.commit()
+    changed = [key for key, count in edge_net.items() if count]
+    return {
+        "nodes": sorted(nodes),
+        "sources": sorted({s for k, s, _t in changed if k in ("CALLS", "TESTED_BY")}),
+        "targets": sorted({t for k, _s, t in changed if k == "CALLS"}),
+        "deleted_ids": sorted(deleted_ids),
+        "inherits": any(k in ("INHERITS", "IMPLEMENTS") for k, _s, _t in changed),
+        "structural": bool(nodes or changed),
+    }
+
+
+def _journal_mark(store: GraphStore) -> int:
+    row = store._conn.execute("SELECT MAX(rowid) FROM temp.crg_delta").fetchone()
+    return int(row[0] or 0)
+
+
+def _files_that_lost_edges(store: GraphStore, since: int) -> set[str]:
+    """Files whose edges were deleted after journal position *since*."""
+    return {
+        row[0] for row in store._conn.execute(
+            "SELECT DISTINCT file_path FROM temp.crg_delta "
+            "WHERE rowid > ? AND op = '-' AND file_path IS NOT NULL",
+            (since,),
+        )
+    }
+
+
+def read_flows_stale(store: GraphStore) -> Optional[dict[str, Any]]:
+    """The graph change flows and communities have not absorbed yet, or None."""
+    raw = store.get_metadata(_FLOWS_STALE_KEY)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {"full": True}
+    return value if isinstance(value, dict) else {"full": True}
+
+
+def mark_flows_stale(store: GraphStore, delta: dict[str, Any]) -> None:
+    """Merge *delta* into the pending change; too large a change becomes full."""
+    pending = read_flows_stale(store)
+    if delta.get("full") or (pending is not None and pending.get("full")):
+        merged: dict[str, Any] = {"full": True}
+    else:
+        previous = pending or {}
+        merged = {
+            key: sorted(set(previous.get(key, ())) | set(delta.get(key, ())))
+            for key in _DELTA_LISTS
+        }
+        for flag in ("inherits", "structural"):
+            merged[flag] = bool(previous.get(flag) or delta.get(flag))
+        if sum(len(merged[key]) for key in _DELTA_LISTS) > _MAX_DELTA_ENTRIES:
+            merged = {"full": True}
+    store.set_metadata(_FLOWS_STALE_KEY, json.dumps(merged, separators=(",", ":")))
+
+
+def clear_flows_stale(store: GraphStore) -> None:
+    store.delete_metadata(_FLOWS_STALE_KEY)
 
 
 # Extension -> language tag, matching the RESOLVERS frozensets in
@@ -709,13 +1025,14 @@ def clear_nested_ignore_cache() -> None:
 def _is_binary(path: Path) -> bool:
     """Quick heuristic: check if file appears to be binary."""
     try:
-        chunk = path.read_bytes()[:8192]
+        with open(path, "rb") as fh:
+            chunk = fh.read(8192)
         return b"\x00" in chunk
     except (OSError, PermissionError):
         return True
 
 
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
+_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds, configurable
 
 # When True, `git ls-files --recurse-submodules` is used so that files
 # inside git submodules are included in the graph.  Opt-in via env var;
@@ -813,44 +1130,6 @@ def _decode_name_status_paths(output: bytes) -> list[str]:
                 seen.add(path)
                 paths.append(path)
     return paths
-
-
-def _store_indexed_dirty_paths(repo_root: Path, store: "GraphStore") -> None:
-    """Record which paths were dirty when the graph was built.
-
-    A freshness check that only looks at the CURRENT dirty set misses one case:
-    a file that was dirty at build time and has since been restored to its HEAD
-    content leaves the dirty set entirely, while the graph still holds the
-    version it was indexed from. Storing the paths (not their hashes -- the
-    authoritative hash is ``nodes.file_hash``, read live) keeps that file under
-    observation. An empty list is written deliberately: a MISSING key means the
-    graph predates this feature, which callers treat differently.
-    """
-    try:
-        dirty = sorted(get_staged_and_unstaged(repo_root))
-    except (OSError, subprocess.SubprocessError):
-        return
-    store.set_metadata(
-        "indexed_dirty_paths", json.dumps(dirty, separators=(",", ":")),
-    )
-
-
-def _store_vcs_metadata(repo_root: Path, store: "GraphStore") -> None:
-    """Persist VCS branch/revision info into the graph metadata table."""
-    vcs = detect_vcs(repo_root)
-    if vcs == "git":
-        branch, sha = _git_branch_info(repo_root)
-        if branch:
-            store.set_metadata("git_branch", branch)
-        if sha:
-            store.set_metadata("git_head_sha", sha)
-        _store_indexed_dirty_paths(repo_root, store)
-    elif vcs == "svn":
-        branch, rev = _svn_revision_info(repo_root)
-        if branch:
-            store.set_metadata("svn_branch", branch)
-        if rev:
-            store.set_metadata("svn_revision", rev)
 
 
 def _commit_object_exists(repo_root: Path, ref: str) -> bool:
@@ -988,43 +1267,56 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
     except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return []
 
-def get_staged_and_unstaged(repo_root: Path) -> list[str]:
-    """Get all modified files (staged + unstaged + untracked)."""
+class GitUnavailableError(RuntimeError):
+    """git could not answer; callers must not read this as a clean tree."""
+
+
+def read_git_dirty_paths(repo_root: Path, timeout: Optional[float] = None) -> list[str]:
+    """Staged, unstaged and untracked paths from ``git status``.
+
+    Raises :class:`GitUnavailableError` when git fails, times out or is
+    missing. With porcelain ``-z`` a rename/copy record lists its
+    destination first and its source in the following record.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            capture_output=True,
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT if timeout is None else timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitUnavailableError(f"git status failed: {exc}") from exc
+    if result.returncode != 0:
+        raise GitUnavailableError(f"git status exited {result.returncode}")
+    files: list[str] = []
+    records = result.stdout.split(b"\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        if len(record) > 3:
+            files.append(os.fsdecode(record[3:]))
+            if b"R" in record[:2] or b"C" in record[:2]:
+                index += 1
+        index += 1
+    return files
+
+
+def get_staged_and_unstaged(repo_root: Path) -> Optional[list[str]]:
+    """Get all modified files (staged + unstaged + untracked).
+
+    Returns None when git cannot answer (non-zero exit, timeout, missing
+    binary): that is "unavailable", never a clean tree.
+    """
     if detect_vcs(repo_root) == "svn":
         return _get_svn_changed_files(repo_root)
     try:
-        result = subprocess.run(
-            [
-                "git",
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-            ],
-            capture_output=True,
-            cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-        if result.returncode != 0:
-            logger.warning("git status failed while discovering working-tree files")
-            return []
-        files: list[str] = []
-        records = result.stdout.split(b"\0")
-        index = 0
-        while index < len(records):
-            record = records[index]
-            if len(record) > 3:
-                status = record[:2]
-                files.append(os.fsdecode(record[3:]))
-                # With porcelain -z, a rename/copy record stores the
-                # destination first and its source in the following record.
-                if b"R" in status or b"C" in status:
-                    index += 1
-            index += 1
-        return files
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+        return read_git_dirty_paths(repo_root)
+    except GitUnavailableError as exc:
+        logger.warning("git status unavailable for %s: %s", repo_root, exc)
+        return None
+
 
 def get_all_tracked_files(
     repo_root: Path,
@@ -1140,13 +1432,56 @@ def collect_all_files(
     return files
 
 
+_SKIPPED_FILES_SHOWN = 50
+
+
+def _max_file_bytes() -> int:
+    return env_int("CRG_MAX_FILE_BYTES", 2 * 1024 * 1024, minimum=1)
+
+
+def _oversized_bytes(path: Path, limit: int) -> Optional[int]:
+    """The file's size when it exceeds *limit*, else None."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    return size if size > limit else None
+
+
+def _drop_oversized(repo_root: Path, rel_paths: list[str]) -> tuple[list[str], list[dict]]:
+    """Split off files over ``CRG_MAX_FILE_BYTES``; they are reported, never parsed."""
+    limit = _max_file_bytes()
+    kept: list[str] = []
+    skipped: list[dict] = []
+    for rel_path in rel_paths:
+        size = _oversized_bytes(repo_root / rel_path, limit)
+        if size is None:
+            kept.append(rel_path)
+        else:
+            skipped.append({"file": rel_path, "bytes": size})
+    return kept, skipped
+
+
+def _skipped_section(skipped: list[dict]) -> dict[str, Any]:
+    if skipped:
+        logger.warning(
+            "Skipped %d file(s) over CRG_MAX_FILE_BYTES=%d, e.g. %s",
+            len(skipped), _max_file_bytes(), skipped[0]["file"],
+        )
+    return {
+        "files_skipped": len(skipped),
+        "skipped_files": sorted(skipped, key=lambda e: e["file"])[:_SKIPPED_FILES_SHOWN],
+    }
+
+
 def _reconcile_stale_files(
     repo_root: Path,
     store: GraphStore,
     current_files: list[str] | None = None,
+    stored: list[str] | None = None,
 ) -> list[str]:
     """Remove graph files absent from the current parseable repository inventory."""
-    stored_files = set(store.get_all_files())
+    stored_files = set(store.get_all_files() if stored is None else stored)
     current_paths: set[str]
     if current_files is not None:
         current_paths = {
@@ -1186,7 +1521,9 @@ _DRIFT_MTIME_TOLERANCE_SECONDS = float(
 )
 
 
-def _detect_content_drift(repo_root: Path, store: GraphStore) -> list[str]:
+def _detect_content_drift(
+    repo_root: Path, store: GraphStore, stored: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
     """Find indexed files whose on-disk content no longer matches the graph.
 
     Git cannot see this divergence: the watcher applies an edit while HEAD
@@ -1195,37 +1532,47 @@ def _detect_content_drift(repo_root: Path, store: GraphStore) -> list[str]:
     still describes the reverted content. The sweep is stat-first — only files
     whose mtime is newer than the graph's ``last_updated`` record are hashed —
     so a quiet repository pays one ``stat`` per indexed file and no hashing.
-    Returns repo-relative paths ready to enter the changed-file pipeline.
+
+    Returns ``(drifted, vanished)``: repo-relative paths ready to enter the
+    changed-file pipeline, and stored paths whose file no longer exists.
     """
     built_at_raw = store.get_metadata("last_updated")
     if not built_at_raw:
-        return []
+        return [], []
     try:
         # ``last_updated`` is written by time.strftime (naive local time);
         # .timestamp() reads it back in that same local-time frame.
         threshold = datetime.fromisoformat(built_at_raw).timestamp()
     except ValueError:
-        return []
+        return [], []
     threshold += _DRIFT_MTIME_TOLERANCE_SECONDS
 
     drifted: list[str] = []
-    for stored_path in store.get_all_files():
+    vanished: list[str] = []
+    for stored_path in store.get_all_files() if stored is None else stored:
         path = Path(stored_path)
         try:
             if path.stat().st_mtime <= threshold:
                 continue
             raw = path.read_bytes()
+        except FileNotFoundError:
+            try:
+                path.relative_to(repo_root)
+            except ValueError:
+                continue
+            vanished.append(stored_path)
+            continue
         except OSError:
             continue
-        node = next(store.iter_nodes_by_file(stored_path), None)
-        if node is None or not node.file_hash:
+        stored_hash = store.get_file_hash(stored_path)
+        if not stored_hash:
             continue
-        if hashlib.sha256(raw).hexdigest() != node.file_hash:
+        if hashlib.sha256(raw).hexdigest() != stored_hash:
             try:
                 drifted.append(str(path.relative_to(repo_root)))
             except ValueError:
                 drifted.append(str(path))
-    return sorted(drifted)
+    return sorted(drifted), sorted(vanished)
 
 
 def _assert_graph_matches_root(repo_root: Path, store: GraphStore) -> None:
@@ -1357,8 +1704,139 @@ def _parse_single_file(
             _PARSE_WORKER_STATE.repo_root = repo_root_str
         nodes, edges = parser.parse_bytes(abs_path, raw)
         return (rel_path, nodes, edges, None, fhash)
+    except FileNotFoundError:
+        return (rel_path, [], [], _VANISHED, "")
     except Exception as e:
         return (rel_path, [], [], str(e), "")
+
+
+def _parse_chunk(
+    chunk: list[tuple[str, str]],
+) -> list[tuple[str, list, list, str | None, str]]:
+    return [_parse_single_file(args) for args in chunk]
+
+
+# Error marker for a file deleted between discovery and parsing.
+_VANISHED = "\0vanished"
+_PARSE_CHUNK_FILES = 20
+
+
+class _ParseOutcome(NamedTuple):
+    parsed: int
+    total_nodes: int
+    total_edges: int
+    errors: list[dict[str, str]]
+    vanished: list[str]
+
+
+def _parse_and_store(
+    repo_root: Path,
+    store: GraphStore,
+    parser: CodeParser,
+    rel_paths: list[str],
+) -> _ParseOutcome:
+    """Parse *rel_paths* and store them STORE_BATCH_FILES files per transaction.
+
+    Parse failures become ``errors``; storage failures (including a database
+    that stays locked) propagate, because they are not the file's fault.
+    """
+    batch: list[tuple[str, list, list, str]] = []
+    errors: list[dict[str, str]] = []
+    vanished: list[str] = []
+    counts = [0, 0, 0]  # parsed files, nodes, edges
+    stored_once = False
+
+    def flush() -> None:
+        nonlocal stored_once
+        if not batch:
+            return
+        store.store_file_batch(batch)
+        batch.clear()
+        if not stored_once:
+            stored_once = True
+            fault_point("store")
+
+    def accept(rel_path: str, nodes: list, edges: list, error: str | None, fhash: str) -> None:
+        if error == _VANISHED:
+            vanished.append(rel_path)
+            return
+        if error is not None:
+            logger.warning("Error parsing %s: %s", rel_path, error)
+            errors.append({"file": rel_path, "error": error})
+            return
+        batch.append((str(repo_root / rel_path), nodes, edges, fhash))
+        counts[0] += 1
+        counts[1] += len(nodes)
+        counts[2] += len(edges)
+        if counts[0] == 1:
+            fault_point("parse")
+        if len(batch) >= STORE_BATCH_FILES:
+            flush()
+
+    file_count = len(rel_paths)
+    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+    if use_serial or file_count < 8:
+        for i, rel_path in enumerate(rel_paths, 1):
+            full_path = repo_root / rel_path
+            try:
+                source = full_path.read_bytes()
+                fhash = hashlib.sha256(source).hexdigest()
+                nodes, edges = parser.parse_bytes(full_path, source)
+            except FileNotFoundError:
+                accept(rel_path, [], [], _VANISHED, "")
+                continue
+            except Exception as e:
+                accept(rel_path, [], [], str(e), "")
+                continue
+            accept(rel_path, nodes, edges, None, fhash)
+            if i % 50 == 0 or i == file_count:
+                logger.info("Progress: %d/%d files parsed", i, file_count)
+    else:
+        # Parallel parsing; storing stays in this thread (SQLite single-writer).
+        # Executor kind auto-selected: process for normal CLI/automation;
+        # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
+        # orphan workers (issues #46, #136, PR #615). Override via
+        # CRG_PARSE_EXECUTOR env. Chunks are stored in completion order.
+        root = str(repo_root)
+        chunks = [
+            [(rel_path, root) for rel_path in rel_paths[i:i + _PARSE_CHUNK_FILES]]
+            for i in range(0, file_count, _PARSE_CHUNK_FILES)
+        ]
+        done = 0
+        probes = probe_grammars(sorted(parser.grammars_for(repo_root / rel for rel in rel_paths)))
+        with _make_executor(_MAX_PARSE_WORKERS, probes) as executor:
+            futures = [executor.submit(_parse_chunk, chunk) for chunk in chunks]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    for rel_path, nodes, edges, error, fhash in future.result():
+                        accept(rel_path, nodes, edges, error, fhash)
+                    done += _PARSE_CHUNK_FILES
+                    if done % 200 == 0 or done >= file_count:
+                        logger.info(
+                            "Progress: %d/%d files parsed", min(done, file_count), file_count,
+                        )
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+    flush()
+    return _ParseOutcome(counts[0], counts[1], counts[2], errors, vanished)
+
+
+def _run_resolvers(
+    store: GraphStore,
+    repo_root: Path,
+    names: list[str],
+    failures: dict[str, str],
+) -> dict[str, Optional[dict]]:
+    """Run *names* in registry order; each one's failure replaces its old entry."""
+    results: dict[str, Optional[dict]] = dict.fromkeys(RESOLVERS)
+    for index, name in enumerate(names):
+        failures.pop(name, None)
+        results[name] = run_resolver(name, store, repo_root, failures)
+        if index == 0:
+            fault_point("resolvers")
+    return results
 
 
 def _canonical_repo_root(repo_root: Path) -> Path:
@@ -1371,12 +1849,44 @@ def _canonical_repo_root(repo_root: Path) -> Path:
     return Path(repo_root).expanduser().resolve()
 
 
+def _begin_write(
+    repo_root: Path, store: GraphStore, build_type: str, ignore_patterns: list[str],
+) -> tuple[int, dict[str, Any]]:
+    """Open a write epoch; returns it with the stamp arguments captured now."""
+    pending = {
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "build_type": build_type,
+        "vcs": _capture_vcs_state(repo_root),
+        "ignore_policy": ignore_policy_fingerprint(ignore_patterns),
+    }
+    return open_write_epoch(store), pending
+
+
+def _end_write(
+    store: GraphStore, result: dict[str, Any], pending: dict[str, Any], stamp: bool,
+) -> dict[str, Any]:
+    result["status"] = (
+        "partial" if result["failed_files"] or result["resolver_failures"] else "ok"
+    )
+    result["_pending_stamp"] = pending
+    if stamp:
+        finish_write(store, result)
+    return result
+
+
 def full_build(
     repo_root: Path,
     store: GraphStore,
     recurse_submodules: bool | None = None,
+    *,
+    stamp: bool = True,
+    lock_wait: Optional[float] = None,
 ) -> dict:
     """Full rebuild of the entire graph.
+
+    Runs under the writer lock inside a write epoch. With ``stamp=False`` the
+    epoch stays open for the caller to close with :func:`finish_write` after
+    its post-processing.
 
     Args:
         repo_root: Repository root directory.
@@ -1385,97 +1895,70 @@ def full_build(
             When *None*, falls back to ``CRG_RECURSE_SUBMODULES`` env var.
     """
     repo_root = _canonical_repo_root(repo_root)
-    parser = CodeParser(repo_root)
-    files = collect_all_files(repo_root, recurse_submodules)
-    stale_files = _reconcile_stale_files(repo_root, store, files)
+    with store_writer_lock(store, lock_wait):
+        ignore_patterns = _load_ignore_patterns(repo_root)
+        epoch, pending = _begin_write(repo_root, store, "full", ignore_patterns)
+        parser = CodeParser(repo_root)
+        files, skipped = _drop_oversized(
+            repo_root, collect_all_files(repo_root, recurse_submodules),
+        )
+        stale_files = _reconcile_stale_files(repo_root, store, files)
+        if store.has_nodes():
+            outcome = _parse_and_store(repo_root, store, parser, files)
+        else:
+            # Empty graph: one transaction with FTS triggers off, index rebuilt at the end.
+            with store.bulk_load():
+                outcome = _parse_and_store(repo_root, store, parser, files)
+        if outcome.vanished:
+            store.remove_files_permanently(
+                [normalize_file_path(repo_root / rel) for rel in outcome.vanished]
+            )
 
-    total_nodes = 0
-    total_edges = 0
-    errors = []
-    cpp_errors: set[str] = set()
-    file_count = len(files)
+        failures: dict[str, str] = {}
+        resolver_results = _run_resolvers(store, repo_root, list(RESOLVERS), failures)
 
-    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+        result = {
+            "files_parsed": len(files),
+            "stale_files_removed": len(stale_files),
+            "total_nodes": outcome.total_nodes,
+            "total_edges": outcome.total_edges,
+            "errors": outcome.errors,
+            "failed_files": sorted(error["file"] for error in outcome.errors),
+            "resolver_failures": failures,
+            "write_epoch": epoch,
+            **_resolver_results_section(resolver_results),
+            **_skipped_section(skipped),
+        }
+        mark_flows_stale(store, {"full": True})
+        return _end_write(store, result, pending, stamp)
 
-    if use_serial or file_count < 8:
-        # Serial fallback (for debugging or tiny repos)
-        for i, rel_path in enumerate(files, 1):
-            full_path = repo_root / rel_path
-            try:
-                source = full_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(full_path, source)
-                store.store_file_nodes_edges(str(full_path), nodes, edges, fhash)
-                total_nodes += len(nodes)
-                total_edges += len(edges)
-            except (OSError, PermissionError) as e:
-                errors.append({"file": rel_path, "error": str(e)})
-                if parser.detect_language(full_path) == "cpp":
-                    cpp_errors.add(str(rel_path))
-            except Exception as e:
-                logger.warning("Error parsing %s: %s", rel_path, e)
-                errors.append({"file": rel_path, "error": str(e)})
-                if parser.detect_language(full_path) == "cpp":
-                    cpp_errors.add(str(rel_path))
-            if i % 50 == 0 or i == file_count:
-                logger.info("Progress: %d/%d files parsed", i, file_count)
-    else:
-        # Parallel parsing — store calls remain serial (SQLite single-writer).
-        # Executor kind auto-selected: process for normal CLI/automation;
-        # thread for MCP stdio to avoid pipe-handle inheritance deadlocks and
-        # orphan workers (issues #46, #136, PR #615). Override via
-        # CRG_PARSE_EXECUTOR env.
-        args_list = [(rel_path, str(repo_root)) for rel_path in files]
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for i, (rel_path, nodes, edges, error, fhash) in enumerate(
-                executor.map(_parse_single_file, args_list, chunksize=20),
-                1,
-            ):
-                if error:
-                    logger.warning("Error parsing %s: %s", rel_path, error)
-                    errors.append({"file": rel_path, "error": error})
-                    if parser.detect_language(repo_root / rel_path) == "cpp":
-                        cpp_errors.add(str(rel_path))
-                    continue
-                full_path = repo_root / rel_path
-                store.store_file_nodes_edges(
-                    str(full_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
-                total_nodes += len(nodes)
-                total_edges += len(edges)
-                if i % 200 == 0 or i == file_count:
-                    logger.info("Progress: %d/%d files parsed", i, file_count)
 
-    store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
-    store.set_metadata("last_build_type", "full")
-    store.set_metadata(
-        _IGNORE_POLICY_METADATA_KEY,
-        ignore_policy_fingerprint(_load_ignore_patterns(repo_root)),
-    )
-    if not cpp_errors:
-        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
-    _store_vcs_metadata(repo_root, store)
-    store.commit()
+def _inheritance_dependents(store: GraphStore, file_path: str) -> set[str]:
+    """Files whose classes extend or implement a class in *file_path*."""
+    dependents: set[str] = set()
+    for node in store.get_nodes_by_file(file_path):
+        if node.kind not in ("Class", "Type"):
+            continue
+        for edge in store.iter_edges_by_target(node.qualified_name):
+            if edge.kind in ("INHERITS", "IMPLEMENTS"):
+                dependents.add(edge.file_path)
+    dependents.discard(file_path)
+    return dependents
 
-    resolver_results = {name: run_resolver(name, store, repo_root) for name in RESOLVERS}
 
+def _noop_update_result(changed_files: list[str] | None) -> dict[str, Any]:
     return {
-        "files_parsed": len(files),
-        "stale_files_removed": len(stale_files),
-        "total_nodes": total_nodes,
-        "total_edges": total_edges,
-        "errors": errors,
-        "python_resolution": resolver_results["python"],
-        "rescript_resolution": resolver_results["rescript"],
-        "spring_resolution": resolver_results["spring"],
-        "event_resolution": resolver_results["spring_event"],
-        "temporal_resolution": resolver_results["temporal"],
-        "jsp_resolution": resolver_results["jsp"],
-        "hcl_resolution": resolver_results["hcl"],
-        "scoped_resolution": resolver_results["scoped"],
+        "status": "ok",
+        "files_updated": 0,
+        "total_nodes": 0,
+        "total_edges": 0,
+        "changed_files": list(changed_files or []),
+        "dependent_files": [],
+        "stale_files_removed": 0,
+        "content_drift_detected": 0,
+        "errors": [],
+        **_resolver_results_section(dict.fromkeys(RESOLVERS)),
+        **_skipped_section([]),
     }
 
 
@@ -1485,42 +1968,95 @@ def incremental_update(
     base: str = "HEAD~1",
     changed_files: list[str] | None = None,
     reconcile_stale: bool = True,
+    *,
+    startup: bool = False,
+    stamp: bool = True,
+    lock_wait: Optional[float] = None,
 ) -> dict:
-    """Incremental update: re-parse changed + dependent files only."""
+    """Incremental update: re-parse changed files and retry failed ones.
+
+    Runs under the writer lock. Returns ``status``:
+
+    - ``ok`` / ``partial`` (parse or resolver failures were recorded);
+    - ``rebuild_required`` when the graph's index generation is not this
+      build's: nothing is written and a full build is needed.
+
+    ``startup=True`` (a watcher (re)start) also sweeps for stale files and
+    content drift. A result without ``write_epoch`` wrote nothing.
+    """
     repo_root = _canonical_repo_root(repo_root)
+    with store_writer_lock(store, lock_wait):
+        return _incremental_update_locked(
+            repo_root, store, base, changed_files, reconcile_stale, startup, stamp,
+        )
+
+
+def _incremental_update_locked(
+    repo_root: Path,
+    store: GraphStore,
+    base: str,
+    changed_files: list[str] | None,
+    reconcile_stale: bool,
+    startup: bool,
+    stamp: bool,
+) -> dict:
     if reconcile_stale:
         _assert_graph_matches_root(repo_root, store)
+
+    generation = get_index_generation(store._conn)
+    if generation != INDEX_GENERATION and store.has_nodes():
+        logger.warning(
+            "Graph index generation %s differs from %s; a full rebuild is required",
+            generation, INDEX_GENERATION,
+        )
+        return {
+            **_noop_update_result(changed_files),
+            "status": "rebuild_required",
+            "rebuild_required": True,
+            "reason": "index_generation_mismatch",
+            "index_generation": generation,
+            "expected_index_generation": INDEX_GENERATION,
+        }
+
+    _start_delta_journal(store)
+    try:
+        return _incremental_update_journaled(
+            repo_root, store, base, changed_files, reconcile_stale, startup, stamp,
+        )
+    finally:
+        _stop_delta_journal(store)
+
+
+def _incremental_update_journaled(
+    repo_root: Path,
+    store: GraphStore,
+    base: str,
+    changed_files: list[str] | None,
+    reconcile_stale: bool,
+    startup: bool,
+    stamp: bool,
+) -> dict:
+    journal_start = _journal_mark(store)
     parser = CodeParser(repo_root)
     ignore_patterns = _load_ignore_patterns(repo_root)
-    # Initialized once so every return path carries all resolver keys.
-    resolver_results: dict[str, Optional[dict]] = dict.fromkeys(RESOLVERS)
+    # A previous write that never stamped left the graph in an unknown state.
+    recovering = write_epoch_is_open(store)
+    # An explicit empty change list asks for reconciliation only.
+    startup = startup or recovering or (reconcile_stale and changed_files == [])
+    previous_failed = read_failed_files(store)
+    resolver_failures = read_resolver_failures(store)
+    stored_cache: list[list[str]] = []
 
-    if (
-        store.get_metadata(_CPP_IDENTITY_METADATA_KEY) != CPP_IDENTITY_VERSION
-        and store.has_nodes_for_language("cpp")
-    ):
-        logger.info(
-            "C++ identity format changed; rebuilding the graph before incremental update",
-        )
-        rebuilt = full_build(repo_root, store)
-        for name, key in _RESOLVER_RESULT_KEYS.items():
-            resolver_results[name] = rebuilt.get(key)
-        return {
-            "files_updated": rebuilt["files_parsed"],
-            "total_nodes": rebuilt["total_nodes"],
-            "total_edges": rebuilt["total_edges"],
-            "changed_files": list(changed_files or []),
-            "dependent_files": [],
-            "errors": rebuilt["errors"],
-            "identity_rebuild": True,
-            "content_drift_detected": 0,
-            **_resolver_results_section(resolver_results),
-        }
+    def stored_files() -> list[str]:
+        if not stored_cache:
+            stored_cache.append(store.get_all_files())
+        return stored_cache[0]
 
     # Determine changed files
     auto_discovery = changed_files is None
-    if auto_discovery:
-        changed_files = get_changed_files(repo_root, base)
+    changed: list[str] = (
+        get_changed_files(repo_root, base) if changed_files is None else list(changed_files)
+    )
     # A changed ignore policy is invisible to a diff: files it newly admits were
     # never in the graph and never appear in `git diff`, so without this they
     # stay missing until a full rebuild. Comparison happens before any inventory
@@ -1536,9 +2072,14 @@ def incremental_update(
         store.get_metadata(_IGNORE_POLICY_METADATA_KEY) != policy
     )
     inventory = collect_all_files(repo_root) if policy_changed else None
-    stale_files = (
-        _reconcile_stale_files(repo_root, store, inventory) if reconcile_stale else []
-    )
+    deletions_seen = any(not (repo_root / rel).exists() for rel in changed)
+    # The full stale sweep stats and sniffs every indexed file, so it only
+    # runs when something can have gone stale behind the diff's back.
+    stale_files: list[str] = []
+    if reconcile_stale and (policy_changed or startup or deletions_seen):
+        stale_files = _reconcile_stale_files(repo_root, store, inventory, stored_files())
+        if stale_files:
+            stored_cache.clear()
 
     # An empty diff does not prove the graph matches disk: edits the watcher
     # applied and a later ``git checkout`` reverted leave HEAD unchanged while
@@ -1546,17 +2087,17 @@ def incremental_update(
     # and let any drifted file enter the normal changed-file pipeline below.
     # Explicit changed_files lists (the watcher's own batches) skip the sweep —
     # they already know what changed.
-    drifted_files = (
-        _detect_content_drift(repo_root, store)
-        if auto_discovery and not changed_files
-        else []
-    )
+    drifted_files: list[str] = []
+    vanished: list[str] = []
+    if auto_discovery and (not changed or startup):
+        drifted_files, vanished = _detect_content_drift(repo_root, store, stored_files())
+        vanished = [path for path in vanished if path not in stale_files]
     if drifted_files:
-        changed_files = drifted_files
+        changed = list(dict.fromkeys(changed + drifted_files))
 
     if inventory is not None:
         # Read after the reconcile above so removed rows are already gone.
-        known = {normalize_file_path(path) for path in store.get_all_files()}
+        known = {normalize_file_path(path) for path in stored_files()}
         added = [
             rel
             for rel in inventory
@@ -1566,50 +2107,47 @@ def incremental_update(
             logger.info(
                 "Ignore policy changed: %d file(s) newly indexable", len(added)
             )
-            changed_files = list(dict.fromkeys(list(changed_files or []) + added))
+            changed = list(dict.fromkeys(changed + added))
 
-    if not changed_files and not stale_files:
+    # Files whose last parse failed are retried until they parse.
+    retried = [rel for rel in previous_failed if rel not in changed]
+    changed = changed + retried
+    retry_resolvers = [name for name in RESOLVERS if name in resolver_failures]
+
+    if (
+        not changed and not stale_files and not vanished
+        and not recovering and not retry_resolvers
+    ):
         if policy_changed:
             # Nothing was added and nothing removed, so the new policy really
             # did produce no work -- record it, or every later update pays for
             # the inventory again.
             store.set_metadata(_IGNORE_POLICY_METADATA_KEY, policy)
-            store.commit()
-        return {
-            "files_updated": 0,
-            "total_nodes": 0,
-            "total_edges": 0,
-            "changed_files": [],
-            "dependent_files": [],
-            "stale_files_removed": 0,
-            "content_drift_detected": 0,
-            "errors": [],
-            **_resolver_results_section(resolver_results),
-        }
+        return _noop_update_result([])
 
-    # Find dependent files (files that import from changed files)
+    epoch, pending = _begin_write(repo_root, store, "incremental", ignore_patterns)
+
+    # Subclasses re-resolve against a changed parent; other dependents are
+    # unchanged on disk and would only be hash-skipped.
     dependent_files: set[str] = set()
-    for rel_path in changed_files:
-        full_path = normalize_file_path(repo_root / rel_path)
-        deps = find_dependents(store, full_path)
-        for d in deps:
-            # Convert back to relative path if needed
+    for rel_path in changed:
+        for dep in _inheritance_dependents(store, normalize_file_path(repo_root / rel_path)):
             try:
-                dependent_files.add(str(Path(d).relative_to(repo_root)))
+                dependent_files.add(str(Path(dep).relative_to(repo_root)))
             except ValueError:
-                dependent_files.add(d)
+                dependent_files.add(dep)
+        if len(dependent_files) > _MAX_DEPENDENT_FILES:
+            break
 
     # Combine changed + dependent
-    all_files = set(changed_files) | dependent_files
-
-    total_nodes = 0
-    total_edges = 0
-    errors = []
-    missing_paths: set[str] = set()
+    all_files = set(changed) | dependent_files
+    missing_paths: set[str] = set(vanished)
 
     # Separate deleted/unparseable files from files that need re-parsing
     to_parse: list[str] = []
-    for rel_path in all_files:
+    skipped: list[dict] = []
+    size_limit = _max_file_bytes()
+    for rel_path in sorted(all_files):
         if _should_ignore(rel_path, ignore_patterns):
             continue
         abs_path = repo_root / rel_path
@@ -1619,111 +2157,94 @@ def incremental_update(
             continue
         if parser.detect_language(abs_path) is None:
             continue
+        size = _oversized_bytes(abs_path, size_limit)
+        if size is not None:
+            # Too large to parse: reported, and its old rows leave the graph.
+            skipped.append({"file": rel_path, "bytes": size})
+            missing_paths.add(normalize_file_path(abs_path))
+            continue
         # Quick hash check to skip unchanged files
         try:
             raw = abs_path.read_bytes()
-            fhash = hashlib.sha256(raw).hexdigest()
-            existing_nodes = store.get_nodes_by_file(str(abs_path))
-            if existing_nodes and existing_nodes[0].file_hash == fhash:
+            stored_hash = store.get_file_hash(str(abs_path))
+            if stored_hash and stored_hash == hashlib.sha256(raw).hexdigest():
                 continue
-        except (OSError, PermissionError):
+        except OSError:
             pass
         to_parse.append(rel_path)
 
-    # Persist deletions before store_file_nodes_edges() opens its own
-    # explicit transaction — avoids nested transaction errors.
-    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
-    parsed_files = 0
-
-    if use_serial or len(to_parse) < 8:
-        for rel_path in to_parse:
-            abs_path = repo_root / rel_path
-            try:
-                source = abs_path.read_bytes()
-                fhash = hashlib.sha256(source).hexdigest()
-                nodes, edges = parser.parse_bytes(abs_path, source)
-                store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
-                parsed_files += 1
-                total_nodes += len(nodes)
-                total_edges += len(edges)
-            except (OSError, PermissionError) as e:
-                errors.append({"file": rel_path, "error": str(e)})
-            except Exception as e:
-                logger.warning("Error parsing %s: %s", rel_path, e)
-                errors.append({"file": rel_path, "error": str(e)})
-    else:
-        # See full-build comment above for executor kind rationale.
-        args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
-        with _make_executor(_MAX_PARSE_WORKERS) as executor:
-            for rel_path, nodes, edges, error, fhash in executor.map(
-                _parse_single_file,
-                args_list,
-                chunksize=20,
-            ):
-                if error:
-                    logger.warning("Error parsing %s: %s", rel_path, error)
-                    errors.append({"file": rel_path, "error": error})
-                    continue
-                store.store_file_nodes_edges(
-                    str(repo_root / rel_path),
-                    nodes,
-                    edges,
-                    fhash,
-                )
-                parsed_files += 1
-                total_nodes += len(nodes)
-                total_edges += len(edges)
+    outcome = _parse_and_store(repo_root, store, parser, to_parse)
+    missing_paths.update(normalize_file_path(repo_root / rel) for rel in outcome.vanished)
 
     removed_files = store.remove_files_permanently(sorted(missing_paths)) if missing_paths else 0
-    files_updated = parsed_files + len(stale_files) + removed_files
-    # The VCS anchor must also advance when the update ran the pipeline over
-    # a non-empty discovered change set yet every file was hash-skipped: a
-    # global pre-commit hook that runs ``update`` before its own commit moves
-    # HEAD leaves the graph content already current while the stored base
-    # still names the old commit, and a files_updated-only gate strands the
-    # anchor there forever (every later update hash-skips the same diff). At
-    # that point the graph equals disk, which is exactly what the anchor
-    # records. The empty-discovery early return above keeps skipping this.
-    touched = bool(changed_files or stale_files or missing_paths)
-    if files_updated or touched:
-        store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
-        store.set_metadata("last_build_type", "incremental")
-        store.set_metadata(_CPP_IDENTITY_METADATA_KEY, CPP_IDENTITY_VERSION)
-        # Stamped only after the work it describes actually landed.
-        store.set_metadata(_IGNORE_POLICY_METADATA_KEY, policy)
-        _store_vcs_metadata(repo_root, store)
-        store.commit()
+
+    # Removing a file drops other files' edges into it, while a fresh build
+    # keeps them as unresolved references: parse those files again.
+    settled = missing_paths | set(stale_files) | {
+        normalize_file_path(repo_root / rel) for rel in to_parse
+    }
+    referrers: list[str] = []
+    for lost in sorted(_files_that_lost_edges(store, journal_start) - settled):
+        try:
+            rel = str(Path(lost).relative_to(repo_root))
+        except ValueError:
+            continue
+        if (repo_root / rel).is_file() and not _should_ignore(rel, ignore_patterns):
+            referrers.append(rel)
+    if referrers:
+        again = _parse_and_store(repo_root, store, parser, referrers)
+        outcome = _ParseOutcome(
+            outcome.parsed + again.parsed,
+            outcome.total_nodes + again.total_nodes,
+            outcome.total_edges + again.total_edges,
+            outcome.errors + again.errors,
+            outcome.vanished + again.vanished,
+        )
+        dependent_files.update(referrers)
+        all_files.update(referrers)
+    files_updated = outcome.parsed + len(stale_files) + removed_files
 
     # Only re-run a resolver when a file in one of its declared languages
     # changed. python/spring/spring_event/temporal/jsp are in _RECONCILE_ON_DELETE
     # and also look at stale/missing paths, so a deletion that only surfaces
     # through reconciliation still clears derived state (e.g. virtual Spring
     # Event nodes — issue #474); every other resolver only looks at newly
-    # changed files, same as before this refactor.
+    # changed files. Failed resolvers, and all of them after an unstamped
+    # write, run again.
     reconciled_languages = _changed_languages(
         set(all_files) | set(stale_files) | missing_paths
     )
     changed_languages = _changed_languages(all_files)
-
-    for name, (_resolver, _label, languages) in RESOLVERS.items():
-        active_languages = (
+    to_run = [
+        name
+        for name, (_resolver, _label, languages) in RESOLVERS.items()
+        if recovering
+        or name in retry_resolvers
+        or languages & (
             reconciled_languages if name in _RECONCILE_ON_DELETE else changed_languages
         )
-        resolver_results[name] = (
-            run_resolver(name, store, repo_root) if languages & active_languages else None
-        )
+    ]
+    resolver_results = _run_resolvers(store, repo_root, to_run, resolver_failures)
 
-    return {
+    result = {
         "files_updated": files_updated,
-        "total_nodes": total_nodes,
-        "total_edges": total_edges,
-        "changed_files": list(changed_files),
-        "dependent_files": list(dependent_files),
+        "total_nodes": outcome.total_nodes,
+        "total_edges": outcome.total_edges,
+        "changed_files": list(changed),
+        "dependent_files": sorted(dependent_files),
         "stale_files_removed": len(stale_files),
         "content_drift_detected": len(drifted_files),
-        "errors": errors,
+        "retried_failed_files": len(retried),
+        "errors": outcome.errors,
+        "failed_files": sorted(error["file"] for error in outcome.errors),
+        "resolver_failures": resolver_failures,
+        "write_epoch": epoch,
         **_resolver_results_section(resolver_results),
+        **_skipped_section(skipped),
     }
+    # An unstamped earlier write may have changed anything.
+    mark_flows_stale(store, {"full": True} if recovering else _stop_delta_journal(store))
+    return _end_write(store, result, pending, stamp)
 
 
 # ---------------------------------------------------------------------------
@@ -1732,10 +2253,16 @@ def incremental_update(
 
 
 _DEBOUNCE_SECONDS = 1
+# A steady stream of events (a build writing sources) must not postpone the
+# update forever: a batch is processed at most this long after its first event.
+_DEBOUNCE_MAX_WAIT_SECONDS = env_float("CRG_WATCH_MAX_WAIT", 10.0, minimum=0.1)
+_AUTO_WATCH_RESTART_MAX_DELAY = 60.0
 
 
 def _raise_watch_update_errors(result: dict, context: str) -> None:
     """Fail the watch boundary when an incremental update reports errors."""
+    if result.get("status") == "rebuild_required":
+        raise RuntimeError(f"{context}: the graph needs a full rebuild")
     errors = result.get("errors") or []
     if not errors:
         return
@@ -2317,6 +2844,38 @@ class _WatchSupervisor:
             pass
 
 
+def _make_debouncer(
+    callback: Callable[[list[Any]], None],
+    interval: float = _DEBOUNCE_SECONDS,
+    max_wait: Optional[float] = None,
+) -> Any:
+    """An ``EventDebouncer`` whose quiet-period wait is capped at *max_wait*."""
+    from watchdog.utils.event_debouncer import EventDebouncer
+
+    cap = _DEBOUNCE_MAX_WAIT_SECONDS if max_wait is None else max_wait
+
+    class CappedDebouncer(EventDebouncer):
+        def run(self) -> None:
+            with self._cond:
+                while True:
+                    while not self._events and self.should_keep_running():
+                        self._cond.wait()
+                    deadline = time.monotonic() + cap
+                    while self.should_keep_running():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        if not self._cond.wait(timeout=min(interval, remaining)):
+                            break
+                    if not self.should_keep_running():
+                        break
+                    events = self._events
+                    self._events = []
+                    self.events_callback(events)
+
+    return CappedDebouncer(interval, callback)  # type: ignore[arg-type]
+
+
 def _create_watch_handler(
     repo_root: Path,
     store: GraphStore,
@@ -2324,7 +2883,6 @@ def _create_watch_handler(
 ):
     """Create the debounced watchdog handler for one repository."""
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
-    from watchdog.utils.event_debouncer import EventDebouncer
 
     ignore_patterns = _load_ignore_patterns(repo_root)
     parser = CodeParser(repo_root)
@@ -2450,7 +3008,7 @@ def _create_watch_handler(
                 raise RuntimeError("watch update failed") from self.failure
 
     processor = WatchBatchProcessor()
-    debouncer = EventDebouncer(_DEBOUNCE_SECONDS, processor.process)
+    debouncer = _make_debouncer(processor.process)
 
     class GraphUpdateHandler(FileSystemEventHandler):
         def dispatch(self, event: FileSystemEvent) -> None:
@@ -2500,6 +3058,45 @@ def _sync_watch_tree(supervisor: _WatchSupervisor, handler: Any) -> None:
         handler.dispatch(DirCreatedEvent(path))
     for path in vanished:
         handler.dispatch(DirDeletedEvent(path))
+
+
+# Coarse filesystem timestamps can trail time.time() slightly.
+_STARTUP_WINDOW_SLACK_SECONDS = 1.0
+
+
+def _paths_changed_since(
+    repo_root: Path, ignore_patterns: list[str], since: float,
+) -> list[Path]:
+    """Files modified after *since*, plus every file of a directory changed after it.
+
+    A directory's mtime covers files moved in with their old timestamps.
+    Ignored trees and symlinked directories are not walked.
+    """
+    threshold = since - _STARTUP_WINDOW_SLACK_SECONDS
+    changed: list[Path] = []
+    for directory, dirnames, filenames in os.walk(repo_root):
+        base = Path(directory)
+        relative = base.relative_to(repo_root)
+        dirnames[:] = [
+            name for name in dirnames
+            if name != ".git"
+            and not (base / name).is_symlink()
+            and not _should_ignore((relative / name).as_posix(), ignore_patterns)
+        ]
+        try:
+            fresh_directory = base.stat().st_mtime >= threshold
+        except OSError:
+            continue
+        for name in filenames:
+            path = base / name
+            if _should_ignore((relative / name).as_posix(), ignore_patterns):
+                continue
+            try:
+                if fresh_directory or path.lstat().st_mtime >= threshold:
+                    changed.append(path)
+            except OSError:
+                continue
+    return changed
 
 
 def _install_sigterm_interrupt() -> Callable[[], None]:
@@ -2555,17 +3152,18 @@ def watch(
         RuntimeError: if a watch update fails, or if the filesystem observer
             stops running.
     """
-    from watchdog.events import DirCreatedEvent, DirDeletedEvent
+    from watchdog.events import DirCreatedEvent, DirDeletedEvent, FileModifiedEvent
     from watchdog.observers import Observer
 
     # One boundary, once: ``--repo .`` reaches here relative, and every path
     # comparison below — stored file paths, watch keys, event paths — assumes
     # they are all spelled the same way.
     repo_root = _canonical_repo_root(repo_root)
+    ignore_patterns = _load_ignore_patterns(repo_root)
     supervisor = _WatchSupervisor(
         None,
         repo_root,
-        _load_ignore_patterns(repo_root),
+        ignore_patterns,
         health_path=_watch_health_path(repo_root),
     )
     # The first build of a large repository takes minutes.  Without a
@@ -2573,7 +3171,15 @@ def watch(
     # stalled for the whole build.
     supervisor.report_health(observer_alive=True, phase="initial-build", force=True)
 
-    initial = incremental_update(repo_root, store, changed_files=[])
+    # Edits made while no watcher ran produce no events: reconcile against
+    # the last stamped commit plus a drift and stale-file sweep.
+    reconcile_started = time.time()
+    initial = incremental_update(
+        repo_root,
+        store,
+        base=resolve_incremental_base(repo_root, store) or "HEAD",
+        startup=True,
+    )
     _raise_watch_update_errors(initial, "initial watch reconciliation")
     if initial["files_updated"] > 0 and on_files_updated is not None:
         postprocess_result = on_files_updated(store)
@@ -2584,6 +3190,10 @@ def watch(
     supervisor.schedule_initial(handler)
     handler.start()
     observer.start()
+    # What changed after the reconciliation looked and before the observer
+    # listened produced no event; replay it through the debouncer.
+    for changed in _paths_changed_since(repo_root, ignore_patterns, reconcile_started):
+        handler.dispatch(FileModifiedEvent(str(changed)))
     supervisor.report_health(observer_alive=True, force=True)
 
     logger.info("Watching %s for changes... (Ctrl+C to stop)", repo_root)
@@ -2647,10 +3257,13 @@ def start_watch_thread(
     repo_root: Path,
     store: GraphStore,
     daemon: bool = True,
+    stop_event: threading.Event | None = None,
 ) -> threading.Thread | None:
-    """Start watch mode in a background thread.
+    """Start watch mode in a background thread that restarts after failures.
 
-    Returns the started thread, or None if watchdog is unavailable.
+    Every restart begins with a catch-up reconciliation, so edits made while
+    the watcher was down are indexed. Returns the started thread, or None if
+    watchdog is unavailable.
     """
     try:
         import watchdog  # noqa: F401
@@ -2658,13 +3271,24 @@ def start_watch_thread(
         logger.warning("watchdog not installed; auto-watch disabled")
         return None
 
+    stop = stop_event or threading.Event()
+
     def _run() -> None:
         # A thread cannot take the process down, so the one thing it must not
         # do is die quietly: the server would keep serving a frozen graph.
-        try:
-            watch(repo_root, store)
-        except RuntimeError as exc:
-            logger.error("Auto-watch for %s stopped: %s", repo_root, exc)
+        delay = 1.0
+        while not stop.is_set():
+            started = time.monotonic()
+            try:
+                watch(repo_root, store, stop_event=stop)
+                return
+            except Exception as exc:  # noqa: BLE001 - restart on anything
+                logger.error("Auto-watch for %s failed, restarting: %s", repo_root, exc)
+            if time.monotonic() - started > _AUTO_WATCH_RESTART_MAX_DELAY:
+                delay = 1.0
+            if stop.wait(delay):
+                return
+            delay = min(delay * 2, _AUTO_WATCH_RESTART_MAX_DELAY)
 
     thread = threading.Thread(
         target=_run,

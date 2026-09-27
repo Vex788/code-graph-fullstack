@@ -102,7 +102,13 @@ def _methods_of(store: GraphStore, class_qname: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def orient(query: str, repo_root: str | None = None) -> dict[str, Any]:
+def orient(
+    query: str,
+    repo_root: str | None = None,
+    provider: str | None = None,
+    limit: int = 8,
+    detail_level: str = "standard",
+) -> dict[str, Any]:
     """One-call codebase mini-map for a task string.
 
     Returns top functions/classes (hybrid FTS + vector search), top files,
@@ -112,11 +118,21 @@ def orient(query: str, repo_root: str | None = None) -> dict[str, Any]:
     Args:
         query: Natural-language or symbol-ish task description.
         repo_root: Repository root path. Auto-detected if omitted.
+        provider: Embedding provider for this call; the repository's
+            embedding settings decide when omitted.
+        limit: Maximum top functions/classes (default 8).
+        detail_level: "standard", or "minimal" for names and locations only.
     """
+    limit = max(1, limit)
     store, root = _get_store(repo_root)
     try:
         mode_out: list[str] = []
-        nodes = hybrid_search(store, query, limit=12, _out_mode=mode_out)
+        info: dict[str, Any] = {}
+        # A few extra hits so File nodes do not crowd out the functions.
+        nodes = hybrid_search(
+            store, query, limit=limit + 4, provider=provider, repo_root=str(root),
+            _out_mode=mode_out, _out_info=info,
+        )
 
         files: list[dict[str, Any]] = []
         funcs: list[dict[str, Any]] = []
@@ -134,11 +150,7 @@ def orient(query: str, repo_root: str | None = None) -> dict[str, Any]:
                 fp = _short(node.get("file_path") or where, root)
                 file_scores[fp] = file_scores.get(fp, 0.0) + score
             else:
-                # Demote tiny generic identifiers (get, run, ...) out of the
-                # function list; they crowd out meaningful matches without
-                # ever being what the caller meant.
-                if len(simple) >= 6:
-                    funcs.append(entry)
+                funcs.append(entry)
                 fp = _short(node.get("file_path") or "", root)
                 if fp:
                     file_scores[fp] = file_scores.get(fp, 0.0) + score
@@ -181,7 +193,11 @@ def orient(query: str, repo_root: str | None = None) -> dict[str, Any]:
                     break
 
         max_score = max((f.get("score", 0.0) for f in funcs), default=0.0)
-        return {
+        top_functions = funcs[:limit]
+        if detail_level == "minimal":
+            top_functions = [{"name": f["name"], "where": f["where"]} for f in top_functions]
+            top_files = [{"where": f["where"]} for f in top_files]
+        out: dict[str, Any] = {
             "status": "ok",
             "search_mode": mode_out[0] if mode_out else "none",
             # A gibberish query still returns near-zero-score neighbours from
@@ -190,11 +206,18 @@ def orient(query: str, repo_root: str | None = None) -> dict[str, Any]:
             "low_confidence": bool(
                 mode_out and mode_out[0] in ("semantic", "hybrid") and max_score < 0.02
             ),
-            "top_functions": funcs[:8],
+            "top_functions": top_functions,
             "top_files": top_files,
-            "communities": comm_rows,
             "graph_nodes": stats,
         }
+        if detail_level != "minimal":
+            out["communities"] = comm_rows
+        # Budgeted output: "off" is implied by search_mode, so only other states show.
+        if info.get("embeddings_state", "off") != "off":
+            out["embeddings_state"] = info["embeddings_state"]
+        if info.get("warning"):
+            out["warning"] = info["warning"]
+        return out
     finally:
         store.close()
 

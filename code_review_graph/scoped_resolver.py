@@ -254,6 +254,11 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
 
     Returns a dict with resolution counts for telemetry.
     """
+    with store.transaction():
+        return _resolve_scoped_calls(store)
+
+
+def _resolve_scoped_calls(store: GraphStore) -> dict:
     conn = store._conn
 
     lang_placeholders = ",".join("?" for _ in _SCOPED_LANGUAGES)
@@ -503,9 +508,6 @@ def resolve_scoped_calls(store: GraphStore) -> dict:
             "Scoped resolver: %s → %s (via %s)",
             resolution_target, new_target, via,
         )
-
-    if resolved:
-        conn.commit()
 
     logger.info(
         "Scoped resolver: resolved %d CALLS edges across %d files",

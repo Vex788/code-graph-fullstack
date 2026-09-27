@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
+from ..graph import fts_triggers_installed, node_signature
 from ..incremental import (
+    clear_flows_stale,
+    fault_point,
+    finish_write,
     full_build,
     incremental_update,
+    read_flows_stale,
     resolve_incremental_base,
+    store_writer_lock,
 )
+from ..parser import normalize_file_path
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
@@ -55,11 +64,14 @@ def _run_postprocess(
     changed_files: list[str] | None = None,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
+    repo_root: Any = None,
 ) -> list[str]:
     """Run post-build steps based on *postprocess* level.
 
-    When *full_rebuild* is False and *changed_files* are available,
-    uses incremental flow/community detection for faster updates.
+    When *full_rebuild* is False, flows and communities re-derive only what
+    the pending graph delta (``flows_stale``) says changed; without one they
+    fall back to *changed_files* (relative ones resolved against *repo_root*).
+    Levels below ``full`` leave the delta pending for the next full run.
 
     Records structured stage durations in ``build_result["postprocess_timing"]``.
     Minimal processing reports ``signatures_s`` and ``fts_s``; full processing
@@ -70,6 +82,9 @@ def _run_postprocess(
     """
     warnings: list[str] = []
     build_result["postprocess_level"] = postprocess
+
+    if postprocess != "full":
+        build_result["flows_stale"] = read_flows_stale(store) is not None
 
     if postprocess == "none":
         _run_embedding_refresh(
@@ -82,6 +97,10 @@ def _run_postprocess(
         return warnings
 
     # Resolve bare and C++ scoped call targets before derived graph steps.
+    # These and the signatures are required: their failures reach readiness.
+    ran = build_result.setdefault("postprocess_ran", [])
+    failures = build_result.setdefault("postprocess_failures", {})
+    ran.append("postprocess.call_targets")
     try:
         resolved = store.resolve_bare_call_targets()
         resolved += store.resolve_bare_tested_by_sources()
@@ -94,34 +113,20 @@ def _run_postprocess(
         warnings.append(
             f"Call-target resolution failed: {type(e).__name__}: {e}"
         )
+        failures["postprocess.call_targets"] = f"{type(e).__name__}: {e}"
+    fault_point("postprocess")
 
     # -- Signatures + FTS (fast, always run unless "none") --
     timing: dict[str, float] = {}
     stage_started = time.perf_counter()
+    ran.append("postprocess.signatures")
     try:
-        rows = store.get_nodes_without_signature()
-        for row in rows:
-            node_id, name, kind, params, ret = (
-                row[0],
-                row[1],
-                row[2],
-                row[3],
-                row[4],
-            )
-            if kind in ("Function", "Test"):
-                sig = f"def {name}({params or ''})"
-                if ret:
-                    sig += f" -> {ret}"
-            elif kind == "Class":
-                sig = f"class {name}"
-            else:
-                sig = name
-            store.update_node_signature(node_id, sig[:512])
-        store.commit()
+        _compute_signatures(store)
         build_result["signatures_updated"] = True
     except (sqlite3.OperationalError, TypeError, KeyError) as e:
         logger.warning("Signature computation failed: %s", e)
         warnings.append(f"Signature computation failed: {type(e).__name__}: {e}")
+        failures["postprocess.signatures"] = f"{type(e).__name__}: {e}"
     timing["signatures_s"] = max(
         0.0,
         round(time.perf_counter() - stage_started, 6),
@@ -131,16 +136,10 @@ def _run_postprocess(
     try:
         from code_review_graph.search import rebuild_fts_index
 
-        # An update that parsed nothing cannot have changed a node, so the FTS
-        # content is already correct. Rebuilding it anyway re-indexes every row
-        # (62k on a PMS-sized graph) on every git hook firing.
-        nothing_changed = (
-            not full_rebuild
-            and not changed_files
-            and not build_result.get("files_reparsed")
-            and not build_result.get("content_drift_detected")
-        )
-        if nothing_changed:
+        # Triggers keep nodes_fts in sync with every write; only a graph whose
+        # triggers are missing (an interrupted bulk load, an old writer) needs
+        # the full re-index.
+        if fts_triggers_installed(store):
             build_result["fts_rebuilt"] = False
         else:
             fts_count = rebuild_fts_index(store)
@@ -166,14 +165,23 @@ def _run_postprocess(
         return warnings
 
     # -- Expensive: flows + communities (only for "full") --
-    use_incremental = not full_rebuild and bool(changed_files)
+    pending = read_flows_stale(store)
+    delta = None if pending is None or pending.get("full") else pending
+    use_incremental = not full_rebuild and (
+        delta is not None or (pending is None and bool(changed_files))
+    )
+    changed = [
+        normalize_file_path(Path(repo_root) / path) if repo_root is not None else path
+        for path in changed_files or ()
+    ]
+    derived_ok = True
 
     stage_started = time.perf_counter()
     try:
         if use_incremental:
             from code_review_graph.flows import incremental_trace_flows
 
-            count = incremental_trace_flows(store, changed_files)
+            count = incremental_trace_flows(store, changed, delta=delta)
         else:
             from code_review_graph.flows import store_flows as _store_flows
             from code_review_graph.flows import trace_flows as _trace_flows
@@ -182,6 +190,7 @@ def _run_postprocess(
             count = _store_flows(store, flows)
         build_result["flows_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
+        derived_ok = False
         logger.warning("Flow detection failed: %s", e)
         warnings.append(f"Flow detection failed: {type(e).__name__}: {e}")
     timing["flows_s"] = max(
@@ -196,7 +205,7 @@ def _run_postprocess(
                 incremental_detect_communities,
             )
 
-            count = incremental_detect_communities(store, changed_files)
+            count = incremental_detect_communities(store, changed, delta=delta)
         else:
             from code_review_graph.communities import (
                 detect_communities as _detect_communities,
@@ -209,12 +218,15 @@ def _run_postprocess(
             count = _store_communities(store, comms)
         build_result["communities_detected"] = count
     except (sqlite3.OperationalError, ImportError) as e:
+        derived_ok = False
         logger.warning("Community detection failed: %s", e)
         warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
     timing["communities_s"] = max(
         0.0,
         round(time.perf_counter() - stage_started, 6),
     )
+    if derived_ok and pending is not None:
+        clear_flows_stale(store)
 
     # -- Compute pre-computed summary tables --
     stage_started = time.perf_counter()
@@ -244,6 +256,55 @@ def _run_postprocess(
     store.set_metadata("postprocess_level", postprocess)
 
     return warnings
+
+
+_EMBED_THREADS: list[threading.Thread] = []
+
+
+def embed_changed_nodes(
+    store: Any,
+    root: Any,
+    delta: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> None:
+    """Queue embeddings for what *delta* changed, after the stamp.
+
+    A no-op while embeddings are off. The work runs on a background thread;
+    a one-shot process calls :func:`wait_for_embeddings` before it exits.
+    """
+    try:
+        from ..repo_settings import load_embedding_settings
+
+        if not load_embedding_settings(root).enabled:
+            return
+        from ..embeddings import embed_changed
+
+        names = None if delta is None or delta.get("full") else delta.get("nodes", [])
+        worker = embed_changed(store, names, repo_root=root, wait=False)
+    except Exception as exc:  # embeddings never fail a build
+        logger.warning("Embedding update failed: %s", exc)
+        result["embeddings"] = {"state": "stale", "error": f"{type(exc).__name__}: {exc}"}
+        return
+    if isinstance(worker, threading.Thread):
+        _EMBED_THREADS[:] = [thread for thread in _EMBED_THREADS if thread.is_alive()]
+        _EMBED_THREADS.append(worker)
+    result["embeddings"] = {"state": "queued"}
+
+
+def wait_for_embeddings(timeout: float | None = None) -> None:
+    """Join the embedding threads this process started."""
+    while _EMBED_THREADS:
+        _EMBED_THREADS.pop().join(timeout)
+
+
+def _compute_signatures(store: Any) -> int:
+    """Fill ``nodes.signature`` where it is NULL, in one transaction."""
+    rows = store.get_nodes_without_signature()
+    with store.transaction():
+        for row in rows:
+            node_id, name, kind, params, ret = row[0], row[1], row[2], row[3], row[4]
+            store.update_node_signature(node_id, node_signature(kind, name, params, ret))
+    return len(rows)
 
 
 def _compute_summaries(store: Any) -> None:
@@ -519,73 +580,115 @@ def build_or_update_graph(
         return {"status": "idle", "summary": "no background job tracking for this root"}
     store, root = _get_store(repo_root)
     try:
-        if not full_rebuild and not store.has_nodes():
+        # One writer for the whole build, post-processing and final stamp.
+        with store_writer_lock(store):
+            return _build_locked(
+                store, root, full_rebuild, base, postprocess, recurse_submodules,
+                embedding_provider, embedding_model,
+            )
+    finally:
+        store.close()
+
+
+def _build_locked(
+    store: Any,
+    root: Any,
+    full_rebuild: bool,
+    base: str | None,
+    postprocess: str,
+    recurse_submodules: bool | None,
+    embedding_provider: str | None,
+    embedding_model: str | None,
+) -> dict[str, Any]:
+    if not full_rebuild and not store.has_nodes():
+        full_rebuild = True
+
+    # An automatic (base is None) incremental update resolves its diff base
+    # to the last-synced commit. When no usable anchor exists, fall back to
+    # a full rebuild rather than a wrong HEAD~1 diff that could report the
+    # graph as up to date while it is actually stale.
+    base_resolved: str | None = base
+    if not full_rebuild and base is None:
+        base_resolved = resolve_incremental_base(root, store)
+        if base_resolved is None:
             full_rebuild = True
 
-        # An automatic (base is None) incremental update resolves its diff base
-        # to the last-synced commit. When no usable anchor exists, fall back to
-        # a full rebuild rather than a wrong HEAD~1 diff that could report the
-        # graph as up to date while it is actually stale.
-        base_resolved: str | None = base
-        if not full_rebuild and base is None:
-            base_resolved = resolve_incremental_base(root, store)
-            if base_resolved is None:
-                full_rebuild = True
-
-        if full_rebuild:
-            result = full_build(root, store, recurse_submodules)
-            build_result = {
+    if full_rebuild:
+        result = full_build(root, store, recurse_submodules, stamp=False)
+        build_result = {
+            **result,
+            "build_type": "full",
+            "base_resolved": None,
+            "summary": (
+                f"Full build complete: parsed {result['files_parsed']} files, "
+                f"created {result['total_nodes']} nodes and "
+                f"{result['total_edges']} edges."
+            ),
+        }
+    else:
+        result = incremental_update(root, store, base=base_resolved, stamp=False)
+        if result["status"] == "rebuild_required":
+            return {
                 **result,
-                "status": "ok",
-                "build_type": "full",
-                "base_resolved": None,
-                "summary": (
-                    f"Full build complete: parsed {result['files_parsed']} files, "
-                    f"created {result['total_nodes']} nodes and "
-                    f"{result['total_edges']} edges."
-                ),
-            }
-        else:
-            result = incremental_update(root, store, base=base_resolved)
-            if result["files_updated"] == 0:
-                return {
-                    **result,
-                    "status": "ok",
-                    "build_type": "incremental",
-                    "base_resolved": base_resolved,
-                    "summary": "No changes detected. Graph is up to date.",
-                    "postprocess_level": postprocess,
-                }
-            build_result = {
-                **result,
-                "status": "ok",
                 "build_type": "incremental",
                 "base_resolved": base_resolved,
                 "summary": (
-                    f"Incremental update: {result['files_updated']} files re-parsed, "
-                    f"{result['total_nodes']} nodes and "
-                    f"{result['total_edges']} edges updated. "
-                    f"Changed: {result['changed_files']}. "
-                    f"Dependents also updated: {result['dependent_files']}."
+                    "The graph was built by an incompatible indexer "
+                    f"(index generation {result.get('index_generation')}, expected "
+                    f"{result.get('expected_index_generation')}). Run a full build."
                 ),
             }
+        if "write_epoch" not in result:
+            unchanged = {
+                **result,
+                "build_type": "incremental",
+                "base_resolved": base_resolved,
+                "summary": "No changes detected. Graph is up to date.",
+                "postprocess_level": postprocess,
+            }
+            if postprocess == "full" and read_flows_stale(store) is not None:
+                # Earlier --skip-flows updates left flows and communities behind.
+                warnings = _run_postprocess(store, unchanged, postprocess, repo_root=root)
+                if warnings:
+                    unchanged["warnings"] = warnings
+            return unchanged
+        build_result = {
+            **result,
+            "build_type": "incremental",
+            "base_resolved": base_resolved,
+            "summary": (
+                f"Incremental update: {result['files_updated']} files re-parsed, "
+                f"{result['total_nodes']} nodes and "
+                f"{result['total_edges']} edges updated. "
+                f"Changed: {result['changed_files']}. "
+                f"Dependents also updated: {result['dependent_files']}."
+            ),
+        }
 
-        # Pass changed_files for incremental flow/community detection
-        changed = result.get("changed_files") if not full_rebuild else None
-        warnings = _run_postprocess(
-            store,
-            build_result,
-            postprocess,
-            full_rebuild=full_rebuild,
-            changed_files=changed,
-            embedding_provider=embedding_provider,
-            embedding_model=embedding_model,
+    # Read before post-processing consumes it: embeddings follow the stamp.
+    pending = read_flows_stale(store)
+    changed = result.get("changed_files") if not full_rebuild else None
+    warnings = _run_postprocess(
+        store,
+        build_result,
+        postprocess,
+        full_rebuild=full_rebuild,
+        changed_files=changed,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+        repo_root=root,
+    )
+    if warnings:
+        build_result["warnings"] = warnings
+    finish_write(store, build_result)
+    embed_changed_nodes(store, root, pending, build_result)
+    if build_result["status"] == "partial":
+        build_result["summary"] += (
+            f" Partial: {len(build_result.get('failed_files') or [])} file(s) failed "
+            f"to parse, {len(build_result.get('resolver_failures') or {})} resolver "
+            "step(s) failed; they are retried by the next update."
         )
-        if warnings:
-            build_result["warnings"] = warnings
-        return build_result
-    finally:
-        store.close()
+    return build_result
 
 
 def run_postprocess(
@@ -698,6 +801,9 @@ def run_postprocess(
                 store.rollback()
                 logger.warning("Community detection failed: %s", e)
                 warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
+
+        if "flows_detected" in result and "communities_detected" in result:
+            clear_flows_stale(store)
 
         _run_embedding_refresh(
             store,

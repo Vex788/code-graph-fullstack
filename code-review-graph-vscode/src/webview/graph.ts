@@ -7,6 +7,13 @@
  */
 
 import * as d3 from "d3";
+import {
+  EDGE_KINDS,
+  EDGE_KIND_COLORS,
+  FALLBACK_EDGE_COLOR,
+  FALLBACK_NODE_COLOR,
+  NODE_KIND_COLORS,
+} from "../generated/kinds";
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: unknown): void;
@@ -18,16 +25,10 @@ declare function acquireVsCodeApi(): {
 // Types
 // ---------------------------------------------------------------------------
 
-type NodeKind = "File" | "Class" | "Function" | "Test" | "Type";
-
-type EdgeKind =
-  | "CALLS"
-  | "IMPORTS_FROM"
-  | "INHERITS"
-  | "IMPLEMENTS"
-  | "TESTED_BY"
-  | "CONTAINS"
-  | "DEPENDS_ON";
+// Kinds are open: a newer graph may carry kinds this build has never seen,
+// and those are drawn in a fallback colour rather than dropped.
+type NodeKind = string;
+type EdgeKind = string;
 
 interface GraphNode {
   id: number;
@@ -77,13 +78,7 @@ const NODE_RADIUS: Record<NodeKind, number> = {
   Type: 5,
 };
 
-const NODE_COLOR: Record<NodeKind, string> = {
-  File: "#58a6ff",
-  Class: "#f0883e",
-  Function: "#3fb950",
-  Test: "#d2a8ff",
-  Type: "#8b949e",
-};
+const NODE_COLOR: Record<NodeKind, string> = NODE_KIND_COLORS;
 
 const NODE_SHAPE: Record<NodeKind, d3.SymbolType> = {
   File: d3.symbolCircle,
@@ -101,16 +96,17 @@ const NODE_AREA: Record<NodeKind, number> = {
   Type: 314,
 };
 
-const EDGE_COLOR: Record<EdgeKind, string> = {
-  CALLS: "#3fb950",
-  IMPORTS_FROM: "#f0883e",
-  INHERITS: "#d2a8ff",
-  IMPLEMENTS: "#f9e2af",
-  TESTED_BY: "#f38ba8",
-  CONTAINS: "rgba(139,148,158,0.15)",
-  DEPENDS_ON: "#fab387",
-};
+const KNOWN_EDGE_KINDS = new Set<string>(EDGE_KINDS);
 
+function edgeColor(kind: EdgeKind): string {
+  return EDGE_KIND_COLORS[kind] ?? FALLBACK_EDGE_COLOR;
+}
+
+function edgeMarker(kind: EdgeKind): string {
+  return KNOWN_EDGE_KINDS.has(kind) ? `url(#arrow-${kind})` : "url(#arrow-fallback)";
+}
+
+/** Kinds with a toggle pill in the filter popover. */
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "CALLS",
   "IMPORTS_FROM",
@@ -131,7 +127,8 @@ let allNodes: SimNode[] = [];
 let allEdges: SimLink[] = [];
 let nodeMap = new Map<string, SimNode>();
 
-let visibleEdgeKinds = new Set<EdgeKind>(ALL_EDGE_KINDS);
+// Hidden rather than visible, so kinds without a pill are always shown.
+let hiddenEdgeKinds = new Set<EdgeKind>();
 let selectedNode: SimNode | null = null;
 let depthLimit = 0; // 0 = show all
 
@@ -177,9 +174,9 @@ function createSvg(): void {
     .attr("height", "100%")
     .attr("viewBox", `0 0 ${width} ${height}`);
 
-  // Arrow marker definitions -- one per edge kind
+  // Arrow marker definitions -- one per known edge kind plus a fallback
   const defs = svg.append("defs");
-  for (const kind of ALL_EDGE_KINDS) {
+  for (const kind of [...EDGE_KINDS, "fallback"]) {
     defs
       .append("marker")
       .attr("id", `arrow-${kind}`)
@@ -191,7 +188,7 @@ function createSvg(): void {
       .attr("orient", "auto")
       .append("path")
       .attr("d", "M0,-5L10,0L0,5")
-      .attr("fill", EDGE_COLOR[kind]);
+      .attr("fill", edgeColor(kind));
   }
 
   container = svg.append("g").attr("class", "graph-container");
@@ -287,7 +284,7 @@ function setData(nodes: GraphNode[], edges: GraphEdge[]): void {
 
 function getVisibleData(): { nodes: SimNode[]; links: SimLink[] } {
   // Filter edges by visible kinds
-  let links = allEdges.filter((e) => visibleEdgeKinds.has(e.kind));
+  let links = allEdges.filter((e) => !hiddenEdgeKinds.has(e.kind));
 
   let nodes: SimNode[];
 
@@ -398,10 +395,10 @@ function buildGraph(): void {
     .selectAll<SVGLineElement, SimLink>("line")
     .data(links, (d) => `${d.sourceQualified}-${d.targetQualified}-${d.kind}`)
     .join("line")
-    .attr("stroke", (d) => EDGE_COLOR[d.kind])
+    .attr("stroke", (d) => edgeColor(d.kind))
     .attr("stroke-width", 1.5)
     .attr("stroke-opacity", 0.4)
-    .attr("marker-end", (d) => `url(#arrow-${d.kind})`);
+    .attr("marker-end", (d) => edgeMarker(d.kind));
 
   // --- Nodes ---
   nodeSelection = nodeGroup
@@ -410,7 +407,7 @@ function buildGraph(): void {
     .join("path")
     .attr("class", "node-shape")
     .attr("d", (d) => d3.symbol().type(NODE_SHAPE[d.kind] ?? d3.symbolCircle).size(NODE_AREA[d.kind] ?? 314)()!)
-    .attr("fill", (d) => NODE_COLOR[d.kind] ?? "#cdd6f4")
+    .attr("fill", (d) => NODE_COLOR[d.kind] ?? FALLBACK_NODE_COLOR)
     .attr("stroke", "none")
     .attr("stroke-width", 2)
     .attr("cursor", "pointer")
@@ -839,12 +836,12 @@ function bindToolbarEvents(): void {
     const pill = document.getElementById(`edge-${kind}`);
     if (pill) {
       const toggle = () => {
-        if (visibleEdgeKinds.has(kind)) {
-          visibleEdgeKinds.delete(kind);
+        if (!hiddenEdgeKinds.has(kind)) {
+          hiddenEdgeKinds.add(kind);
           pill.classList.remove("active");
           pill.setAttribute("aria-pressed", "false");
         } else {
-          visibleEdgeKinds.add(kind);
+          hiddenEdgeKinds.delete(kind);
           pill.classList.add("active");
           pill.setAttribute("aria-pressed", "true");
         }

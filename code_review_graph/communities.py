@@ -13,6 +13,8 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from .graph import GraphEdge, GraphNode, GraphStore, _sanitize_name
+from .kinds import community_edge_weights
+from .parser import normalize_file_path
 
 # Fixed seed for igraph's RNG so Leiden community detection is reproducible
 # across runs. Without this, two builds of the same graph produce different
@@ -42,15 +44,8 @@ except ImportError:
 # Edge weight mapping
 # ---------------------------------------------------------------------------
 
-EDGE_WEIGHTS: dict[str, float] = {
-    "CALLS": 1.0,
-    "IMPORTS_FROM": 0.5,
-    "INHERITS": 0.8,
-    "IMPLEMENTS": 0.7,
-    "CONTAINS": 0.3,
-    "TESTED_BY": 0.4,
-    "DEPENDS_ON": 0.6,
-}
+# Per-kind values live in kinds.py (the kind registry).
+EDGE_WEIGHTS: dict[str, float] = community_edge_weights()
 
 # Common words to filter when generating community names
 _COMMON_WORDS = frozenset({
@@ -795,6 +790,38 @@ def _dedupe_community_names(
 # ---------------------------------------------------------------------------
 
 
+def _load_graph(store: GraphStore) -> tuple[list[GraphEdge], list[GraphNode]]:
+    """All edges and non-File nodes, without the ``extra`` detection never reads.
+
+    Leiden depends on input order; sorting makes the result a function of
+    the graph alone, so an incremental update matches a full rebuild.
+    """
+    conn = store._conn
+    cursor = conn.cursor()
+    cursor.row_factory = None  # plain tuples sort natively
+    # Detection reads endpoints and kind only; rows equal on those are
+    # interchangeable, so they need no further tie-break.
+    rows = cursor.execute(
+        "SELECT source_qualified, target_qualified, kind FROM edges"
+    ).fetchall()
+    rows.sort()
+    edges = [GraphEdge(0, kind, source, target, "", 0, {}) for source, target, kind in rows]
+    nodes = [
+        GraphNode(
+            id=row[0], kind=row[1], name=row[2], qualified_name=row[3], file_path=row[4],
+            line_start=row[5], line_end=row[6], language=row[7] or "", parent_name=row[8],
+            params=row[9], return_type=row[10], is_test=bool(row[11]), file_hash=row[12],
+            extra={},
+        )
+        for row in conn.execute(
+            "SELECT id, kind, name, qualified_name, file_path, line_start, line_end, "
+            "language, parent_name, params, return_type, is_test, file_hash "
+            "FROM nodes WHERE kind != 'File' ORDER BY qualified_name"
+        )
+    ]
+    return edges, nodes
+
+
 def detect_communities(
     store: GraphStore, min_size: int = 2
 ) -> list[dict[str, Any]]:
@@ -811,12 +838,8 @@ def detect_communities(
         List of community dicts with keys: name, level, size, cohesion,
         dominant_language, description, members, member_qns.
     """
-    # Gather all nodes (exclude File nodes to focus on code entities)
-    all_edges = store.get_all_edges()
-    unique_nodes = store.get_all_nodes(exclude_files=True)
-
-    # Build adjacency index once for fast cohesion computation
-    adj = _build_adjacency(all_edges)
+    # Gather all nodes (exclude File nodes to focus on code entities).
+    all_edges, unique_nodes = _load_graph(store)
 
     logger.info(
         "Loaded %d unique nodes, %d edges",
@@ -825,10 +848,10 @@ def detect_communities(
 
     if IGRAPH_AVAILABLE:
         logger.info("Detecting communities with Leiden algorithm (igraph)")
-        results = _detect_leiden(unique_nodes, all_edges, min_size, adj=adj)
+        results = _detect_leiden(unique_nodes, all_edges, min_size)
     else:
         logger.info("igraph not available, using file-based community detection")
-        results = _detect_file_based(unique_nodes, all_edges, min_size, adj=adj)
+        results = _detect_file_based(unique_nodes, all_edges, min_size)
 
     # Split oversized communities
     results = _split_oversized(
@@ -850,44 +873,46 @@ def incremental_detect_communities(
     store: GraphStore,
     changed_files: list[str],
     min_size: int = 2,
+    *,
+    delta: dict[str, Any] | None = None,
 ) -> int:
-    """Re-detect communities only if changed files affect existing communities.
+    """Re-detect communities only when the graph's structure changed.
 
-    If no existing communities contain nodes from changed files, skips
-    re-detection entirely (the common case for small changes). Otherwise
-    re-runs full community detection.
+    Detection is global, so any structural change re-runs it in full. With
+    the journaled *delta* of an incremental update that is exact: a change
+    that moved no node or edge (a comment, a reformat) skips it. Without a
+    delta, *changed_files* holding any node counts as a change.
 
     Args:
         store: The GraphStore instance.
         changed_files: List of file paths that have changed.
         min_size: Minimum number of nodes for a community to be included.
+        delta: The journaled graph change, when known.
 
     Returns:
         Number of communities detected, or 0 if skipped.
     """
-    if not changed_files:
-        return 0
+    if delta is not None:
+        if not delta.get("structural"):
+            return 0
+    else:
+        if not changed_files:
+            return 0
+        conn = store._conn
+        files = [normalize_file_path(p) for p in changed_files]
+        affected = False
+        for i in range(0, len(files), _SQL_BATCH):
+            batch = files[i:i + _SQL_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            if conn.execute(
+                f"SELECT 1 FROM nodes WHERE file_path IN ({placeholders}) LIMIT 1",  # nosec B608
+                batch,
+            ).fetchone():
+                affected = True
+                break
+        if not affected:
+            return 0
 
-    conn = store._conn
-
-    # Check if any communities are affected (batch to stay under SQLite limit)
-    affected_count = 0
-    for i in range(0, len(changed_files), _SQL_BATCH):
-        batch = changed_files[i:i + _SQL_BATCH]
-        placeholders = ",".join("?" * len(batch))
-        row = conn.execute(
-            f"SELECT COUNT(DISTINCT community_id) FROM nodes "  # nosec B608
-            f"WHERE community_id IS NOT NULL AND file_path IN ({placeholders})",
-            batch,
-        ).fetchone()
-        if row:
-            affected_count += row[0]
-    affected = (affected_count,) if affected_count else None
-
-    if not affected or affected[0] == 0:
-        return 0  # No communities affected, skip
-
-    # Re-run full community detection (correct and fast enough)
     communities = detect_communities(store, min_size=min_size)
     return store_communities(store, communities)
 

@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 def resolve_python_imports(store: GraphStore) -> dict[str, int]:
     """Resolve raw Python modules by unique repository-wide path suffix."""
+    with store.transaction():
+        return _resolve_python_imports(store)
+
+
+def _resolve_python_imports(store: GraphStore) -> dict[str, int]:
     conn = store._conn  # intentional: bounded post-build maintenance pass
     python_files = [
         row["file_path"]
@@ -110,7 +115,6 @@ def resolve_python_imports(store: GraphStore) -> dict[str, int]:
         updates,
     )
     if updates:
-        conn.commit()
         store._invalidate_cache()
 
     result = {

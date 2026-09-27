@@ -1,0 +1,104 @@
+# Where the graph kit lands in each harness. Paths are relative to the target
+# root (``--root``, else ``default_root``). ``command_root`` is how hook
+# commands spell that root at runtime. ``vars`` feed {{var}} in kit templates.
+# ``regions`` fill <!-- crg-kit:begin id --> markers in hand-maintained files.
+
+[targets.claude]
+default_root = "~/.claude"
+command_root = "$HOME/.claude"
+hooks_dir = "hooks"
+skills_dir = "skills"
+data_dir = "hooks"
+edit_matcher = "Edit|Write|MultiEdit"
+regions = [
+  { file = "CLAUDE.md", id = "graph-routing", block = "graph-routing" },
+]
+
+[targets.claude.events]
+post_tool_use = "PostToolUse"
+session_start = "SessionStart"
+
+[targets.claude.vars]
+rules_file = "CLAUDE.md"
+harness_name = "Claude Code"
+harness_home = "~/.claude"
+skills_home = "~/.claude/skills"
+mcp_prefix = "mcp__code-review-graph__"
+pack_schema = "pms"
+# Paths for kit scripts: ~ and ${VAR:-default} expand at runtime; never a /Users literal.
+state_home = "~/.claude/state/crg-update"
+log_home = "~/.claude/logs"
+domain_router = "~/.claude/skills/pms-project-knowledge/scripts/route_domain_cards.py"
+
+[targets.zcode]
+default_root = "~/.zcode/harness"
+command_root = "$HOME/.zcode/harness"
+hooks_dir = "hooks"
+skills_dir = "skills"
+data_dir = "hooks"
+# ZCode emits ApplyPatch for edits; Claude Code never does.
+edit_matcher = "Edit|Write|MultiEdit|ApplyPatch"
+regions = [
+  { file = "agent-src/blocks/graph-search.md", id = "graph-search", block = "graph-search" },
+  { file = "agent-src/blocks/impact-claim.md", id = "impact-claim", block = "impact-claim" },
+  { file = "agent-src/blocks/routing.md", id = "graph-routing", block = "graph-routing" },
+  { file = "AGENTS.md", id = "graph-routing", block = "graph-routing" },
+]
+
+[targets.zcode.events]
+post_tool_use = "PostToolUse"
+session_start = "SessionStart"
+
+[targets.zcode.vars]
+rules_file = "AGENTS.md"
+harness_name = "ZCode"
+harness_home = "~/.zcode/harness"
+skills_home = "~/.zcode/harness/skills"
+mcp_prefix = "mcp__code-review-graph__"
+pack_schema = "pms"
+# agent-src blocks are rendered again by render-agents, which fills this per role.
+impact_for = "{{impact_for}}"
+state_home = "~/.zcode/harness/state/crg-update"
+log_home = "~/.zcode/harness/logs"
+domain_router = "~/.zcode/harness/skills/pms-project-knowledge/scripts/route_domain_cards.py"
+
+# The plugin directory has no default; pass --root.
+[targets.bug-hunter]
+command_root = "${CLAUDE_PLUGIN_ROOT}"
+hooks_dir = "hooks"
+skills_dir = "skills"
+data_dir = "hooks"
+edit_matcher = "Edit|Write|MultiEdit|ApplyPatch"
+# Claude Code never loads a plugin-root CLAUDE.md; agents and skills carry the routing.
+regions = [
+  { file = "CLAUDE.md", id = "graph-routing", block = "graph-routing" },
+  { file = "agents/reviewer.md", id = "graph-routing", block = "graph-routing" },
+  { file = "skills/pr-review-orchestrator/SKILL.md", id = "graph-routing", block = "graph-routing" },
+]
+
+[targets.bug-hunter.events]
+post_tool_use = "PostToolUse"
+session_start = "SessionStart"
+
+[targets.bug-hunter.vars]
+rules_file = "CLAUDE.md"
+harness_name = "bug-hunter plugin"
+harness_home = "${CLAUDE_PLUGIN_ROOT}"
+skills_home = "${CLAUDE_PLUGIN_ROOT}/skills"
+mcp_prefix = "mcp__plugin_bug-hunter_code-review-graph__"
+pack_schema = "bughunter"
+# CLAUDE_PLUGIN_DATA survives plugin updates; same fallback as lib/bughunter_config.py.
+state_home = "${CLAUDE_PLUGIN_DATA:-~/.claude/plugins/data/bug-hunter}/state/crg-update"
+log_home = "${CLAUDE_PLUGIN_DATA:-~/.claude/plugins/data/bug-hunter}/logs"
+# Empty: the plugin passes --domain-router explicitly.
+domain_router = ""
+
+# laya owns its files; the kit only fills marker regions there.
+[targets.laya]
+regions_only = true
+regions = [
+  { file = "README.md", id = "graph-search", block = "graph-search" },
+]
+
+[targets.laya.vars]
+rules_file = "AGENTS.md"

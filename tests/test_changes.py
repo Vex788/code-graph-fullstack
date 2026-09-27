@@ -513,6 +513,28 @@ class TestChanges:
             assert result["test_gaps"] == []
         assert getattr(self.store.close, "__func__", None) is GraphStore.close
 
+    @pytest.mark.parametrize("tool", [
+        "detect_changes_func", "get_review_context", "get_affected_flows_func",
+    ])
+    @pytest.mark.parametrize("dirty", [None, []])
+    def test_git_unavailable_is_not_reported_as_no_changes(self, tool, dirty):
+        from code_review_graph import tools
+
+        with (
+            patch("code_review_graph.tools.review._get_store") as mock_get_store,
+            patch("code_review_graph.tools.review.get_changed_files", return_value=[]),
+            patch("code_review_graph.tools.review.get_staged_and_unstaged", return_value=dirty),
+            patch.object(self.store, "close"),
+        ):
+            mock_get_store.return_value = (self.store, Path("/fake/repo"))
+            result = getattr(tools, tool)(base="HEAD~1", repo_root="/fake/repo")
+        if dirty is None:
+            assert result.get("git") == "unavailable", result
+            assert "git" in result["summary"]
+            assert result.get("warning")
+        else:
+            assert "git" not in result and "warning" not in result
+
     def test_detect_changes_tool_with_changes(self):
         """detect_changes_func returns full analysis for changed files."""
         from code_review_graph.tools import detect_changes_func
@@ -574,6 +596,16 @@ class TestAnalyzeChangesFunctionCap:
     def test_no_truncation_below_cap(self, monkeypatch):
         """analyze_changes processes all functions when count is below cap."""
         monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "50")
+        self._add_funcs(5)
+
+        result = analyze_changes(self.store, changed_files=["app.py"])
+
+        assert len(result["changed_functions"]) == 5
+        assert result["functions_truncated"] is False
+
+    def test_malformed_cap_falls_back_to_default(self, monkeypatch):
+        """A typo in CRG_MAX_CHANGED_FUNCS must not crash detect-changes."""
+        monkeypatch.setenv("CRG_MAX_CHANGED_FUNCS", "lots")
         self._add_funcs(5)
 
         result = analyze_changes(self.store, changed_files=["app.py"])
@@ -844,3 +876,17 @@ class TestRiskScoreChurn:
                 repo_root=str(tmp_path),
             )
         churn.assert_not_called()
+
+
+def test_malformed_git_timeout_env_falls_back_instead_of_crashing_import():
+    import os
+    import sys
+
+    env = {**os.environ, "CRG_GIT_TIMEOUT": "thirty"}
+    completed = subprocess.run(
+        [sys.executable, "-c",
+         "import code_review_graph.changes as c; print(c._GIT_TIMEOUT)"],
+        capture_output=True, text=True, env=env, timeout=60, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "30"

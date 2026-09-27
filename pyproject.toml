@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.5"
+version = "2.3.8+fs.6"
 description = "Fork of code-review-graph: fullstack code mapping (templates, routes, ORM) for AI review agents"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -28,11 +28,12 @@ classifiers = [
 dependencies = [
     "mcp>=1.0.0,<3",
     # fastmcp >=3.2.4 is required for Message-based prompts and includes the
-    # CVE-2025-62800/62801/66416 fixes; <4 prevents the next major release
-    # from breaking the server the way fastmcp 3.0 did. See: #488
+    # CVE-2025-62800/62801/66416 fixes. 4.x is verified (prompts.py imports
+    # Message via a shim); <5 blocks the next unverified major. See: #488
     "fastmcp>=3.2.4,<5",
     "tree-sitter>=0.23.0,<1",
-    "tree-sitter-language-pack>=0.3.0,<2",
+    # 1.x downloads grammars at runtime and changes the exception types.
+    "tree-sitter-language-pack>=0.3.0,<1",
     "pyyaml>=6.0,<7",
     "networkx>=3.2,<4",
     "watchdog>=4.0.0,<7",
@@ -40,11 +41,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://code-review-graph.com"
-Repository = "https://github.com/tirth8205/code-review-graph"
-Documentation = "https://github.com/tirth8205/code-review-graph/blob/main/docs/INDEX.md"
-Changelog = "https://github.com/tirth8205/code-review-graph/blob/main/CHANGELOG.md"
-Issues = "https://github.com/tirth8205/code-review-graph/issues"
+Homepage = "https://github.com/Vex788/code-graph-fullstack"
+Repository = "https://github.com/Vex788/code-graph-fullstack"
+Documentation = "https://github.com/Vex788/code-graph-fullstack/blob/develop/docs/INDEX.md"
+Changelog = "https://github.com/Vex788/code-graph-fullstack/blob/develop/CHANGELOG.md"
+Issues = "https://github.com/Vex788/code-graph-fullstack/issues"
 
 [project.scripts]
 code-review-graph = "code_review_graph.cli:main"
@@ -53,6 +54,23 @@ crg-daemon = "code_review_graph.daemon_cli:main"
 [project.optional-dependencies]
 embeddings = [
     "sentence-transformers>=3.0.0,<7",
+    "numpy>=1.26,<3",
+]
+# Embedding profiles (`code-review-graph embeddings enable --profile P`).
+# fast: static model2vec vectors, numpy only.
+embeddings-fast = [
+    "model2vec>=0.6.0,<1",
+    "numpy>=1.26,<3",
+]
+# balanced on every OS: EmbeddingGemma through ONNX Runtime.
+embeddings-onnx = [
+    "fastembed>=0.8.0,<1",
+    "numpy>=1.26,<3",
+]
+# balanced/accurate on Apple Silicon; resolves to nothing elsewhere.
+embeddings-mlx = [
+    "mlx-embeddings>=0.1.0,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.31.0,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26,<3",
 ]
 google-embeddings = [
@@ -70,6 +88,9 @@ wiki = [
 ]
 all = [
     "code-graph-fullstack[embeddings]",
+    "code-graph-fullstack[embeddings-fast]",
+    "code-graph-fullstack[embeddings-onnx]",
+    "code-graph-fullstack[embeddings-mlx]",
     "code-graph-fullstack[google-embeddings]",
     "code-graph-fullstack[communities]",
     "code-graph-fullstack[enrichment]",

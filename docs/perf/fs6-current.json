@@ -1,0 +1,244 @@
+{
+  "run": {
+    "code_under_test": "05057eb (W4b: incremental flows/communities, jsp/spring/temporal/probe/import-walk speedups)",
+    "compared_with": "158746c (before W4b), timed back to back on the same machine and targets",
+    "command": "python -m code_review_graph.eval.benchmarks.stage_timing --fork <checkout> --fork-ref 158746c --scale 2000 --repeat 3 --out docs/perf/fs6-current.json",
+    "before_158746c": {
+      "fixture_scale_2000": {
+        "full_build_s": 2.3262,
+        "postprocess_s": 1.916,
+        "total_s": 4.2422,
+        "noop_update_median_s": 0.039,
+        "one_file_update_median_s": 0.7063,
+        "one_file_postprocess_timing": {
+          "communities_s": 0.000174,
+          "flows_s": 0.083186,
+          "fts_s": 8.9e-05,
+          "signatures_s": 0.001468,
+          "summaries_s": 0.138728
+        },
+        "resolvers_s": {
+          "hcl": 0.0024,
+          "jsp": 0.1037,
+          "python": 0.0015,
+          "rescript": 0.0159,
+          "scoped": 0.0028,
+          "spring": 0.0716,
+          "spring_event": 0.0273,
+          "temporal": 0.006
+        }
+      },
+      "fork": {
+        "full_build_s": 5.054,
+        "postprocess_s": 3.2743,
+        "total_s": 8.3283,
+        "noop_update_median_s": 0.0333,
+        "one_file_update_median_s": 0.7101,
+        "one_file_postprocess_timing": {
+          "communities_s": 0.000202,
+          "flows_s": 0.107764,
+          "fts_s": 8e-05,
+          "signatures_s": 0.002025,
+          "summaries_s": 0.186316
+        },
+        "resolvers_s": {
+          "hcl": 0.0061,
+          "jsp": 0.0047,
+          "python": 0.0432,
+          "rescript": 0.1376,
+          "scoped": 0.1086,
+          "spring": 0.1444,
+          "spring_event": 0.081,
+          "temporal": 0.1019
+        }
+      }
+    },
+    "full_build_ab_postprocess_none": {
+      "fork_after": {
+        "median_s": 5.599,
+        "min_s": 4.977,
+        "runs_s": [
+          5.793,
+          5.084,
+          5.599,
+          6.623,
+          4.977
+        ]
+      },
+      "fork_before": {
+        "median_s": 5.829,
+        "min_s": 5.436,
+        "runs_s": [
+          5.977,
+          6.211,
+          5.829,
+          5.721,
+          5.436
+        ]
+      },
+      "fx_after": {
+        "median_s": 2.29,
+        "min_s": 2.011,
+        "runs_s": [
+          2.011,
+          2.062,
+          2.29,
+          2.511,
+          2.379
+        ]
+      },
+      "fx_before": {
+        "median_s": 2.36,
+        "min_s": 2.148,
+        "runs_s": [
+          2.222,
+          2.148,
+          2.36,
+          2.412,
+          2.765
+        ]
+      }
+    },
+    "notes": [
+      "The container was shared with other workers (load average 1.0-1.7); the single full_build sample per target varies by about 0.5 s between runs, so full builds were also timed 5x alternating old and new code (full_build_ab_postprocess_none; fx = fixture_scale_2000).",
+      "one_file_update on the fork adds a Python function (a structural change): communities are now re-detected (about 0.46 s) where 158746c skipped them because relative changed paths matched no stored path. That is the correctness fix, not a slowdown of existing work; flows_s drops from about 0.11 s to 0.01 s.",
+      "one_file_update on the fixture appends a Java comment: no node or edge changes, so flows and communities correctly do nothing.",
+      "docs/perf/baseline.json (wave0-green) is left unchanged."
+    ]
+  },
+  "machine": {
+    "code_review_graph_version": "2.3.8+fs.5",
+    "cpu_count": 4,
+    "fork_git_head": "158746c44b10f34618aa557bbf5a44f82952fcc3",
+    "machine": "x86_64",
+    "package_path": "clean worktree of the fork at 05057eb",
+    "parse_executor": "auto",
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "python": "3.11.15",
+    "sqlite": "3.45.1",
+    "timestamp_utc": "2026-09-27T19:00:42+00:00"
+  },
+  "notes": [
+    "full_build_s covers parse, store and the post-parse resolvers; full_build() runs them together, so resolvers_s is measured by re-running each resolver on the built graph and parse_store_s is full_build_s minus that sum (an estimate).",
+    "postprocess_s wraps the whole post-build step; postprocess_timing is its own per-stage breakdown. The difference is bare/C++ call-target resolution, which it does not time.",
+    "noop_update and one_file_update time build_or_update_graph(full_rebuild=False), the path hooks and the MCP tool take; each one-file edit is committed first."
+  ],
+  "targets": {
+    "fixture_scale_2000": {
+      "edit_file": "src/main/java/com/acme/service/UserService.java",
+      "full_build": {
+        "full_build_s": 1.9899,
+        "parse_store_s": 1.8254,
+        "postprocess_s": 1.5447,
+        "postprocess_timing": {
+          "communities_s": 0.378234,
+          "flows_s": 0.187962,
+          "fts_s": 0.000244,
+          "signatures_s": 0.610846,
+          "summaries_s": 0.118098
+        },
+        "resolvers_s": {
+          "hcl": 0.0015,
+          "jsp": 0.036,
+          "python": 0.0012,
+          "rescript": 0.0132,
+          "scoped": 0.0022,
+          "spring": 0.0414,
+          "spring_event": 0.0612,
+          "temporal": 0.0078
+        },
+        "total_s": 3.5346,
+        "warnings": []
+      },
+      "graph": {
+        "edges": 26093,
+        "files": 1999,
+        "nodes": 9965,
+        "parse_errors": 0
+      },
+      "noop_update": {
+        "median_s": 0.0377,
+        "runs_s": [
+          0.0385,
+          0.0331,
+          0.0377
+        ]
+      },
+      "one_file_update": {
+        "dependent_files": 0,
+        "files_updated": 1,
+        "median_s": 0.4524,
+        "postprocess_timing": {
+          "communities_s": 5e-06,
+          "flows_s": 3.5e-05,
+          "fts_s": 8.6e-05,
+          "signatures_s": 0.001444,
+          "summaries_s": 0.11726
+        },
+        "runs_s": [
+          0.4524,
+          0.4315,
+          0.4568
+        ]
+      }
+    },
+    "fork": {
+      "edit_file": "code_review_graph/hints.py",
+      "full_build": {
+        "full_build_s": 5.3402,
+        "parse_store_s": 4.9223,
+        "postprocess_s": 2.9214,
+        "postprocess_timing": {
+          "communities_s": 0.486126,
+          "flows_s": 0.261531,
+          "fts_s": 0.000402,
+          "signatures_s": 0.439012,
+          "summaries_s": 0.152908
+        },
+        "resolvers_s": {
+          "hcl": 0.0054,
+          "jsp": 0.0033,
+          "python": 0.0299,
+          "rescript": 0.1066,
+          "scoped": 0.1244,
+          "spring": 0.034,
+          "spring_event": 0.1082,
+          "temporal": 0.0061
+        },
+        "total_s": 8.2616,
+        "warnings": []
+      },
+      "graph": {
+        "edges": 66071,
+        "files": 418,
+        "nodes": 7892,
+        "parse_errors": 0
+      },
+      "noop_update": {
+        "median_s": 0.0283,
+        "runs_s": [
+          0.029,
+          0.0247,
+          0.0283
+        ]
+      },
+      "one_file_update": {
+        "dependent_files": 0,
+        "files_updated": 1,
+        "median_s": 1.0138,
+        "postprocess_timing": {
+          "communities_s": 0.465171,
+          "flows_s": 0.010224,
+          "fts_s": 7.6e-05,
+          "signatures_s": 0.002013,
+          "summaries_s": 0.182452
+        },
+        "runs_s": [
+          1.0138,
+          0.9667,
+          1.0426
+        ]
+      }
+    }
+  }
+}

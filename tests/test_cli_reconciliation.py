@@ -29,7 +29,7 @@ from code_review_graph import cli
     ],
 )
 def test_quiet_build_and_update_suppress_summary_and_info_logs(
-    command, result, capsys, caplog,
+    command, result, capsys, caplog, tmp_path,
 ):
     """``--quiet`` must silence progress logs as well as the final summary."""
 
@@ -41,9 +41,10 @@ def test_quiet_build_and_update_suppress_summary_and_info_logs(
     with caplog.at_level(logging.INFO):
         with patch.object(sys, "argv", argv):
             with patch("code_review_graph.graph.GraphStore", return_value=MagicMock()):
+                # The CLI takes the writer lock next to the db path; keep it in tmp.
                 with patch(
                     "code_review_graph.incremental.get_db_path",
-                    return_value=MagicMock(),
+                    return_value=tmp_path / "graph.db",
                 ):
                     with patch(
                         "code_review_graph.tools.build.build_or_update_graph",
@@ -55,7 +56,7 @@ def test_quiet_build_and_update_suppress_summary_and_info_logs(
     assert "parsing progress" not in caplog.text
 
 
-def test_status_json_is_the_only_stdout_and_includes_current_sha(capsys):
+def test_status_json_is_the_only_stdout_and_includes_current_sha(capsys, tmp_path):
     store = MagicMock()
     store.get_stats.return_value = SimpleNamespace(
         total_nodes=3,
@@ -71,12 +72,13 @@ def test_status_json_is_the_only_stdout_and_includes_current_sha(capsys):
         "svn_branch": None,
     }.get
     argv = ["code-review-graph", "status", "--repo", "repo-root", "--json"]
+    (tmp_path / "graph.db").touch()
 
     with patch.object(sys, "argv", argv):
         with patch("code_review_graph.graph.GraphStore", return_value=store):
             with patch(
                 "code_review_graph.incremental.get_db_path",
-                return_value=MagicMock(),
+                return_value=tmp_path / "graph.db",
             ):
                 with patch(
                     "code_review_graph.incremental.detect_vcs",
@@ -90,7 +92,12 @@ def test_status_json_is_the_only_stdout_and_includes_current_sha(capsys):
 
     output = capsys.readouterr().out
     payload = json.loads(output)
-    assert payload == {
+    # Readiness fields are additive; the keys consumers already read stay exact.
+    assert {key: payload[key] for key in (
+        "nodes", "edges", "files", "languages", "last_updated", "vcs",
+        "built_on_branch", "built_at_commit", "current_branch", "current_sha",
+        "svn_branch", "svn_revision",
+    )} == {
         "nodes": 3,
         "edges": 4,
         "files": 2,
@@ -104,6 +111,8 @@ def test_status_json_is_the_only_stdout_and_includes_current_sha(capsys):
         "svn_branch": None,
         "svn_revision": None,
     }
+    # An empty stand-in database is never ready.
+    assert payload["readiness"]["status"] != "ok"
     assert output.count("\n") == 1
 
 

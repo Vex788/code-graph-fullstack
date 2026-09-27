@@ -34,6 +34,15 @@ from typing import Optional
 
 import tree_sitter_language_pack as tslp
 
+# 1.x raises its own Error hierarchy instead of LookupError for unknown grammars.
+_GRAMMAR_PROBE_ERRORS: tuple[type[BaseException], ...] = (
+    LookupError, ValueError, ImportError, OSError,
+    *(
+        err for err in (getattr(tslp, "Error", None),)
+        if isinstance(err, type) and issubclass(err, Exception)
+    ),
+)
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -332,7 +341,7 @@ def _validate_entry(
     # themselves are created lazily by CodeParser._get_parser.
     try:
         tslp.get_language(grammar)  # type: ignore[arg-type]
-    except (LookupError, ValueError, ImportError, OSError) as exc:
+    except _GRAMMAR_PROBE_ERRORS as exc:
         logger.warning(
             "%s: custom language %r: grammar %r is not available in "
             "tree_sitter_language_pack (%s) — skipping",

@@ -41,6 +41,11 @@ def resolve_rescript_cross_module(store: GraphStore) -> dict:
 
     Returns a dict with resolution counts for telemetry.
     """
+    with store.transaction():
+        return _resolve_rescript_cross_module(store)
+
+
+def _resolve_rescript_cross_module(store: GraphStore) -> dict:
     conn = store._conn  # intentional: post-build maintenance pass
 
     # Basename (module name) → absolute file path, preferring .res over .resi.
@@ -131,7 +136,6 @@ def resolve_rescript_cross_module(store: GraphStore) -> dict:
             "UPDATE edges SET target_qualified = ? WHERE id = ?",
             (new_target, edge_id),
         )
-    conn.commit()
     store._invalidate_cache()
 
     result = {

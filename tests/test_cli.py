@@ -162,7 +162,7 @@ def test_visualize_json_uses_local_export(tmp_path, capsys):
 
 
 class TestBuildUpdateCommands:
-    def test_build_skip_postprocess_does_not_run_extra_cli_postprocess(self):
+    def test_build_skip_postprocess_does_not_run_extra_cli_postprocess(self, tmp_path):
         argv = [
             "code-review-graph",
             "build",
@@ -181,7 +181,7 @@ class TestBuildUpdateCommands:
             with patch("code_review_graph.graph.GraphStore") as mock_store:
                 mock_store.return_value = MagicMock()
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
-                    mock_db.return_value = MagicMock()
+                    mock_db.return_value = tmp_path / "graph.db"
                     with patch(
                         "code_review_graph.tools.build.build_or_update_graph",
                         return_value=result,
@@ -198,7 +198,7 @@ class TestBuildUpdateCommands:
         )
         mock_postprocess.assert_not_called()
 
-    def test_update_skip_flows_does_not_run_extra_cli_postprocess(self):
+    def test_update_skip_flows_does_not_run_extra_cli_postprocess(self, tmp_path):
         argv = [
             "code-review-graph",
             "update",
@@ -217,7 +217,7 @@ class TestBuildUpdateCommands:
             with patch("code_review_graph.graph.GraphStore") as mock_store:
                 mock_store.return_value = MagicMock()
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
-                    mock_db.return_value = MagicMock()
+                    mock_db.return_value = tmp_path / "graph.db"
                     with patch(
                         "code_review_graph.tools.build.build_or_update_graph",
                         return_value=result,
@@ -237,7 +237,7 @@ class TestBuildUpdateCommands:
         )
         mock_postprocess.assert_not_called()
 
-    def test_update_forwards_explicit_base_verbatim(self):
+    def test_update_forwards_explicit_base_verbatim(self, tmp_path):
         argv = [
             "code-review-graph",
             "update",
@@ -258,7 +258,7 @@ class TestBuildUpdateCommands:
             with patch("code_review_graph.graph.GraphStore") as mock_store:
                 mock_store.return_value = MagicMock()
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
-                    mock_db.return_value = MagicMock()
+                    mock_db.return_value = tmp_path / "graph.db"
                     with patch(
                         "code_review_graph.tools.build.build_or_update_graph",
                         return_value=result,
@@ -270,7 +270,7 @@ class TestBuildUpdateCommands:
 
         assert mock_build.call_args.kwargs["base"] == "HEAD~3"
 
-    def test_update_reports_full_rebuild_fallback(self, capsys):
+    def test_update_reports_full_rebuild_fallback(self, capsys, tmp_path):
         argv = ["code-review-graph", "update", "--repo", "repo-root"]
         # build_or_update_graph falls back to a full rebuild when there is no
         # usable incremental base; the CLI must say so rather than print
@@ -288,7 +288,7 @@ class TestBuildUpdateCommands:
             with patch("code_review_graph.graph.GraphStore") as mock_store:
                 mock_store.return_value = MagicMock()
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
-                    mock_db.return_value = MagicMock()
+                    mock_db.return_value = tmp_path / "graph.db"
                     with patch(
                         "code_review_graph.tools.build.build_or_update_graph",
                         return_value=result,

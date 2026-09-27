@@ -33,7 +33,7 @@ class TestSessionState:
     def test_refactoring_intent_detected(self):
         """Recording refactoring-oriented tools should infer 'refactoring'."""
         session = SessionState()
-        for tool in ("refactor", "find_dead_code", "suggest_refactorings"):
+        for tool in ("refactor", "apply_refactor", "find_large_functions"):
             session.record_tool_call(tool)
         assert infer_intent(session) == "refactoring"
 
@@ -67,7 +67,7 @@ class TestGenerateHints:
         suggested_tools2 = {s["tool"] for s in hints2["next_steps"]}
         # list_flows itself was called, so it shouldn't be suggested by get_flow workflow
         # Also, the first list_flows call should be excluded from next suggestions
-        assert "list_flows" not in suggested_tools2
+        assert "list_flows_tool" not in suggested_tools2
 
     def test_hints_max_three(self):
         """Each hints category should have at most 3 entries."""
@@ -193,3 +193,67 @@ class TestGlobalSession:
         hints = generate_hints("get_architecture_overview", result, session)
         assert any("High coupling" in w for w in hints["warnings"])
         assert any("Circular dependency" in w for w in hints["warnings"])
+
+
+class TestToolNames:
+    """Hints name tools the MCP server actually registers."""
+
+    @staticmethod
+    def _registered() -> set[str]:
+        import asyncio
+
+        from code_review_graph import main as crg_main
+
+        return {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
+
+    def test_every_workflow_and_intent_tool_is_registered(self):
+        from code_review_graph.hints import _INTENT_TOOLS, _WORKFLOW, mcp_tool_name
+
+        registered = self._registered()
+        names = {mcp_tool_name(t) for tools in _INTENT_TOOLS.values() for t in tools}
+        names |= {mcp_tool_name(k) for k in _WORKFLOW}
+        names |= {mcp_tool_name(step["tool"]) for steps in _WORKFLOW.values() for step in steps}
+        assert names <= registered, names - registered
+
+    def test_next_steps_use_registered_names(self):
+        registered = self._registered()
+        hints = generate_hints("detect_changes", {"status": "ok"}, SessionState())
+        assert hints["next_steps"]
+        assert {s["tool"] for s in hints["next_steps"]} <= registered
+
+    def test_own_suggestions_merge_first_and_dedupe(self):
+        result = {"next_tool_suggestions": [
+            "get_impact_radius -- check blast radius",
+            "query_graph callers_of -- trace the coupling",
+        ]}
+        hints = generate_hints("detect_changes", result, SessionState())
+        steps = hints["next_steps"]
+        assert [s["tool"] for s in steps][:2] == ["get_impact_radius_tool", "query_graph_tool"]
+        assert steps[1]["args"] == "callers_of"
+        assert len({s["tool"] for s in steps}) == len(steps)
+
+    def test_suffixed_tool_name_is_recorded_bare(self):
+        session = SessionState()
+        generate_hints("list_flows_tool", {"status": "ok"}, session)
+        assert list(session.tools_called) == ["list_flows"]
+
+
+def test_every_next_tool_suggestion_names_a_registered_tool():
+    """Static suggestion lists in tool modules name real MCP tools."""
+    import asyncio
+    import re
+    from pathlib import Path
+
+    from code_review_graph import main as crg_main
+
+    registered = {t.name for t in asyncio.run(crg_main.mcp.list_tools())}
+    tools_dir = Path(crg_main.__file__).parent / "tools"
+    text = "\n".join(p.read_text(encoding="utf-8") for p in tools_dir.glob("*.py"))
+    lists = re.findall(r'next_tool_suggestions(?:"\]|"\s*:|=)\s*\[([^\]]*)\]', text)
+    names = {
+        m.split()[0]
+        for body in lists
+        for m in re.findall(r'"([a-z_]+(?: [^"]*)?)"', body)
+    }
+    assert names, "no suggestion lists found"
+    assert names <= registered, names - registered

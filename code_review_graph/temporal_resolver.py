@@ -22,6 +22,16 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from .spring_resolver import (
+    _bare_type_name,
+    called_method_name,
+    calls_in_files,
+    enclosing_class_chain,
+    java_class_owners,
+    java_method_index,
+    pick_java_method,
+)
+
 if TYPE_CHECKING:
     from .graph import GraphStore
 
@@ -36,6 +46,11 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
 
     Returns a dict with resolution counts for telemetry.
     """
+    with store.transaction():
+        return _resolve_temporal_calls(store)
+
+
+def _resolve_temporal_calls(store: GraphStore) -> dict:
     conn = store._conn
 
     java_files: set[str] = {
@@ -91,15 +106,8 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
         logger.info("Temporal resolver: no TEMPORAL_STUB edges found, skipping")
         return {"files_indexed": len(java_files), "calls_resolved": 0}
 
-    # -----------------------------------------------------------------------
-    # method_to_qual: (class_name, method_name) → full qualified_name
-    # -----------------------------------------------------------------------
-    method_to_qual: dict[tuple[str, str], str] = {}
-    for row in conn.execute(
-        "SELECT name, qualified_name, parent_name FROM nodes "
-        "WHERE kind IN ('Function', 'Test') AND language = 'java' AND parent_name IS NOT NULL"
-    ).fetchall():
-        method_to_qual[(row["parent_name"], row["name"])] = row["qualified_name"]
+    method_index = java_method_index(conn)
+    class_owners = java_class_owners(conn)
 
     # -----------------------------------------------------------------------
     # implementors: bare interface name → list of implementing class quals
@@ -110,16 +118,19 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
     ).fetchall():
         iface = row["target_qualified"]
         impl = row["source_qualified"]
-        if any(impl.startswith(f) for f in java_files) or "::" in impl:
-            implementors.setdefault(iface, []).append(impl)
+        if impl.partition("::")[0] not in java_files:
+            continue
+        # INHERITS targets are qualified when the parser resolved the type
+        # and bare otherwise; index both spellings.
+        for key in {iface, _bare_type_name(iface)}:
+            implementors.setdefault(key, []).append(impl)
 
     # -----------------------------------------------------------------------
     # Resolve CALLS edges
     # -----------------------------------------------------------------------
-    calls_rows = conn.execute(
-        "SELECT id, source_qualified, target_qualified, extra, file_path "
-        "FROM edges WHERE kind = 'CALLS'"
-    ).fetchall()
+    calls_rows = calls_in_files(
+        conn, {class_qual.partition("::")[0] for class_qual, _ in field_map} & java_files,
+    )
 
     resolved = 0
 
@@ -139,48 +150,30 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
         if extra.get("temporal_resolved") or extra.get("spring_resolved"):
             continue
 
-        raw_target = row["target_qualified"]
-        if "::" in raw_target:
-            after = raw_target.split("::", 1)[1]
-            method_name = after.split(".")[-1] if "." in after else after
-        else:
-            method_name = raw_target
-
+        method_name = called_method_name(row["target_qualified"])
         source_qual = row["source_qualified"]
 
-        # Derive enclosing class qualified name
-        enclosing_class_qual: str | None = None
-        if "::" in source_qual:
-            after_sep = source_qual.split("::", 1)[1]
-            if "." in after_sep:
-                class_part = after_sep.split(".")[0]
-                prefix = source_qual.split("::")[0]
-                enclosing_class_qual = f"{prefix}::{class_part}"
-            else:
-                enclosing_class_qual = source_qual
-
-        if not enclosing_class_qual:
-            continue
-
-        interface_bare = field_map.get((enclosing_class_qual, receiver))
+        interface_bare = next(
+            (
+                field_map[(class_qual, receiver)]
+                for class_qual in enclosing_class_chain(source_qual, class_owners)
+                if (class_qual, receiver) in field_map
+            ),
+            None,
+        )
         if not interface_bare:
             continue
 
         interface_qual = temporal_interfaces.get(interface_bare, interface_bare)
 
-        # ``implementors`` is keyed by the bare interface name (INHERITS'
-        # target_qualified is bare for Java), so look it up with the bare name.
-        # Using ``interface_qual`` (the fully-qualified name) never matches, so
-        # the ``len(impls) == 1`` branch was dead and every stub call resolved
-        # to the interface method instead of the concrete implementation.
-        impls = implementors.get(interface_bare, [])
-        if len(impls) == 1:
-            concrete_class = impls[0].split("::")[-1]
-            fallback = f"{impls[0]}.{method_name}"
-            new_target = method_to_qual.get((concrete_class, method_name)) or fallback
+        # ``implementors`` indexes every interface under its bare name too:
+        # INHERITS targets are qualified only when the parser resolved them.
+        impls = list(dict.fromkeys(implementors.get(interface_bare, [])))
+        owner = impls[0] if len(impls) == 1 else interface_qual
+        if "::" in owner:
+            new_target = pick_java_method(method_index, owner, method_name, extra.get("arg_count"))
         else:
-            fallback = f"{interface_qual}.{method_name}"
-            new_target = method_to_qual.get((interface_bare, method_name)) or fallback
+            new_target = f"{owner}.{method_name}"
 
         extra["temporal_resolved"] = True
         extra["temporal_interface"] = interface_bare
@@ -195,9 +188,6 @@ def resolve_temporal_calls(store: GraphStore) -> dict:
             "Temporal resolved: %s → %s (receiver=%s, interface=%s)",
             source_qual, new_target, receiver, interface_bare,
         )
-
-    if resolved:
-        conn.commit()
 
     logger.info("Temporal resolver: resolved %d CALLS edges in %d Java files",
                 resolved, len(java_files))

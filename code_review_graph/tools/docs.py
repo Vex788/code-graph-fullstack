@@ -32,6 +32,11 @@ def embed_graph(
 ) -> dict[str, Any]:
     """Compute vector embeddings for all graph nodes to enable semantic search.
 
+    Embeddings are off by default. To turn them on for a repository, with
+    updates embedding changed nodes automatically, run
+    ``code-review-graph embeddings enable --profile balanced``; this tool is a
+    one-off embed with an explicit provider.
+
     Requires: ``pip install code-review-graph[embeddings]`` (local provider only;
     cloud providers like ``openai`` / ``google`` / ``minimax`` / ``voyage`` use
     stdlib ``urllib``).
@@ -85,7 +90,8 @@ def embed_graph(
                         "The local embedding provider needs sentence-transformers. "
                         "Install with: pip install code-review-graph[embeddings] — "
                         "or switch provider to 'openai' / 'google' / 'minimax' "
-                        "/ 'voyage'."
+                        "/ 'voyage', or run `code-review-graph embeddings enable "
+                        "--profile balanced`."
                     )
                 return {"status": "error", "error": err}
 

@@ -85,14 +85,18 @@ def test_serve_ignores_non_project_cwd_as_default_root(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_build_tool_passes_status_only(monkeypatch):
+async def test_build_tool_status_only_reads_the_job_without_starting_one(monkeypatch):
     calls = []
 
-    def fake_build(**kwargs):
-        calls.append(kwargs)
+    def fake_status(root):
+        calls.append(root)
         return {"status": "idle"}
 
-    monkeypatch.setattr(crg_main, "build_or_update_graph", fake_build)
+    def no_build(*args, **kwargs):
+        raise AssertionError("status_only must not start a build")
+
+    monkeypatch.setattr(crg_main, "build_job_status", fake_status)
+    monkeypatch.setattr(crg_main, "run_build_job", no_build)
     monkeypatch.setattr(crg_main, "with_provenance", lambda result, root=None: result)
     tool = getattr(crg_main.build_or_update_graph_tool, "fn", None)
     underlying = tool or crg_main.build_or_update_graph_tool
@@ -100,7 +104,7 @@ async def test_build_tool_passes_status_only(monkeypatch):
     result = await underlying(status_only=True)
 
     assert result == {"status": "idle"}
-    assert calls[0]["status_only"] is True
+    assert len(calls) == 1
 
 
 def test_docs_wrapper_falls_back_to_packaged_docs_with_resolved_repo(
@@ -205,7 +209,7 @@ class TestLongRunningToolsAreAsync:
     }
 
     HEAVY_TOOL_IMPLS = {
-        "build_or_update_graph_tool": "build_or_update_graph",
+        "build_or_update_graph_tool": "run_build_job",
         "run_postprocess_tool": "run_postprocess",
         "embed_graph_tool": "embed_graph",
         "detect_changes_tool": "detect_changes_func",
@@ -521,3 +525,227 @@ class TestApplyToolFilter:
         crg_main._apply_tool_filter(" query_graph_tool , semantic_search_nodes_tool ")
         remaining = await self._tool_names()
         assert remaining == {"query_graph_tool", "semantic_search_nodes_tool"}
+
+    @pytest.mark.asyncio
+    async def test_agent_preset_keeps_the_agent_working_set(self):
+        crg_main._apply_tool_filter("agent")
+        remaining = await self._tool_names()
+        assert remaining == set(crg_main.TOOL_PRESETS["agent"])
+        assert len(remaining) == 14
+
+    @pytest.mark.asyncio
+    async def test_agent_preset_via_env_combines_with_names(self, monkeypatch):
+        monkeypatch.setenv("CRG_TOOLS", "agent,embed_graph_tool")
+        crg_main._apply_tool_filter(None)
+        remaining = await self._tool_names()
+        assert remaining == set(crg_main.TOOL_PRESETS["agent"]) | {"embed_graph_tool"}
+
+    @pytest.mark.asyncio
+    async def test_all_preset_keeps_every_tool(self):
+        before = await self._tool_names()
+        crg_main._apply_tool_filter("all")
+        assert await self._tool_names() == before
+
+    @pytest.mark.asyncio
+    async def test_preset_names_are_registered_tools(self):
+        registered = await self._tool_names()
+        for names in crg_main.TOOL_PRESETS.values():
+            assert set(names) <= registered
+
+
+def test_serve_tools_agent_reaches_the_filter(monkeypatch):
+    from code_review_graph import cli
+
+    seen: dict = {}
+    monkeypatch.setattr(crg_main, "main", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(cli.sys, "argv", ["code-review-graph", "serve", "--tools", "agent"])
+    try:
+        cli.main()
+    except SystemExit as exc:
+        assert not exc.code
+    assert seen.get("tools") == "agent"
+
+
+class TestMcpErrorShape:
+    """Tool errors reach MCP clients as {status: error, error_code, message}."""
+
+    @staticmethod
+    async def _call(name: str, args: dict) -> dict:
+        from fastmcp import Client
+
+        async with Client(crg_main.mcp) as client:
+            result = await client.call_tool(name, args, raise_on_error=False)
+        return result.structured_content
+
+    @pytest.mark.asyncio
+    async def test_rejected_argument_is_invalid_argument(self, monkeypatch):
+        def reject(**_kwargs):
+            raise ValueError("max_results must be an integer greater than or equal to 1")
+
+        monkeypatch.setattr(crg_main, "get_impact_radius", reject)
+        payload = await self._call("get_impact_radius_tool", {"max_results": 0})
+        assert payload["status"] == "error"
+        assert payload["error_code"] == "invalid_argument"
+        assert "max_results" in payload["message"]
+
+    @pytest.mark.asyncio
+    async def test_bad_repo_root_is_invalid_repo_root(self, tmp_path):
+        payload = await self._call(
+            "list_graph_stats_tool", {"repo_root": str(tmp_path / "missing")},
+        )
+        assert (payload["status"], payload["error_code"]) == ("error", "invalid_repo_root")
+
+    @pytest.mark.asyncio
+    async def test_legacy_error_result_gains_error_code(self, monkeypatch):
+        monkeypatch.setattr(
+            crg_main, "list_flows", lambda **_kw: {"status": "error", "error": "boom"},
+        )
+        monkeypatch.setattr(crg_main, "with_provenance", lambda result, _root: result)
+        payload = await self._call("list_flows_tool", {})
+        assert payload["error_code"] == "tool_error"
+        assert payload["message"] == "boom" and payload["error"] == "boom"
+
+    @pytest.mark.asyncio
+    async def test_batch_query_invalid_root_is_per_item(self, tmp_path):
+        payload = await self._call("batch_query_tool", {
+            "queries": [{"pattern": "callers_of", "target": "x"}],
+            "repo_root": str(tmp_path / "missing"),
+        })
+        assert payload["status"] == "ok"
+        assert payload["results"][0]["error_code"] == "invalid_repo_root"
+
+
+def test_new_paging_params_are_forwarded(monkeypatch):
+    seen: dict = {}
+
+    def capture(name):
+        def fake(**kwargs):
+            seen[name] = kwargs
+            return {"status": "ok"}
+        return fake
+
+    monkeypatch.setattr(crg_main, "with_provenance", lambda result, _root: result)
+    for name in ("get_impact_radius", "query_graph", "semantic_search_nodes",
+                 "list_flows", "list_communities_func"):
+        monkeypatch.setattr(crg_main, name, capture(name))
+
+    def fn(tool):
+        return getattr(tool, "fn", tool)
+
+    fn(crg_main.get_impact_radius_tool)(offset=5)
+    fn(crg_main.query_graph_tool)("pages_for", "X", offset=2)
+    fn(crg_main.semantic_search_nodes_tool)("x", offset=3)
+    fn(crg_main.list_flows_tool)(offset=4)
+    fn(crg_main.list_communities_tool)(offset=6)
+    assert seen["get_impact_radius"]["max_results"] == 100
+    assert seen["get_impact_radius"]["offset"] == 5
+    assert seen["query_graph"]["offset"] == 2
+    assert seen["semantic_search_nodes"]["offset"] == 3
+    assert seen["list_flows"]["offset"] == 4
+    assert seen["list_communities_func"]["offset"] == 6
+
+
+def test_review_context_default_matches_docstring():
+    import inspect
+
+    from code_review_graph.tools.review import get_review_context
+
+    tool = getattr(crg_main.get_review_context_tool, "fn", crg_main.get_review_context_tool)
+    default = inspect.signature(tool).parameters["max_results"].default
+    assert default == inspect.signature(get_review_context).parameters["max_results"].default
+    assert f"Default: {default}." in inspect.getdoc(tool)
+
+
+def test_orient_tool_forwards_provider_limit_and_detail_level(monkeypatch):
+    seen: dict = {}
+
+    def fake_orient(**kwargs):
+        seen.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(crg_main, "orient", fake_orient)
+    monkeypatch.setattr(crg_main, "with_provenance", lambda result, _root: result)
+    fn = getattr(crg_main.orient_tool, "fn", crg_main.orient_tool)
+    fn("login flow", repo_root="/tmp/r", provider="fast", limit=3, detail_level="minimal")
+    assert seen == {"query": "login flow", "repo_root": "/tmp/r", "provider": "fast",
+                    "limit": 3, "detail_level": "minimal"}
+    seen.clear()
+    fn("login flow", repo_root="/tmp/r")
+    assert (seen["provider"], seen["limit"], seen["detail_level"]) == (None, 8, "standard")
+
+
+def _windows_start(monkeypatch, tmp_path) -> list:
+    """Run ``main`` as on Windows; returns the recorded start events."""
+    import code_review_graph.embeddings as embeddings
+    from code_review_graph import repo_settings
+
+    events: list = []
+    policy = object()
+    monkeypatch.setattr(crg_main, "_default_repo_root", None)
+    monkeypatch.delenv("CRG_EMBEDDINGS", raising=False)
+    # Installed while sys.platform is still POSIX; see test_embedding_initialization.
+    monkeypatch.setattr(crg_main.asyncio, "WindowsSelectorEventLoopPolicy",
+                        lambda: policy, raising=False)
+    monkeypatch.setattr(crg_main.asyncio, "set_event_loop_policy",
+                        lambda value: events.append("policy") if value is policy else None)
+    monkeypatch.setattr(crg_main.sys, "platform", "win32")
+    monkeypatch.setattr(embeddings, "prewarm_local_embeddings",
+                        lambda model=None: events.append(("prewarm", model)))
+    monkeypatch.setattr(crg_main.mcp, "run", lambda **_kwargs: events.append("run"))
+    repo_settings.clear_cache()
+    crg_main.main(repo_root=str(tmp_path))
+    repo_settings.clear_cache()
+    return events
+
+
+def test_windows_start_skips_prewarm_when_embeddings_are_off(monkeypatch, tmp_path):
+    assert _windows_start(monkeypatch, tmp_path) == ["policy", "run"]
+
+
+def test_windows_start_skips_prewarm_for_non_legacy_profiles(monkeypatch, tmp_path):
+    from code_review_graph.repo_settings import write_section
+
+    write_section(tmp_path, "embeddings", {"enabled": True, "profile": "balanced"})
+    assert _windows_start(monkeypatch, tmp_path) == ["policy", "run"]
+
+
+def test_windows_start_prewarms_the_legacy_profile_model(monkeypatch, tmp_path):
+    from code_review_graph.embedding_providers.profiles import LEGACY
+    from code_review_graph.repo_settings import write_section
+
+    write_section(tmp_path, "embeddings", {"enabled": True, "profile": "legacy"})
+    assert _windows_start(monkeypatch, tmp_path) == [
+        "policy", ("prewarm", LEGACY.model), "run",
+    ]
+
+
+def test_windows_start_prewarms_the_local_provider(monkeypatch, tmp_path):
+    from code_review_graph.repo_settings import write_section
+
+    write_section(tmp_path, "embeddings", {"enabled": True, "profile": "local"})
+    assert _windows_start(monkeypatch, tmp_path) == ["policy", ("prewarm", None), "run"]
+
+
+def test_embed_graph_help_points_at_embeddings_enable(monkeypatch, tmp_path):
+    fn = getattr(crg_main.embed_graph_tool, "fn", crg_main.embed_graph_tool)
+    assert "code-review-graph embeddings enable" in (docs_module.embed_graph.__doc__ or "")
+    assert "code-review-graph embeddings enable" in (fn.__doc__ or "")
+
+    class _NoProvider:
+        available = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class _Store:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(docs_module, "EmbeddingStore", _NoProvider)
+    monkeypatch.setattr(docs_module, "_get_store", lambda _root: (_Store(), tmp_path))
+    result = docs_module.embed_graph(repo_root=str(tmp_path))
+    assert result["status"] == "error"
+    assert "code-review-graph embeddings enable" in result["error"]

@@ -11,30 +11,37 @@ endpoint cannot be driven cross-origin (e.g. via DNS rebinding); see
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
-from typing_extensions import TypedDict  # pydantic rejects typing.TypedDict below 3.12
+from fastmcp.server.middleware import Middleware
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
+from typing_extensions import NotRequired, TypedDict  # pydantic rejects typing.TypedDict below 3.12
 
 from . import incremental as _incremental
 from .cli import _get_version
+from .constants import env_float, env_int
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
+from .jobs import DEFAULT_WAIT_SECONDS, build_job_status, run_build_job
+from .migrations import SchemaMigrationPending, SchemaTooNewError
 from .prompts import (
+    Message,
     architecture_map_prompt,
     debug_issue_prompt,
     onboard_developer_prompt,
     pre_merge_check_prompt,
     review_changes_prompt,
 )
+from .repo_settings import load_embedding_settings
 from .tools import (
     apply_refactor_func,
     batch_query,
-    build_or_update_graph,
     coverage_report,
     cross_repo_search_func,
     detect_changes_func,
@@ -66,6 +73,7 @@ from .tools import (
     traverse_graph_func,
     with_provenance,
 )
+from .tools._common import _resolve_root, building_response, schema_error_response
 from .tools.navigation import common_callers_of, orient, shortest_path_between
 
 logger = logging.getLogger(__name__)
@@ -110,6 +118,82 @@ mcp = FastMCP(
 )
 
 
+def _schema_error_payload(exc: BaseException) -> Optional[dict]:
+    """Contract shape for a schema exception anywhere in *exc*'s chain."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, SchemaTooNewError):
+            return schema_error_response(current)
+        if isinstance(current, SchemaMigrationPending):
+            return building_response()
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _error_payload(code: str, message: str) -> dict:
+    """The contract error shape; ``error`` repeats the message for old readers."""
+    return {"status": "error", "error_code": code, "message": message, "error": message}
+
+
+def _value_error_payload(exc: BaseException) -> Optional[dict]:
+    """Error shape for a ValueError anywhere in *exc*'s chain (FastMCP wraps it)."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ValueError):
+            message = str(current)
+            code = (
+                "invalid_repo_root" if message.startswith("repo_root")
+                else "invalid_argument"
+            )
+            return _error_payload(code, message)
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _tool_result(payload: dict) -> ToolResult:
+    return ToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload))],
+        structured_content=payload,
+    )
+
+
+class _SchemaStateMiddleware(Middleware):
+    """Tools that open the graph answer ``building`` or ``schema_too_new``
+    instead of failing when the schema is mid-migration or too new.
+
+    It also keeps every tool error in the contract shape ``{status: error,
+    error_code, message}``: a rejected argument (``ValueError``, including a
+    bad ``repo_root``) becomes ``invalid_argument``/``invalid_repo_root``,
+    and an error result without ``error_code`` gets ``tool_error``.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            result = await call_next(context)
+        except Exception as exc:
+            payload = _schema_error_payload(exc) or _value_error_payload(exc)
+            if payload is None:
+                raise
+            return _tool_result(payload)
+        payload = getattr(result, "structured_content", None)
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "error"
+            and "error_code" not in payload
+        ):
+            message = str(payload.get("message") or payload.get("error")
+                          or payload.get("summary") or "tool error")
+            return _tool_result({**payload, **_error_payload("tool_error", message)})
+        return result
+
+
+mcp.add_middleware(_SchemaStateMiddleware())
+
+
 @mcp.tool()
 async def build_or_update_graph_tool(
     full_rebuild: bool = False,
@@ -120,6 +204,7 @@ async def build_or_update_graph_tool(
     embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
     status_only: bool = False,
+    wait_seconds: Optional[float] = None,
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -127,12 +212,12 @@ async def build_or_update_graph_tool(
     By default performs an incremental update (only changed files).
     Set full_rebuild=True to re-parse every file.
 
-    Runs the blocking full_build / incremental_update work in a thread
-    via ``asyncio.to_thread`` so the stdio event loop stays responsive.
-    Without this wrapper, long builds deadlocked on Windows because
-    ``ProcessPoolExecutor`` (used by parallel parsing) interacted badly
-    with the sync handler blocking the only event-loop thread. See:
-    #46, #136.
+    The build runs as a background job (a ``code-review-graph build|update``
+    subprocess, one per repository), never inside the server. The call waits
+    up to ``wait_seconds`` for it; a longer build answers ``status:
+    building`` with a ``job_id``, and a repeat call joins the running job.
+    The wait runs in a thread via ``asyncio.to_thread`` so the stdio event
+    loop stays responsive (#46, #136).
 
     Args:
         full_rebuild: If True, re-parse all files. Default: False (incremental).
@@ -149,19 +234,41 @@ async def build_or_update_graph_tool(
             refresh. Must be supplied with embedding_model. Default: disabled.
         embedding_model: Exact model for an explicit post-build embedding
             refresh. Must be supplied with embedding_provider. Default: disabled.
-        status_only: If True, report the background build job for this root
-            without building. Default: False.
+        status_only: If True, report the build job for this root (progress
+            while running, the result or error once finished) without
+            starting one. Default: False.
+        wait_seconds: How long to wait for the job before answering
+            ``building``. Default: CRG_BUILD_WAIT_SECONDS, else 25.
     """
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(build_or_update_graph(
-            full_rebuild=full_rebuild, repo_root=root, base=base,
-            postprocess=postprocess, recurse_submodules=recurse_submodules,
-            embedding_provider=embedding_provider,
-            embedding_model=embedding_model,
-            status_only=status_only,
-        ), root)
+        try:
+            resolved = str(_resolve_root(root))
+        except ValueError as exc:
+            return {
+                "status": "error", "error_code": "invalid_repo_root",
+                "message": str(exc), "error": str(exc), "summary": str(exc),
+            }
+        if status_only:
+            return with_provenance(build_job_status(resolved), resolved)
+        wait = (
+            wait_seconds if wait_seconds is not None
+            else env_float("CRG_BUILD_WAIT_SECONDS", DEFAULT_WAIT_SECONDS)
+        )
+        try:
+            result = run_build_job(
+                resolved, full_rebuild=full_rebuild, base=base,
+                postprocess=postprocess, recurse_submodules=recurse_submodules,
+                embedding_provider=embedding_provider,
+                embedding_model=embedding_model, wait_seconds=wait,
+            )
+        except ValueError as exc:
+            return {
+                "status": "error", "error_code": "invalid_argument",
+                "message": str(exc), "error": str(exc), "summary": str(exc),
+            }
+        return with_provenance(result, resolved)
 
     return await asyncio.to_thread(_run)
 
@@ -271,6 +378,8 @@ def get_impact_radius_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
+    max_results: int = 100,
+    offset: int = 0,
 ) -> dict:
     """Analyze the blast radius of changed files in the codebase.
 
@@ -283,11 +392,14 @@ def get_impact_radius_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        max_results: Maximum impacted nodes per page, highest impact first. Default: 100.
+        offset: Impacted nodes to skip; pass the previous ``next_offset``. Default: 0.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(get_impact_radius(
         changed_files=changed_files, max_depth=max_depth,
         repo_root=root, base=base, detail_level=detail_level,
+        max_results=max_results, offset=offset,
     ), root)
 
 
@@ -298,6 +410,7 @@ def query_graph_tool(
     repo_root: Optional[str] = None,
     detail_level: str = "standard",
     max_results: int = 100,
+    offset: int = 0,
 ) -> dict:
     """Run a predefined graph query to explore code relationships.
 
@@ -319,17 +432,28 @@ def query_graph_tool(
     - consumers_of: Find classes that consume a Spring configuration property
     - file_summary: Get all nodes in a file
 
+    Cross-stack patterns (results carry ``via`` edge kind and ``direction``):
+    - pages_for: Pages that render or request a class/endpoint, or that it forwards to
+    - requests_to: Pages and scripts requesting an endpoint, class or URL (``/x.action``)
+    - included_by: Pages that include a page or script
+    - views_of: Pages an action forwards or redirects to
+    - forwards_to: Actions that forward or redirect to a page
+    - maps_to: Tables an entity maps to, or entities mapped to a table
+    - binds_to: Bean properties a form binds, or forms bound to a property
+    - styles_of: Selectors a page uses, or pages using a selector or stylesheet
+
     Args:
         pattern: Query pattern name (see above).
-        target: Node name, qualified name, or file path to query.
+        target: Node name, qualified name, file path, or URL to query.
         repo_root: Repository root path. Auto-detected if omitted.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
         max_results: Maximum results to return. Default: 100.
+        offset: Results to skip; pass the previous ``next_offset``. Default: 0.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(query_graph(
         pattern=pattern, target=target, repo_root=root,
-        detail_level=detail_level, max_results=max_results,
+        detail_level=detail_level, max_results=max_results, offset=offset,
     ), root)
 
 
@@ -338,6 +462,7 @@ class QuerySpec(TypedDict):
 
     pattern: str
     target: str
+    repo_root: NotRequired[str]
 
 
 @mcp.tool()
@@ -357,19 +482,26 @@ async def batch_query_tool(
     ``resolved``, ``prod: ["Class.method:line"]``, ``prod_count``,
     ``tests`` (count), ``self_call``; tests_for gives ``tests`` and
     ``test_names``; same-named candidates may be merged (``resolution``).
+    An item may carry its own ``repo_root``; an invalid or unbuilt root is
+    reported on that item only.
 
     Args:
-        queries: List of {"pattern": ..., "target": ...} objects.
+        queries: List of {"pattern": ..., "target": ..., "repo_root"?: ...} objects.
         repo_root: Repository root path. Auto-detected if omitted.
         max_results_per_query: Names listed per item. Default: 10.
     """
     root = _resolve_repo_root(repo_root)
 
     def _run() -> dict:
-        return with_provenance(batch_query(
+        result = batch_query(
             queries=[dict(q) for q in queries], repo_root=root,
             max_results_per_query=max_results_per_query,
-        ), root)
+        )
+        try:
+            return with_provenance(result, root)
+        except ValueError:
+            # An invalid repo_root is already reported per item.
+            return result
 
     return await asyncio.to_thread(_run)
 
@@ -383,7 +515,7 @@ def get_review_context_tool(
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
     detail_level: str = "standard",
-    max_results: int = 100,
+    max_results: int = 50,
     max_files: int = 25,
 ) -> dict:
     """Generate a focused, token-efficient review context for code changes.
@@ -423,14 +555,16 @@ def semantic_search_nodes_tool(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     detail_level: str = "standard",
+    offset: int = 0,
 ) -> dict:
     """Search for code entities by name, keyword, or semantic similarity.
 
-    Uses vector embeddings for semantic search when available (run embed_graph_tool
-    first, with a provider of your choice: "local" needs sentence-transformers,
-    "openai" / "google" / "minimax" / "voyage" need their respective env vars).
-    Falls back to FTS5 / keyword matching when no matching embeddings exist for
-    the given provider.
+    Embeddings are off by default, so this is FTS5 / keyword search until a
+    repository enables them (`code-review-graph embeddings enable --profile
+    balanced`; cloud providers "openai" / "google" / "minimax" / "voyage"
+    need their env vars). The response's ``search_mode`` says which search
+    produced the results, ``embeddings_state`` is off, ready, stale or
+    unavailable, and ``warning`` explains any fallback to keyword search.
 
     Args:
         query: Search string to match against node names.
@@ -440,15 +574,16 @@ def semantic_search_nodes_tool(
         model: Embedding model for query vectors. Must match the model used
                during embed_graph. Falls back to CRG_EMBEDDING_MODEL env var
                (local), CRG_OPENAI_MODEL (openai), or CRG_VOYAGE_MODEL (voyage).
-        provider: Embedding provider: "local" (default), "openai", "google",
-                  "minimax", or "voyage". Must match the provider used during
-                  embed_graph.
+        provider: Embedding provider for this call: "local", "openai",
+                  "google", "minimax", or "voyage". The repository's embedding
+                  settings decide when omitted.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
+        offset: Ranked results to skip; pass the previous ``next_offset``. Default: 0.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(semantic_search_nodes(
         query=query, kind=kind, limit=limit, repo_root=root,
-        model=model, provider=provider, detail_level=detail_level,
+        model=model, provider=provider, detail_level=detail_level, offset=offset,
     ), root)
 
 
@@ -459,6 +594,10 @@ async def embed_graph_tool(
     provider: Optional[str] = None,
 ) -> dict:
     """Compute vector embeddings for all graph nodes to enable semantic search.
+
+    Embeddings are off by default; `code-review-graph embeddings enable
+    --profile balanced` turns them on for the repository and keeps them
+    current on updates. This tool is a one-off embed with an explicit provider.
 
     Requires: pip install code-review-graph[embeddings] (local provider only;
     cloud providers use stdlib urllib).
@@ -572,6 +711,7 @@ def list_flows_tool(
     kind: Optional[str] = None,
     detail_level: str = "standard",
     repo_root: Optional[str] = None,
+    offset: int = 0,
 ) -> dict:
     """List execution flows in the codebase, sorted by criticality.
 
@@ -586,11 +726,12 @@ def list_flows_tool(
         detail_level: "standard" (default) returns full flow data; "minimal"
                       returns only name, criticality, and node_count per flow.
         repo_root: Repository root path. Auto-detected if omitted.
+        offset: Flows to skip; pass the previous ``next_offset``. Default: 0.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(list_flows(
         repo_root=root, sort_by=sort_by, limit=limit, kind=kind,
-        detail_level=detail_level,
+        detail_level=detail_level, offset=offset,
     ), root)
 
 
@@ -668,6 +809,7 @@ def list_communities_tool(
     repo_root: Optional[str] = None,
     max_results: int = 50,
     max_members: int = 10,
+    offset: int = 0,
 ) -> dict:
     """List detected code communities in the codebase.
 
@@ -687,12 +829,13 @@ def list_communities_tool(
         max_members: Maximum member names listed per community in standard
             mode. Each community's size still reports its true member
             count. Default: 10.
+        offset: Communities to skip; pass the previous ``next_offset``. Default: 0.
     """
     root = _resolve_repo_root(repo_root)
     return with_provenance(list_communities_func(
         repo_root=root, sort_by=sort_by, min_size=min_size,
         detail_level=detail_level, max_results=max_results,
-        max_members=max_members,
+        max_members=max_members, offset=offset,
     ), root)
 
 
@@ -809,7 +952,7 @@ async def detect_changes_tool(
         ), root)
 
     coro = asyncio.to_thread(_run)
-    tool_timeout = int(os.environ.get("CRG_TOOL_TIMEOUT", "0"))
+    tool_timeout = env_int("CRG_TOOL_TIMEOUT", 0)
     if tool_timeout > 0:
         try:
             return await asyncio.wait_for(coro, timeout=tool_timeout)
@@ -1145,19 +1288,32 @@ def cross_repo_search_tool(
 
 
 @mcp.tool()
-def orient_tool(query: str, repo_root: Optional[str] = None) -> dict:
+def orient_tool(
+    query: str,
+    repo_root: Optional[str] = None,
+    provider: Optional[str] = None,
+    limit: int = 8,
+    detail_level: str = "standard",
+) -> dict:
     """One-call codebase mini-map for a task string.
 
-    Returns top functions/classes (hybrid FTS+vector), top files,
-    matching communities and 1-line stats. Use FIRST for orientation
-    instead of 3-4 separate search calls.
+    Returns top functions/classes (keyword search, hybrid with vectors when
+    embeddings are enabled), top files, matching communities and 1-line
+    stats. Use FIRST for orientation instead of 3-4 separate search calls.
 
     Args:
         query: Natural-language or symbol-ish task description.
         repo_root: Repository root path. Auto-detected if omitted.
+        provider: Embedding provider for this call; the repository's
+            embedding settings decide when omitted.
+        limit: Maximum top functions/classes. Default: 8.
+        detail_level: "standard", or "minimal" for names and locations only.
     """
     root = _resolve_repo_root(repo_root)
-    return with_provenance(orient(query=query, repo_root=root), root)
+    return with_provenance(orient(
+        query=query, repo_root=root, provider=provider, limit=limit,
+        detail_level=detail_level,
+    ), root)
 
 
 @mcp.tool()
@@ -1211,7 +1367,7 @@ def common_callers_of_tool(
 
 
 @mcp.prompt()
-def review_changes(base: str = "HEAD~1") -> list[dict]:
+def review_changes(base: str = "HEAD~1") -> list[Message]:
     """Pre-commit review workflow using detect_changes, affected_flows, and test gaps.
 
     Produces a structured code review with risk levels and actionable findings.
@@ -1223,7 +1379,7 @@ def review_changes(base: str = "HEAD~1") -> list[dict]:
 
 
 @mcp.prompt()
-def architecture_map() -> list[dict]:
+def architecture_map() -> list[Message]:
     """Architecture documentation using communities, flows, and Mermaid diagrams.
 
     Generates a comprehensive architecture map with module summaries and coupling warnings.
@@ -1232,7 +1388,7 @@ def architecture_map() -> list[dict]:
 
 
 @mcp.prompt()
-def debug_issue(description: str = "") -> list[dict]:
+def debug_issue(description: str = "") -> list[Message]:
     """Guided debugging using search, flow tracing, and recent changes.
 
     Systematic debugging workflow that traces execution paths and identifies root causes.
@@ -1244,7 +1400,7 @@ def debug_issue(description: str = "") -> list[dict]:
 
 
 @mcp.prompt()
-def onboard_developer() -> list[dict]:
+def onboard_developer() -> list[Message]:
     """New developer orientation using stats, architecture, and critical flows.
 
     Creates an onboarding guide covering codebase structure, key modules, and patterns.
@@ -1253,7 +1409,7 @@ def onboard_developer() -> list[dict]:
 
 
 @mcp.prompt()
-def pre_merge_check(base: str = "HEAD~1") -> list[dict]:
+def pre_merge_check(base: str = "HEAD~1") -> list[Message]:
     """PR readiness check with risk scoring, test gaps, and dead code detection.
 
     Produces a merge readiness report with risk assessment and recommendations.
@@ -1264,39 +1420,77 @@ def pre_merge_check(base: str = "HEAD~1") -> list[dict]:
     return pre_merge_check_prompt(base=base)
 
 
+# Named tool sets for ``serve --tools`` / ``CRG_TOOLS``. ``all`` keeps every
+# tool. ``agent`` is the working set coding agents need: orient, look up,
+# assess a change, keep the graph fresh.
+TOOL_PRESETS: dict[str, tuple[str, ...]] = {
+    "agent": (
+        "get_minimal_context_tool",
+        "orient_tool",
+        "semantic_search_nodes_tool",
+        "query_graph_tool",
+        "batch_query_tool",
+        "traverse_graph_tool",
+        "get_impact_radius_tool",
+        "get_affected_flows_tool",
+        "detect_changes_tool",
+        "get_review_context_tool",
+        "build_or_update_graph_tool",
+        "coverage_report_tool",
+        "list_graph_stats_tool",
+        "get_docs_section_tool",
+    ),
+    "all": (),
+}
+
+
+def resolve_tool_selection(raw: str | None) -> set[str] | None:
+    """Tool names a ``--tools`` value keeps; None keeps every tool.
+
+    Entries are tool names or preset names (``agent``, ``all``), comma
+    separated and combinable (``agent,embed_graph_tool``).
+    """
+    entries = [t.strip() for t in (raw or "").split(",") if t.strip()]
+    if not entries or "all" in entries:
+        return None
+    allowed: set[str] = set()
+    for entry in entries:
+        allowed.update(TOOL_PRESETS.get(entry, (entry,)))
+    return allowed
+
+
 def _apply_tool_filter(tools: str | None = None) -> None:
     """Remove tools not listed in the allow-list.
 
-    Accepts a comma-separated string of tool names to keep.  When set,
-    every registered MCP tool whose name is **not** in the list is
-    removed via ``FastMCP.remove_tool()``.
+    Accepts a comma-separated string of tool names and presets (see
+    ``TOOL_PRESETS``: ``agent``, ``all``).  When set, every registered MCP
+    tool whose name is **not** selected is removed via
+    ``FastMCP.remove_tool()``.
 
     The allow-list can be supplied in two ways (first match wins):
 
     1. ``tools`` argument (from ``serve --tools ...``).
     2. ``CRG_TOOLS`` environment variable.
 
-    When neither is set, all tools remain available.
+    When neither is set, or ``all`` is listed, all tools remain available.
 
-    This is useful for token-constrained environments: CRG exposes 28+
-    tools by default (~8k description tokens per LLM turn).  Filtering
-    to a working set of 5-10 tools can reduce overhead by 70-85%.
+    This is useful for token-constrained environments: every registered
+    tool's description is sent on each LLM turn, and the ``agent`` preset
+    keeps the 14 tools coding agents use.
 
     Example::
 
         # via CLI
+        code-review-graph serve --tools agent
         code-review-graph serve --tools query_graph_tool,semantic_search_nodes_tool
 
         # via env var
-        CRG_TOOLS=query_graph_tool,semantic_search_nodes_tool
+        CRG_TOOLS=agent
     """
     import asyncio
     import os
 
-    raw = tools or os.environ.get("CRG_TOOLS")
-    if not raw:
-        return
-    allowed = {t.strip() for t in raw.split(",") if t.strip()}
+    allowed = resolve_tool_selection(tools or os.environ.get("CRG_TOOLS"))
     if not allowed:
         return
     # FastMCP >=3 exposes tool enumeration via the async ``list_tools``
@@ -1321,7 +1515,11 @@ def _apply_tool_filter(tools: str | None = None) -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(_runner).result()
 
-    for name in _list_tool_names():
+    names = _list_tool_names()
+    unknown = sorted(allowed - set(names))
+    if unknown:
+        logger.warning("Unknown tool names in tool selection ignored: %s", unknown)
+    for name in names:
         if name not in allowed:
             mcp.local_provider.remove_tool(name)
 
@@ -1386,9 +1584,14 @@ def main(
             # locks the loop needs). #385 added ``asyncio.to_thread`` to peer
             # tools but cannot fix this case — the dangerous initialization has
             # to happen on the main thread before any worker thread is spawned.
-            from .embeddings import prewarm_local_embeddings
+            # Only the sentence-transformers profiles load torch; the rest stay lazy.
+            settings = load_embedding_settings(root)
+            if settings.enabled and settings.profile in ("legacy", "local"):
+                from .embedding_providers.profiles import LEGACY
+                from .embeddings import prewarm_local_embeddings
 
-            prewarm_local_embeddings()
+                legacy_model = LEGACY.model if settings.profile == "legacy" else None
+                prewarm_local_embeddings(settings.model or legacy_model)
 
         if transport == "stdio":
             # Stdio MCP must keep stdout strictly JSON-RPC. FastMCP's banner/update

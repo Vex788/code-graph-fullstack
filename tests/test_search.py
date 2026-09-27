@@ -3,9 +3,14 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
+from code_review_graph import embeddings as embeddings_mod
 from code_review_graph.graph import GraphStore
 from code_review_graph.parser import NodeInfo
 from code_review_graph.search import (
+    _fts_search,
+    _query_terms,
     detect_query_kind_boost,
     hybrid_search,
     rebuild_fts_index,
@@ -282,11 +287,14 @@ class TestHybridSearch:
         """_out_mode is 'semantic' when only embeddings contribute."""
         import code_review_graph.search as search_mod
 
+        # Triggers index nodes on write; empty the index so only embeddings hit.
+        self.store._conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all')")
+        self.store._conn.commit()
         node_id = self.store._conn.execute(
             "SELECT id FROM nodes WHERE name = 'authenticate'"
         ).fetchone()[0]
 
-        def fake_emb(store, query, limit=50, model=None, provider=None):
+        def fake_emb(store, query, limit=50, model=None, provider=None, **_kwargs):
             return [(node_id, 0.9)]
 
         monkeypatch.setattr(search_mod, "_embedding_search", fake_emb)
@@ -304,7 +312,7 @@ class TestHybridSearch:
             "SELECT id FROM nodes WHERE name = 'authenticate'"
         ).fetchone()[0]
 
-        def fake_emb(store, query, limit=50, model=None, provider=None):
+        def fake_emb(store, query, limit=50, model=None, provider=None, **_kwargs):
             return [(node_id, 0.9)]
 
         monkeypatch.setattr(search_mod, "_embedding_search", fake_emb)
@@ -339,3 +347,220 @@ class TestHybridSearch:
         # Verify search still works after double-rebuild.
         results = hybrid_search(self.store, "auth")
         assert isinstance(results, list)
+
+
+# ---------------------------------------------------------------------------
+# W4a: OR-ed terms, phrase-first order, LIKE top-up, honest embeddings state
+# ---------------------------------------------------------------------------
+
+def _names_store(tmp_path, names):
+    store = GraphStore(tmp_path / "graph.db")
+    for i, name in enumerate(names):
+        store.upsert_node(NodeInfo(kind="Class", name=name, file_path=f"src/F{i}.java",
+                                   line_start=1, line_end=2, language="java"))
+    store.commit()
+    return store
+
+
+def _hit_names(store, hits):
+    rows = {r["id"]: r["name"] for r in store._conn.execute("SELECT id, name FROM nodes")}
+    return [rows[node_id] for node_id, _ in hits]
+
+
+def test_query_terms_split_identifiers_and_drop_stopwords():
+    raw, tokens, sequence = _query_terms("who saves the VendorInvoice")
+    assert raw == ["saves", "VendorInvoice"]
+    assert tokens == ["saves", "vendor", "invoice"]
+    assert sequence == "saves vendor invoice"
+
+
+def test_multi_word_query_ors_terms(tmp_path):
+    """Witness: one missing word used to empty the phrase-only FTS lane."""
+    store = _names_store(tmp_path, ["VendorInvoice", "PaymentService", "Unrelated"])
+    try:
+        names = _hit_names(store, _fts_search(store._conn, "vendor payment", limit=10))
+        assert set(names) == {"VendorInvoice", "PaymentService"}
+    finally:
+        store.close()
+
+
+def test_phrase_hits_rank_before_single_word_hits(tmp_path):
+    store = _names_store(tmp_path, ["InvoiceVendor", "VendorInvoiceActionBean", "VendorList"])
+    try:
+        names = _hit_names(store, _fts_search(store._conn, "vendor invoice", limit=10))
+        assert names[0] == "VendorInvoiceActionBean"
+        assert set(names[1:]) == {"InvoiceVendor", "VendorList"}
+    finally:
+        store.close()
+
+
+def test_single_identifier_matches_parts_in_any_order(tmp_path):
+    store = _names_store(tmp_path, ["VendorInvoiceActionBean", "InvoiceLine", "BeanUtils"])
+    try:
+        names = _hit_names(store, _fts_search(store._conn, "InvoiceBean", limit=10))
+        assert names == ["VendorInvoiceActionBean"]
+    finally:
+        store.close()
+
+
+def test_exact_identifier_does_not_broaden(tmp_path):
+    store = _names_store(tmp_path, ["helper_0_0", "helper_1_2", "helper_3_4"])
+    try:
+        assert _hit_names(store, _fts_search(store._conn, "helper_1_2", limit=10)) == [
+            "helper_1_2"
+        ]
+    finally:
+        store.close()
+
+
+def test_fts_operators_in_query_are_literal(tmp_path):
+    store = _names_store(tmp_path, ["VendorInvoice"])
+    try:
+        assert _fts_search(store._conn, 'vendor" OR NEAR(x', limit=10) is not None
+        assert _hit_names(store, _fts_search(store._conn, "vendor AND", limit=10)) == [
+            "VendorInvoice"
+        ]
+    finally:
+        store.close()
+
+
+def test_like_lane_tops_up_few_hits(tmp_path):
+    store = _names_store(tmp_path, ["voice", "VendorInvoice", "Other"])
+    try:
+        mode: list[str] = []
+        names = [r["name"] for r in hybrid_search(store, "voice", _out_mode=mode)]
+        # FTS only knows the whole token "voice"; LIKE adds the substring match.
+        assert names == ["voice", "VendorInvoice"]
+        assert mode == ["fts"]
+    finally:
+        store.close()
+
+
+def _repo_with_graph(tmp_path, names):
+    repo = tmp_path / "repo"
+    (repo / ".code-review-graph").mkdir(parents=True)
+    store = GraphStore(repo / ".code-review-graph" / "graph.db")
+    for i, name in enumerate(names):
+        store.upsert_node(NodeInfo(kind="Class", name=name, file_path=str(repo / f"F{i}.java"),
+                                   line_start=1, line_end=2, language="java"))
+    store.commit()
+    return repo, store
+
+
+def test_embeddings_off_reports_state_without_warning(tmp_path, monkeypatch):
+    monkeypatch.delenv("CRG_EMBEDDINGS", raising=False)
+    repo, store = _repo_with_graph(tmp_path, ["VendorInvoice"])
+    try:
+        info: dict = {}
+        mode: list[str] = []
+        hybrid_search(store, "vendor", repo_root=str(repo), _out_mode=mode, _out_info=info)
+        assert mode == ["fts"]
+        assert info == {"embeddings_state": "off"}
+    finally:
+        store.close()
+
+
+def test_enabled_but_unavailable_backend_warns(tmp_path, monkeypatch):
+    from code_review_graph.embedding_providers import profiles
+
+    monkeypatch.setenv("CRG_EMBEDDINGS", "fast")
+    monkeypatch.setattr(profiles, "module_available", lambda name: False)
+    repo, store = _repo_with_graph(tmp_path, ["VendorInvoice"])
+    try:
+        info: dict = {}
+        hybrid_search(store, "vendor", repo_root=str(repo), _out_info=info)
+        assert info["embeddings_state"] == "unavailable"
+        assert "embeddings-fast" in info["warning"]
+    finally:
+        store.close()
+
+
+class _KeywordProvider(embeddings_mod.EmbeddingProvider):
+    def _vec(self, text):
+        low = text.lower()
+        return [1.0 if "invoice" in low else 0.0, 1.0 if "order" in low else 0.0, 0.1]
+
+    def embed(self, texts):
+        return [self._vec(t) for t in texts]
+
+    def embed_query(self, text):
+        return self._vec(text)
+
+    @property
+    def dimension(self):
+        return 3
+
+    @property
+    def name(self):
+        return "stub:keyword:f32:d3"
+
+
+@pytest.fixture
+def keyword_profile(monkeypatch):
+    provider = _KeywordProvider()
+
+    def fake(settings, *, mlx_parity=None):
+        from code_review_graph.embedding_providers.profiles import FAST, Resolution
+
+        return provider, Resolution(settings.profile, settings.profile, FAST, "stub", 3, True)
+
+    monkeypatch.setattr(embeddings_mod, "provider_for_settings", fake)
+    monkeypatch.setenv("CRG_EMBEDDINGS", "fast")
+    embeddings_mod.clear_matrix_cache()
+    return provider
+
+
+def test_enabled_without_vectors_falls_back_with_warning(tmp_path, keyword_profile):
+    repo, store = _repo_with_graph(tmp_path, ["VendorInvoice"])
+    try:
+        info: dict = {}
+        mode: list[str] = []
+        hybrid_search(store, "invoice", repo_root=str(repo), _out_mode=mode, _out_info=info)
+        assert mode == ["fts"]
+        assert info["embeddings_state"] == "stale"
+        assert "embeddings enable" in info["warning"]
+    finally:
+        store.close()
+
+
+def test_semantic_lane_joins_when_vectors_exist(tmp_path, keyword_profile):
+    repo, store = _repo_with_graph(tmp_path, ["VendorInvoice", "OrderService"])
+    try:
+        embeddings_mod.embed_changed(store, None, repo_root=repo)
+        info: dict = {}
+        mode: list[str] = []
+        results = hybrid_search(store, "billing invoice", repo_root=str(repo),
+                                _out_mode=mode, _out_info=info)
+        assert mode == ["hybrid"]
+        assert info["embeddings_state"] == "ready" and "warning" not in info
+        assert results[0]["name"] == "VendorInvoice"
+    finally:
+        store.close()
+
+
+def test_semantic_search_nodes_reports_state_and_minimal_limit(tmp_path, monkeypatch):
+    from code_review_graph.tools.query import semantic_search_nodes
+
+    monkeypatch.setenv("CRG_EMBEDDINGS", "off")
+    repo, store = _repo_with_graph(tmp_path, [f"VendorInvoice{i}" for i in range(8)])
+    store.close()
+    full = semantic_search_nodes("vendor invoice", repo_root=str(repo))
+    assert full["embeddings_state"] == "off" and "warning" not in full
+    minimal = semantic_search_nodes("vendor invoice", repo_root=str(repo), limit=7,
+                                    detail_level="minimal")
+    assert len(minimal["results"]) == 7 and minimal["embeddings_state"] == "off"
+
+
+def test_orient_limit_detail_and_short_names(tmp_path, monkeypatch):
+    from code_review_graph.tools.navigation import orient
+
+    monkeypatch.setenv("CRG_EMBEDDINGS", "off")
+    repo, store = _repo_with_graph(tmp_path, ["Pay", "PayService", "PayRequest", "PayDao"])
+    store.close()
+    result = orient("pay", repo_root=str(repo), limit=3)
+    names = [f["name"] for f in result["top_functions"]]
+    assert len(names) == 3 and "Pay" in names  # no 6-character cutoff
+    assert "embeddings_state" not in result  # "off" is implied by search_mode
+    minimal = orient("pay", repo_root=str(repo), detail_level="minimal")
+    assert set(minimal["top_functions"][0]) == {"name", "where"}
+    assert "communities" not in minimal

@@ -918,6 +918,34 @@ class Plain:
         # Negative: __tests__ as a substring without path separators must not match
         assert not _is_test_file("my__tests__notdir.ts")
 
+    def test_test_dir_patterns_are_anchored_to_a_segment(self):
+        from code_review_graph.parser import _is_test_file
+        assert not _is_test_file("src/main/java/com/acme/latest/LatestRatesService.java")
+        assert not _is_test_file("app/contests/views.py")
+        assert not _is_test_file("pkg/latest_rates.py")
+        assert not _is_test_file("R/latest-helpers.R")
+        assert _is_test_file("src/test/java/com/acme/dao/UserDao.java")
+        assert _is_test_file("tests/helpers.py")
+        assert _is_test_file("pkg/test_rates.py")
+        assert _is_test_file("R/test-helpers.R")
+        assert _is_test_file("test/runtests.jl")
+
+    def test_test_detection_ignores_directories_above_repo_root(self, tmp_path):
+        from code_review_graph.parser import _is_test_file
+        root = tmp_path / "tests" / "app"
+        source = str(root / "src" / "service.py")
+        assert _is_test_file(source)
+        assert not _is_test_file(source, root)
+        assert _is_test_file(str(root / "tests" / "service.py"), root)
+
+    def test_parser_marks_only_repo_relative_test_dirs(self, tmp_path):
+        root = tmp_path / "test" / "app"
+        (root / "src").mkdir(parents=True)
+        path = root / "src" / "rates.py"
+        path.write_text("def convert():\n    return 1\n", encoding="utf-8")
+        nodes, _ = CodeParser(root).parse_file(path)
+        assert [n.is_test for n in nodes if n.kind == "File"] == [False]
+
     def test_jest_tests_dir_produces_test_nodes(self):
         """A vitest-style file under __tests__/ should yield Test nodes
         and TESTED_BY edges, the same as a *.test.ts file."""
@@ -2671,3 +2699,73 @@ def test_custom_language_without_grammar_yields_the_file_marker(
     marker = _marker_only(*parser.parse_bytes(path, source))
 
     assert marker.language == "erlang"
+
+
+class TestJsAnonymousCallbacks:
+    """Anonymous callbacks get names from their call, so their calls are theirs."""
+
+    def _parse(self, tmp_path: Path, text: str):
+        path = tmp_path / "page.js"
+        path.write_text(text, encoding="utf-8")
+        nodes, edges = CodeParser(tmp_path).parse_file(path)
+        return path.as_posix(), nodes, edges
+
+    def test_callbacks_are_named_by_their_call(self, tmp_path):
+        prefix, nodes, edges = self._parse(tmp_path, (
+            "$(document).ready(function () {\n"
+            "    init();\n"
+            "    $('#save').on('click', () => { save(); });\n"
+            "    $('#load').on('click', () => { load(); });\n"
+            "});\n"
+            "setTimeout(function () { init(); }, 10);\n"
+            "function init() {}\nfunction save() {}\nfunction load() {}\n"
+        ))
+        names = sorted(n.name for n in nodes if n.extra.get("js_callback"))
+        assert names == ["on_click$1", "on_click$2", "ready$1", "setTimeout$1"]
+        calls = {(e.source, e.target) for e in edges if e.kind == "CALLS"}
+        assert (f"{prefix}::ready$1", f"{prefix}::init") in calls
+        assert (f"{prefix}::on_click$1", f"{prefix}::save") in calls
+        assert (f"{prefix}::on_click$2", f"{prefix}::load") in calls
+        assert (f"{prefix}::setTimeout$1", f"{prefix}::init") in calls
+        # nothing inside a callback is attributed to the file
+        assert not {t for s, t in calls if s == prefix} & {f"{prefix}::save", f"{prefix}::load"}
+        contains = {(e.source, e.target) for e in edges if e.kind == "CONTAINS"}
+        assert (f"{prefix}::ready$1", f"{prefix}::on_click$1") in contains
+
+    def test_named_function_expression_is_a_function(self, tmp_path):
+        prefix, nodes, edges = self._parse(tmp_path, (
+            "el.addEventListener('change', function onChange(e) { refresh(); });\n"
+            "function refresh() {}\n"
+        ))
+        assert "onChange" in {n.name for n in nodes if n.kind == "Function"}
+        calls = {(e.source, e.target) for e in edges if e.kind == "CALLS"}
+        assert (f"{prefix}::onChange", f"{prefix}::refresh") in calls
+
+
+class TestReceiverBindingOutsideJava:
+    """The strict receiver gate is for declared-type languages; others keep evidence."""
+
+    def test_module_namespace_and_local_instance_calls_still_bind(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_SERIAL_PARSE", "1")
+        (tmp_path / "utils.py").write_text("def helper():\n    return 1\n")
+        (tmp_path / "app.py").write_text(
+            "import utils\n\nclass Repo:\n    def save(self):\n        pass\n\n"
+            "def run():\n    utils.helper()\n    r = Repo()\n    r.save()\n"
+        )
+        (tmp_path / "api.js").write_text("export function load() {}\n")
+        (tmp_path / "page.js").write_text(
+            "import * as api from './api.js';\nexport function g() { api.load(); }\n"
+        )
+        with GraphStore(tmp_path / "graph.db") as store:
+            full_build(tmp_path, store)
+            store.resolve_bare_call_targets()
+            store.commit()
+            calls = {
+                (e.source_qualified.rsplit("/", 1)[-1], e.target_qualified.rsplit("/", 1)[-1])
+                for e in store.get_edges_by_source(f"{(tmp_path / 'app.py').as_posix()}::run")
+                + store.get_edges_by_source(f"{(tmp_path / 'page.js').as_posix()}::g")
+                if e.kind == "CALLS"
+            }
+        assert ("app.py::run", "utils.py::helper") in calls
+        assert ("app.py::run", "app.py::Repo.save") in calls
+        assert ("page.js::g", "api.js::load") in calls

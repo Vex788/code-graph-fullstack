@@ -1,0 +1,9 @@
+<%@ taglib prefix="stripes" uri="http://stripes.sourceforge.net/stripes.tld" %>
+<%@ taglib prefix="c" uri="http://java.sun.com/jsp/jstl/core" %>
+<link rel="stylesheet" href="/css/common.css"/>
+<script src="/js/jquery-3.7.1.min.js"></script>
+<script src="/js/common.js"></script>
+<div class="page-header">
+  <a href="/user/List.action">Users</a>
+  <a href="/vendor/Invoice.action">Invoices</a>
+</div>

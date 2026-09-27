@@ -37,7 +37,6 @@ def _clear_derived_event_data(store: GraphStore) -> tuple[int, int]:
         "DELETE FROM nodes WHERE kind = 'Event' AND file_path = ?",
         (_EVENT_NODE_FILE,),
     ).rowcount
-    store.commit()
     return len(derived_ids), removed_nodes
 
 
@@ -48,6 +47,11 @@ def resolve_spring_events(store: GraphStore) -> dict[str, int]:
     listener deletion, rename, or event-type change from leaving a stale CALLS
     edge whose owning publisher file was not itself reparsed.
     """
+    with store.transaction():
+        return _resolve_spring_events(store)
+
+
+def _resolve_spring_events(store: GraphStore) -> dict[str, int]:
     removed_calls, _ = _clear_derived_event_data(store)
     rows = store._conn.execute(
         "SELECT kind, source_qualified, target_qualified, file_path, line, extra "
@@ -109,7 +113,6 @@ def resolve_spring_events(store: GraphStore) -> dict[str, int]:
                 ))
                 emitted += 1
 
-    store.commit()
     logger.info(
         "Spring event resolver: indexed %d events and emitted %d CALLS edges",
         len(event_types),

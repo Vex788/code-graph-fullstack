@@ -8,16 +8,19 @@ Cursor hooks / OpenCode plugin generation.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ._legacy_instructions import LEGACY_INSTRUCTION_SECTIONS
 
@@ -1034,6 +1037,234 @@ def generate_skills(repo_root: Path, skills_dir: Path | None = None) -> Path:
     return skills_dir
 
 
+# Every hook command the installer writes ends with this shell comment. A later
+# install or uninstall recognises our entries by it even after the command changes.
+CRG_HOOK_MARKER = "# crg-managed-hook"
+
+# Exact commands written before the marker existed, so upgrades replace them.
+_PRE_MARKER_HOOK_COMMANDS = frozenset({
+    (
+        "cat >/dev/null || true; "
+        "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph update --skip-flows"
+        " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
+        " || true"
+    ),
+    (
+        "cat >/dev/null || true; "
+        "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph status"
+        " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
+        " || echo 'Not a git repo, skipping'"
+    ),
+    (
+        "cat >/dev/null || true; "
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph update --skip-flows"
+        " || true"
+    ),
+    (
+        "cat >/dev/null || true; "
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph status"
+        " || echo 'Not a git repo, skipping'"
+    ),
+    (
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph update --skip-flows"
+        " || true"
+    ),
+    (
+        "git rev-parse --git-dir >/dev/null 2>&1"
+        " && code-review-graph status"
+        " || echo 'Not a git repo, skipping'"
+    ),
+})
+
+
+def legacy_hook_commands(repo_root: Path | None = None) -> frozenset[str]:
+    """Exact hook commands earlier installers wrote without the ownership marker."""
+    if repo_root is None:
+        return _PRE_MARKER_HOOK_COMMANDS
+    repo_arg = json.dumps(repo_root.resolve().as_posix())
+    return _PRE_MARKER_HOOK_COMMANDS | {
+        (
+            "git rev-parse --git-dir >/dev/null 2>&1"
+            " && code-review-graph update --skip-flows"
+            f" --repo {repo_arg}"
+            " || true"
+        ),
+        (
+            "git rev-parse --git-dir >/dev/null 2>&1"
+            f" && code-review-graph status --repo {repo_arg}"
+            " || echo 'Not a git repo, skipping'"
+        ),
+    }
+
+
+class SettingsNotWrittenError(RuntimeError):
+    """A JSON settings file was left untouched because rewriting it was unsafe."""
+
+    def __init__(self, path: Path, reason: str, patch: dict[str, Any] | None = None):
+        super().__init__(f"{path}: {reason}")
+        self.path = path
+        self.reason = reason
+        self.patch = patch
+
+    def render(self) -> str:
+        text = f"code-review-graph: left {self.path} unchanged: {self.reason}."
+        if self.patch is not None:
+            text += (
+                "\nMerge this into it by hand:\n"
+                + json.dumps(self.patch, indent=2, ensure_ascii=False)
+            )
+        return text
+
+
+def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
+    """Write ``text`` to a temp file beside ``path`` and rename it into place."""
+    if mode is None and path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            tmp.chmod(mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _read_json_settings(path: Path) -> tuple[dict[str, Any], bool]:
+    """Parse a settings file for merging; return ``(data, strict_json)``.
+
+    Raises SettingsNotWrittenError when the file cannot be parsed even as
+    JSONC, or is not an object: guessing would overwrite the user's config.
+    """
+    if not path.exists():
+        return {}, True
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SettingsNotWrittenError(path, f"cannot read it ({exc})") from exc
+    if not raw.strip():
+        return {}, True
+    strict = True
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        strict = False
+        try:
+            data = json.loads(_strip_jsonc(raw))
+        except json.JSONDecodeError as exc:
+            raise SettingsNotWrittenError(path, f"it is not valid JSON or JSONC ({exc})") from exc
+    if not isinstance(data, dict):
+        raise SettingsNotWrittenError(path, "its top level is not a JSON object")
+    return data, strict
+
+
+def _write_json_settings(
+    path: Path,
+    original: dict[str, Any],
+    updated: dict[str, Any],
+    *,
+    strict: bool,
+    patch: dict[str, Any],
+) -> bool:
+    """Back up, then atomically write ``updated``. Returns False when nothing changed.
+
+    A file with comments or trailing commas is never rewritten (a JSON dump
+    would drop them); the caller gets the patch to apply by hand instead.
+    """
+    if path.exists() and updated == original:
+        return False
+    if not strict:
+        raise SettingsNotWrittenError(
+            path, "it contains comments or trailing commas that a rewrite would drop", patch,
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup_path = path.with_name(path.name + ".bak")
+        shutil.copy2(path, backup_path)
+        logger.info("Backed up existing settings to %s", backup_path)
+    _atomic_write_text(path, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
+    return True
+
+
+def _strip_owned_hooks(entry: Any, is_owned: Callable[[str], bool]) -> Any:
+    """Return ``entry`` without our hooks, or None when nothing of it remains."""
+    if not isinstance(entry, dict):
+        return entry
+    command = entry.get("command")
+    if isinstance(command, str) and is_owned(command):
+        return None
+    nested = entry.get("hooks")
+    if not isinstance(nested, list):
+        return entry
+    kept = [
+        hook for hook in nested
+        if not (isinstance(hook, dict) and isinstance(hook.get("command"), str)
+                and is_owned(hook["command"]))
+    ]
+    if len(kept) == len(nested):
+        return entry
+    if not kept:
+        return None
+    stripped = dict(entry)
+    stripped["hooks"] = kept
+    return stripped
+
+
+def _merge_owned_hooks(
+    path: Path,
+    existing_hooks: Any,
+    new_hooks: dict[str, list[Any]],
+    is_owned: Callable[[str], bool],
+) -> dict[str, Any]:
+    """Replace our previous hook entries with ``new_hooks``; keep every other entry.
+
+    New entries go where our old ones were (or at the end), so a re-install
+    with a changed command never duplicates it.
+    """
+    if not isinstance(existing_hooks, dict):
+        raise SettingsNotWrittenError(path, '"hooks" is not a JSON object')
+    merged: dict[str, Any] = {}
+    for event, entries in existing_hooks.items():
+        if not isinstance(entries, list):
+            if event in new_hooks:
+                raise SettingsNotWrittenError(path, f'"hooks.{event}" is not a list')
+            merged[event] = entries
+            continue
+        kept: list[Any] = []
+        insert_at: int | None = None
+        for entry in entries:
+            stripped = _strip_owned_hooks(entry, is_owned)
+            if stripped is not entry and insert_at is None:
+                insert_at = len(kept)
+            if stripped is not None:
+                kept.append(stripped)
+        if event in new_hooks:
+            position = len(kept) if insert_at is None else insert_at
+            kept[position:position] = copy.deepcopy(new_hooks[event])
+        if kept or insert_at is None:
+            merged[event] = kept
+    for event, entries in new_hooks.items():
+        if event not in merged:
+            merged[event] = copy.deepcopy(entries)
+    return merged
+
+
+def _owned_by_marker_or(legacy: frozenset[str]) -> Callable[[str], bool]:
+    return lambda command: CRG_HOOK_MARKER in command or command in legacy
+
+
 def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
     """Generate Claude Code hooks configuration.
 
@@ -1063,6 +1294,7 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
                                 " && code-review-graph update --skip-flows"
                                 " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
                                 " || true"
+                                f" {CRG_HOOK_MARKER}"
                             ),
                             "timeout": 30,
                         },
@@ -1082,6 +1314,7 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
                                 " && code-review-graph status"
                                 " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
                                 " || echo 'Not a git repo, skipping'"
+                                f" {CRG_HOOK_MARKER}"
                             ),
                             "timeout": 10,
                         },
@@ -1107,6 +1340,7 @@ def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
                                 "git rev-parse --git-dir >/dev/null 2>&1"
                                 " && code-review-graph update --skip-flows"
                                 " || true"
+                                f" {CRG_HOOK_MARKER}"
                             ),
                             "timeout": 30,
                             "statusMessage": "Updating code-review-graph",
@@ -1125,6 +1359,7 @@ def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
                                 "git rev-parse --git-dir >/dev/null 2>&1"
                                 " && code-review-graph status"
                                 " || echo 'Not a git repo, skipping'"
+                                f" {CRG_HOOK_MARKER}"
                             ),
                             "timeout": 10,
                             "statusMessage": "Checking code-review-graph status",
@@ -1134,6 +1369,76 @@ def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
             ],
         }
     }
+
+
+GIT_HOOK_MARKER = (
+    "# Installed by code-review-graph. Remove this file to disable pre-commit graph checks."
+)
+GIT_HOOK_END_MARKER = "# End of code-review-graph pre-commit block."
+# $? is saved and restored so a following `exit $?` or bare `exit` in the
+# user's hook still sees the status it had before our block ran.
+_GIT_HOOK_BLOCK = f"""\
+{GIT_HOOK_MARKER}
+crg_status=$?
+if command -v code-review-graph >/dev/null 2>&1; then
+    code-review-graph update || true
+    code-review-graph detect-changes --brief || true
+fi
+(exit "$crg_status")
+{GIT_HOOK_END_MARKER}
+"""
+_SHELL_SHEBANG = re.compile(r"^#!\s*(?:\S*/)?(?:env\s+)?(?:sh|bash|dash|zsh|ksh)\b")
+_TRAILING_EXIT = re.compile(r"^(?:exit|exec)\b")
+
+
+def remove_git_hook_block(text: str) -> tuple[str, int | None]:
+    """Remove our pre-commit block; return the text and the line index it held.
+
+    Blocks from earlier releases have no end marker and end at the first
+    ``fi``; when one was appended to an existing hook it brought its own
+    ``#!/bin/sh`` line, which goes too.
+    """
+    lines = text.splitlines(keepends=True)
+    kept: list[str] = []
+    position: int | None = None
+    i = 0
+    while i < len(lines):
+        if lines[i].rstrip("\r\n") != GIT_HOOK_MARKER:
+            kept.append(lines[i])
+            i += 1
+            continue
+        if position is None:
+            if kept and kept[-1].startswith("#!") and len(kept) > 1:
+                kept.pop()
+            position = len(kept)
+        stop: int | None = None
+        first_fi: int | None = None
+        for j in range(i + 1, len(lines)):
+            line = lines[j].rstrip("\r\n")
+            if line == GIT_HOOK_MARKER:
+                break
+            if line == GIT_HOOK_END_MARKER:
+                stop = j
+                break
+            if first_fi is None and line.strip() == "fi":
+                first_fi = j
+        if stop is None:
+            stop = first_fi if first_fi is not None else i
+        i = stop + 1
+    return "".join(kept), position
+
+
+def _insert_git_hook_block(text: str) -> str:
+    """Add our block to an existing hook, before a trailing exit/exec if any."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    last = len(lines) - 1
+    while last > 0 and (not lines[last].strip() or lines[last].lstrip().startswith("#")):
+        last -= 1
+    if last > 0 and _TRAILING_EXIT.match(lines[last]):
+        return "".join(lines[:last]) + _GIT_HOOK_BLOCK + "".join(lines[last:])
+    return "".join(lines) + _GIT_HOOK_BLOCK
 
 
 def install_git_hook(repo_root: Path) -> Path | None:
@@ -1147,22 +1452,13 @@ def install_git_hook(repo_root: Path) -> Path | None:
     own hook manager (husky, pre-commit) may prefer integrating the
     ``code-review-graph`` commands into that manager manually instead.
 
-    Creates ``pre-commit`` if it doesn't exist, or appends to an existing
-    one — the hook is appended, not overwritten, preserving any hooks
-    already there. Falls back to the legacy ``.git/hooks`` resolution when
-    git itself is unavailable. Returns None when no hooks directory can be
-    determined.
+    Creates ``pre-commit`` if it doesn't exist. An existing shell hook keeps
+    its content: our marked block replaces an earlier copy in place, or goes
+    before a trailing ``exit``/``exec`` so it still runs. A hook in another
+    language is left alone. Falls back to the legacy ``.git/hooks``
+    resolution when git itself is unavailable. Returns None when no hook
+    was installed.
     """
-    script = """\
-#!/bin/sh
-# Installed by code-review-graph. Remove this file to disable pre-commit graph checks.
-if command -v code-review-graph >/dev/null 2>&1; then
-    code-review-graph update || true
-    code-review-graph detect-changes --brief || true
-fi
-"""
-    marker = "code-review-graph detect-changes"
-
     hooks_dir: Path | None = None
     try:
         result = subprocess.run(
@@ -1193,63 +1489,76 @@ fi
     hook_path = hooks_dir / "pre-commit"
     hook_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if hook_path.exists():
-        existing = hook_path.read_text(encoding="utf-8")
-        if marker in existing:
-            return hook_path
-        hook_path.write_text(existing.rstrip("\n") + "\n" + script, encoding="utf-8")
-    else:
-        hook_path.write_text(script, encoding="utf-8")
+    if not hook_path.exists():
+        _atomic_write_text(hook_path, "#!/bin/sh\n" + _GIT_HOOK_BLOCK, mode=0o755)
+        logger.info("Wrote git pre-commit hook: %s", hook_path)
+        return hook_path
 
-    hook_path.chmod(0o755)
-    logger.info("Wrote git pre-commit hook: %s", hook_path)
+    existing = hook_path.read_text(encoding="utf-8")
+    if existing.strip() and not _SHELL_SHEBANG.match(existing):
+        logger.warning(
+            "%s is not a POSIX shell script; add `code-review-graph detect-changes --brief`"
+            " to it by hand.", hook_path,
+        )
+        return None
+    stripped, position = remove_git_hook_block(existing)
+    if position is not None:
+        lines = stripped.splitlines(keepends=True)
+        updated = "".join(lines[:position]) + _GIT_HOOK_BLOCK + "".join(lines[position:])
+    else:
+        updated = _insert_git_hook_block(existing)
+    mode = stat.S_IMODE(hook_path.stat().st_mode) | stat.S_IXUSR
+    if updated != existing:
+        _atomic_write_text(hook_path, updated, mode=mode)
+        logger.info("Wrote git pre-commit hook: %s", hook_path)
+    else:
+        hook_path.chmod(mode)
     return hook_path
+
+
+def _merge_hooks_config(
+    settings_path: Path,
+    hooks_config: dict[str, Any],
+    is_owned: Callable[[str], bool],
+) -> Path:
+    """Merge ``hooks_config`` into a settings file, raising SettingsNotWrittenError."""
+    existing, strict = _read_json_settings(settings_path)
+    updated = dict(existing)
+    updated["hooks"] = _merge_owned_hooks(
+        settings_path, existing.get("hooks", {}), hooks_config.get("hooks", {}), is_owned,
+    )
+    if _write_json_settings(settings_path, existing, updated, strict=strict, patch=hooks_config):
+        logger.info("Wrote hooks config: %s", settings_path)
+    return settings_path
 
 
 def _merge_hooks_into_settings(
     settings_dir: Path,
     hooks_config: dict[str, Any],
-) -> Path:
-    """Merge hook entries into a project settings file without clobbering users."""
-    settings_dir.mkdir(parents=True, exist_ok=True)
+    repo_root: Path | None = None,
+) -> int:
+    """Merge hook entries into ``settings_dir/settings.json`` without clobbering users.
+
+    Returns 0 when the file is current, 1 when it was left untouched (the
+    reason and, for JSONC files, the patch to apply by hand go to stderr).
+    """
     settings_path = settings_dir / "settings.json"
-
-    existing: dict[str, Any] = {}
-    if settings_path.exists():
-        try:
-            existing = json.loads(settings_path.read_text(encoding="utf-8", errors="replace"))
-            backup_path = settings_dir / "settings.json.bak"
-            shutil.copy2(settings_path, backup_path)
-            logger.info("Backed up existing settings to %s", backup_path)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read existing %s: %s", settings_path, exc)
-
-    existing_hooks = existing.get("hooks", {})
-    if not isinstance(existing_hooks, dict):
-        logger.warning("Existing hooks config is not a dict; replacing with defaults")
-        existing_hooks = {}
-
-    merged_hooks = dict(existing_hooks)
-    for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
-        if isinstance(merged_hooks.get(hook_name), list):
-            merged_list = list(merged_hooks[hook_name])
-            for entry in hook_entries:
-                if entry not in merged_list:
-                    merged_list.append(entry)
-            merged_hooks[hook_name] = merged_list
-        else:
-            merged_hooks[hook_name] = hook_entries
-
-    existing["hooks"] = merged_hooks
-
-    settings_path.write_text(
-        json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    logger.info("Wrote hooks config: %s", settings_path)
-    return settings_path
+    try:
+        _merge_hooks_config(
+            settings_path, hooks_config, _owned_by_marker_or(legacy_hook_commands(repo_root)),
+        )
+    except SettingsNotWrittenError as exc:
+        logger.warning("%s", exc)
+        print(exc.render(), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        logger.error("Could not write %s: %s", settings_path, exc)
+        print(f"code-review-graph: could not write {settings_path}: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
-def install_hooks(repo_root: Path, platform: str = "claude") -> None:
+def install_hooks(repo_root: Path, platform: str = "claude") -> int:
     """Write hooks config to platform-specific settings.json.
 
     Merges new hook entries into existing settings, preserving both
@@ -1259,12 +1568,15 @@ def install_hooks(repo_root: Path, platform: str = "claude") -> None:
     Args:
         repo_root: Repository root directory.
         platform: Target platform ("claude" or "qoder").
+
+    Returns:
+        0 on success, 1 when the settings file was left unchanged.
     """
     if platform == "qoder":
         settings_dir = repo_root / ".qoder"
     else:
         settings_dir = repo_root / ".claude"
-    _merge_hooks_into_settings(settings_dir, generate_hooks_config(repo_root))
+    return _merge_hooks_into_settings(settings_dir, generate_hooks_config(repo_root), repo_root)
 
 
 def install_codebuddy_hooks(repo_root: Path) -> Path:
@@ -1274,15 +1586,18 @@ def install_codebuddy_hooks(repo_root: Path) -> Path:
     model as the existing project hooks. The shared generator deliberately
     resolves the checkout at hook runtime instead of embedding the installer's
     absolute path, so committed settings work for every collaborator.
+
+    Raises SettingsNotWrittenError when the file cannot be merged safely.
     """
     hooks_config = generate_hooks_config(repo_root)
     # CodeBuddy's Bash tool can create or rewrite files without going through
     # Edit/Write, so its PostToolUse contract also observes Bash. The command
     # itself still resolves the repository dynamically at hook runtime.
     hooks_config["hooks"]["PostToolUse"][0]["matcher"] = "Edit|Write|Bash"
-    return _merge_hooks_into_settings(
-        repo_root / ".codebuddy",
+    return _merge_hooks_config(
+        repo_root / ".codebuddy" / "settings.json",
         hooks_config,
+        _owned_by_marker_or(legacy_hook_commands(repo_root)),
     )
 
 
@@ -1292,55 +1607,15 @@ def install_codex_hooks(repo_root: Path) -> Path:
     Merges code-review-graph hook entries into any existing hooks.json,
     preserving user-defined hook entries and other top-level settings.
     A backup of the original file is created before modifications.
+
+    Raises SettingsNotWrittenError when the file cannot be merged safely.
     """
-    codex_dir = Path.home() / ".codex"
-    codex_dir.mkdir(parents=True, exist_ok=True)
-    hooks_path = codex_dir / "hooks.json"
-
-    existing: dict[str, Any] = {}
-    if hooks_path.exists():
-        try:
-            existing = json.loads(hooks_path.read_text(encoding="utf-8", errors="replace"))
-            backup_path = codex_dir / "hooks.json.bak"
-            shutil.copy2(hooks_path, backup_path)
-            logger.info("Backed up existing Codex hooks to %s", backup_path)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read existing %s: %s", hooks_path, exc)
-
-    hooks_config = generate_codex_hooks_config(repo_root)
-    existing_hooks = existing.get("hooks", {})
-    if not isinstance(existing_hooks, dict):
-        logger.warning("Existing Codex hooks config is not a dict; replacing with defaults")
-        existing_hooks = {}
-
-    merged_hooks = dict(existing_hooks)
-    for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
-        if isinstance(merged_hooks.get(hook_name), list):
-            merged_list = list(merged_hooks[hook_name])
-            existing_commands = {
-                hook.get("command", "")
-                for entry in merged_list
-                if isinstance(entry, dict)
-                for hook in entry.get("hooks", [])
-                if isinstance(hook, dict)
-            }
-            for entry in hook_entries:
-                entry_commands = [
-                    hook.get("command", "")
-                    for hook in entry.get("hooks", [])
-                    if isinstance(hook, dict)
-                ]
-                if not any(command in existing_commands for command in entry_commands):
-                    merged_list.append(entry)
-            merged_hooks[hook_name] = merged_list
-        else:
-            merged_hooks[hook_name] = hook_entries
-
-    existing["hooks"] = merged_hooks
-    hooks_path.write_text(
-        json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    hooks_path = Path.home() / ".codex" / "hooks.json"
+    _merge_hooks_config(
+        hooks_path,
+        generate_codex_hooks_config(repo_root),
+        _owned_by_marker_or(legacy_hook_commands()),
     )
-    logger.info("Wrote Codex hooks config: %s", hooks_path)
     return hooks_path
 
 
@@ -1616,15 +1891,8 @@ def install_gemini_cli_hooks(repo_root: Path) -> Path:
     settings_dir.mkdir(parents=True, exist_ok=True)
     settings_path = settings_dir / "settings.json"
 
-    existing: dict[str, Any] = {}
-    if settings_path.exists():
-        try:
-            existing = json.loads(settings_path.read_text(encoding="utf-8", errors="replace"))
-            backup_path = settings_dir / "settings.json.bak"
-            shutil.copy2(settings_path, backup_path)
-            logger.info("Backed up existing Gemini CLI settings to %s", backup_path)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read existing %s: %s", settings_path, exc)
+    existing, strict = _read_json_settings(settings_path)
+    original = copy.deepcopy(existing)
 
     hooks_dir = settings_dir / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -1673,7 +1941,7 @@ exit 0
 
     hooks_obj = existing.get("hooks", {})
     if not isinstance(hooks_obj, dict):
-        hooks_obj = {}
+        raise SettingsNotWrittenError(settings_path, '"hooks" is not a JSON object')
 
     def _ensure_group(
         event_name: str, matcher: str, hook_command: str, name: str, timeout: int,
@@ -1730,10 +1998,9 @@ exit 0
     )
 
     existing["hooks"] = hooks_obj
-    settings_path.write_text(
-        json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    logger.info("Wrote Gemini CLI hooks config: %s", settings_path)
+    patch = {"hooks": {k: v for k, v in hooks_obj.items() if k in ("SessionStart", "AfterTool")}}
+    if _write_json_settings(settings_path, original, existing, strict=strict, patch=patch):
+        logger.info("Wrote Gemini CLI hooks config: %s", settings_path)
     return settings_path
 
 
@@ -1975,12 +2242,8 @@ def install_cursor_hooks() -> Path:
     hooks_script_dir = cursor_dir / "hooks"
 
     # --- Merge hooks.json ---
-    existing: dict[str, Any] = {}
-    if hooks_json_path.exists():
-        try:
-            existing = json.loads(hooks_json_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read existing %s: %s", hooks_json_path, exc)
+    existing, strict = _read_json_settings(hooks_json_path)
+    original = copy.deepcopy(existing)
 
     new_config = generate_cursor_hooks_config()
 
@@ -1990,7 +2253,7 @@ def install_cursor_hooks() -> Path:
     # Merge hook arrays per event type
     existing_hooks = existing.get("hooks", {})
     if not isinstance(existing_hooks, dict):
-        existing_hooks = {}
+        raise SettingsNotWrittenError(hooks_json_path, '"hooks" is not a JSON object')
 
     for event, entries in new_config["hooks"].items():
         event_hooks = existing_hooks.get(event, [])
@@ -2005,12 +2268,10 @@ def install_cursor_hooks() -> Path:
 
     existing["hooks"] = existing_hooks
 
-    cursor_dir.mkdir(parents=True, exist_ok=True)
-    hooks_json_path.write_text(
-        json.dumps(existing, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    logger.info("Wrote Cursor hooks config: %s", hooks_json_path)
+    if _write_json_settings(
+        hooks_json_path, original, existing, strict=strict, patch=new_config,
+    ):
+        logger.info("Wrote Cursor hooks config: %s", hooks_json_path)
 
     # --- Write hook scripts ---
     hooks_script_dir.mkdir(parents=True, exist_ok=True)

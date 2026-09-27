@@ -7,10 +7,18 @@ Supports multiple providers:
 4. OpenAI-compatible - Any endpoint speaking OpenAI /v1/embeddings (real OpenAI,
    Azure OpenAI, self-hosted gateways like new-api / LiteLLM / vLLM / LocalAI / Ollama).
 5. Voyage AI - Code retrieval embeddings via the Voyage embeddings API.
+
+Embeddings are off by default. ``code-review-graph embeddings enable`` (or
+``CRG_EMBEDDINGS=<profile>``) selects a profile from
+:mod:`code_review_graph.embedding_providers`: ``fast`` (model2vec),
+``balanced`` (EmbeddingGemma on MLX or ONNX), ``accurate`` (Qwen3 on MLX) or
+``legacy`` (sentence-transformers). Vectors are stored L2-normalized as
+float16; older float32 rows are still read.
 """
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import os
@@ -21,12 +29,18 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 from urllib.parse import urlparse
 
 from . import __version__ as _crg_version
+from .embedding_providers.profiles import Resolution, resolve_profile
 from .graph import GraphNode, GraphStore, node_to_dict
+from .repo_settings import EmbeddingSettings, load_embedding_settings
+
+if TYPE_CHECKING:
+    from google.genai.types import ContentListUnion
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +61,16 @@ _USER_AGENT = (
 class EmbeddingProvider(ABC):
     @abstractmethod
     def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed documents (indexed node text)."""
         pass
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Document-side embedding; the index always goes through this."""
+        return self.embed(texts)
 
     @abstractmethod
     def embed_query(self, text: str) -> list[float]:
-        """Embed a search query (may use a different task type than indexing)."""
+        """Embed a search query (may use a different task type or prompt than indexing)."""
         pass
 
     @property
@@ -165,6 +184,12 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         return [v.tolist() for v in vectors]
 
     def embed_query(self, text: str) -> list[float]:
+        model = self._get_model()
+        # Use the model's own query prompt when its config ships one.
+        prompts = getattr(model, "prompts", None)
+        if isinstance(prompts, dict) and prompts.get("query"):
+            vector = model.encode([text], prompt_name="query", show_progress_bar=False)[0]
+            return vector.tolist()
         return self.embed([text])[0]
 
     @property
@@ -247,10 +272,12 @@ class GoogleEmbeddingProvider(EmbeddingProvider):
                 time.sleep(wait)
 
     def embed_query(self, text: str) -> list[float]:
+        # One string is one content, hence one embedding.
+        contents: ContentListUnion = text
         response = self._call_with_retry(
             lambda: self._client.models.embed_content(
                 model=self.model,
-                contents=[text],
+                contents=contents,
                 config={"task_type": "RETRIEVAL_QUERY"},
             )
         )
@@ -1024,12 +1051,20 @@ def get_provider(
 
 def _check_available() -> bool:
     """Check whether local embedding support is available."""
-    with _MODEL_INIT_LOCK:
-        try:
-            import sentence_transformers  # noqa: F401
-            return True
-        except ImportError:
-            return False
+    # A model load holds the lock for as long as a download takes; answer
+    # from the import system (no import, so no Torch init) instead of
+    # queueing searches behind it.
+    if not _MODEL_INIT_LOCK.acquire(blocking=False):
+        from .embedding_providers.profiles import module_available
+
+        return module_available("sentence_transformers")
+    try:
+        import sentence_transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+    finally:
+        _MODEL_INIT_LOCK.release()
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1090,38 @@ def _decode_vector(blob: bytes) -> list[float]:
     """Decode a binary blob back to a float vector."""
     n = len(blob) // 4  # 4 bytes per float32
     return list(struct.unpack(f"{n}f", blob))
+
+
+_STORED_DTYPES = {"float16": "e", "float32": "f"}
+_SQL_CHUNK = 500
+_MATMUL_CHUNK = 16384
+_MATRIX_CACHE_MAX = 4
+# (db path, provider id, dim) -> (change token, names, unit-row matrix)
+_matrix_cache: collections.OrderedDict[tuple[str, str, int], tuple[Any, list[str], Any]] = (
+    collections.OrderedDict()
+)
+_local_generation: dict[str, int] = {}
+_matrix_lock = threading.Lock()
+
+
+def _encode_stored_vector(vec: Any, dtype: str = "float16") -> bytes:
+    """L2-normalize *vec* and pack it as float16 (default) or float32."""
+    values = [float(x) for x in vec]
+    norm = sum(x * x for x in values) ** 0.5
+    if norm > 0:
+        values = [x / norm for x in values]
+    return struct.pack(f"{len(values)}{_STORED_DTYPES[dtype]}", *values)
+
+
+def _decode_stored(blob: bytes, dim: int) -> Optional[list[float]]:
+    """Decode a *dim*-component row stored as float16 or float32 (None: other dim)."""
+    if dim <= 0:
+        return None
+    if len(blob) == 2 * dim:
+        return list(struct.unpack(f"{dim}e", blob))
+    if len(blob) == 4 * dim:
+        return list(struct.unpack(f"{dim}f", blob))
+    return None
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -1155,21 +1222,50 @@ def _node_to_text(node: GraphNode) -> str:
 
 
 class EmbeddingStore:
-    """Manages vector embeddings for graph nodes in SQLite."""
+    """Manages vector embeddings for graph nodes in SQLite.
+
+    Rows are written L2-normalized as float16 (``dtype="float32"`` keeps full
+    precision); float32 rows from older releases are still read. A row's
+    dtype follows from its byte length and the provider's dimension, so the
+    table needs no schema change.
+    """
 
     def __init__(
         self,
         db_path: str | Path,
         provider: str | None = None,
         model: str | None = None,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+        dtype: str | None = None,
     ) -> None:
-        self.provider = get_provider(provider, model=model)
-        self.available = self.provider is not None
+        """Open the vector table of *db_path*.
+
+        The provider is *embedding_provider* when given, else the named
+        *provider*/*model*. With neither, enabled repository settings pick
+        the profile provider; otherwise the historic default applies.
+        """
         self.db_path = Path(db_path)
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=30, check_same_thread=False,
             isolation_level=None,
         )
+        settings: EmbeddingSettings | None = None
+        if embedding_provider is not None:
+            self.provider: EmbeddingProvider | None = embedding_provider
+        elif provider is None and model is None and (
+            settings := load_embedding_settings(repo_root_for_db(self.db_path))
+        ).enabled:
+            parity = mlx_parity_for(self._conn, _mlx_model(settings))
+            self.provider, _ = provider_for_settings(settings, mlx_parity=parity)
+        else:
+            self.provider = get_provider(provider, model=model)
+        self.available = self.provider is not None
+        dtype = dtype or (settings.dtype if settings is not None else "float16")
+        if dtype not in _STORED_DTYPES:
+            self._conn.close()
+            raise ValueError(f"Unsupported embedding dtype {dtype!r}")
+        self.dtype = dtype
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_EMBEDDINGS_SCHEMA)
 
@@ -1193,56 +1289,179 @@ class EmbeddingStore:
     def close(self) -> None:
         self._conn.close()
 
+    # -- writes ------------------------------------------------------------
+
+    def _existing(self, qualified_names: list[str]) -> dict[str, tuple[str, str]]:
+        """``qualified_name -> (text_hash, provider)`` in chunked IN queries."""
+        found: dict[str, tuple[str, str]] = {}
+        for i in range(0, len(qualified_names), _SQL_CHUNK):
+            chunk = qualified_names[i:i + _SQL_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for row in self._conn.execute(
+                "SELECT qualified_name, text_hash, provider FROM embeddings "  # nosec B608
+                f"WHERE qualified_name IN ({marks})",
+                chunk,
+            ):
+                found[row["qualified_name"]] = (row["text_hash"], row["provider"])
+        return found
+
+    def _embed_texts(self, texts: list[str]) -> list[Any]:
+        provider = self.provider
+        assert provider is not None
+        as_array = getattr(provider, "embed_documents_array", None)
+        if callable(as_array):
+            vectors = list(as_array(texts))
+        elif hasattr(provider, "embed_documents"):
+            vectors = provider.embed_documents(texts)
+        else:
+            vectors = provider.embed(texts)
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"Embedding provider {provider.name} returned {len(vectors)} vectors "
+                f"for {len(texts)} texts",
+            )
+        return vectors
+
     def embed_nodes(self, nodes: list[GraphNode], batch_size: int = 64) -> int:
-        """Compute and store embeddings for a list of nodes."""
+        """Compute and store embeddings for nodes whose text or provider changed.
+
+        Batches are length-sorted (less padding for transformer backends) and
+        each batch is one transaction, so a failure keeps completed batches.
+        """
         if not self.provider:
             return 0
-
-        # Filter to nodes that need embedding
-        to_embed: list[tuple[GraphNode, str, str]] = []
         provider_name = self.provider.name
 
+        candidates: dict[str, tuple[GraphNode, str, str]] = {}
         for node in nodes:
             if node.kind == "File":
                 continue
             text = _node_to_text(node)
-            text_hash = hashlib.sha256(text.encode()).hexdigest()
-
-            existing = self._conn.execute(
-                "SELECT text_hash, provider FROM embeddings WHERE qualified_name = ?",
-                (node.qualified_name,),
-            ).fetchone()
-
-            # Re-embed if text changed OR provider changed
-            if (existing and existing["text_hash"] == text_hash
-                    and existing["provider"] == provider_name):
-                continue
-            to_embed.append((node, text, text_hash))
-
+            candidates[node.qualified_name] = (
+                node, text, hashlib.sha256(text.encode()).hexdigest(),
+            )
+        existing = self._existing(list(candidates))
+        to_embed = [
+            item for qn, item in candidates.items()
+            if existing.get(qn) != (item[2], provider_name)
+        ]
         if not to_embed:
             return 0
+        to_embed.sort(key=lambda item: len(item[1]))
 
         embedded = 0
-        for i in range(0, len(to_embed), batch_size):
-            batch = to_embed[i:i + batch_size]
-            texts = [t for _, t, _ in batch]
-            vectors = self.provider.embed(texts)
-
-            for (node, _text, text_hash), vec in zip(batch, vectors):
-                blob = _encode_vector(vec)
-                self._conn.execute(
-                    """
-                    INSERT OR REPLACE INTO embeddings
-                        (qualified_name, vector, text_hash, provider)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (node.qualified_name, blob, text_hash, provider_name),
-                )
-                embedded += 1
-
-            self._conn.commit()
-
+        try:
+            for i in range(0, len(to_embed), batch_size):
+                batch = to_embed[i:i + batch_size]
+                vectors = self._embed_texts([text for _, text, _ in batch])
+                rows = [
+                    (node.qualified_name, _encode_stored_vector(vec, self.dtype),
+                     text_hash, provider_name)
+                    for (node, _text, text_hash), vec in zip(batch, vectors)
+                ]
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO embeddings "
+                        "(qualified_name, vector, text_hash, provider) VALUES (?, ?, ?, ?)",
+                        rows,
+                    )
+                    self._conn.execute("COMMIT")
+                except BaseException:
+                    self._conn.execute("ROLLBACK")
+                    raise
+                embedded += len(rows)
+        finally:
+            if embedded:
+                self._bump_generation()
         return embedded
+
+    def _bump_generation(self) -> None:
+        """Invalidate search matrices built from this database."""
+        key = _db_key(self.db_path)
+        with _matrix_lock:
+            _local_generation[key] = _local_generation.get(key, 0) + 1
+        if _has_table(self._conn, "metadata"):
+            try:
+                self._conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES ('embeddings_generation', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    "value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning("Cannot bump embeddings_generation: %s", exc)
+
+    def remove_node(self, qualified_name: str) -> None:
+        self._conn.execute(
+            "DELETE FROM embeddings WHERE qualified_name = ?", (qualified_name,)
+        )
+        self._conn.commit()
+        self._bump_generation()
+
+    def remove_provider(self, provider_name: str | None = None) -> int:
+        """Delete every vector (or only one provider's); returns the row count."""
+        if provider_name is None:
+            cursor = self._conn.execute("DELETE FROM embeddings")
+        else:
+            cursor = self._conn.execute(
+                "DELETE FROM embeddings WHERE provider = ?", (provider_name,),
+            )
+        self._bump_generation()
+        return max(cursor.rowcount, 0)
+
+    def purge_orphans(self) -> int:
+        """Delete vectors whose graph node no longer exists.
+
+        Embeddings and graph nodes normally share a SQLite file.  Standalone
+        embedding databases remain supported, so a missing ``nodes`` table is
+        an intentional no-op rather than an error.
+        """
+        if not _has_table(self._conn, "nodes"):
+            return 0
+        cursor = self._conn.execute(
+            "DELETE FROM embeddings "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM nodes "
+            "WHERE nodes.qualified_name = embeddings.qualified_name"
+            ")",
+        )
+        self._conn.commit()
+        purged = max(cursor.rowcount, 0)
+        if purged:
+            self._bump_generation()
+        return purged
+
+    # -- reads -------------------------------------------------------------
+
+    def count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+
+    def count_for_provider(self, provider_name: str) -> int:
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE provider = ?", (provider_name,),
+        ).fetchone()[0]
+
+    def stale_count(self, provider_name: str) -> int:
+        """Embeddable nodes with no vector under *provider_name* (0 without a nodes table)."""
+        if not _has_table(self._conn, "nodes"):
+            return 0
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM nodes n WHERE n.kind != 'File' AND NOT EXISTS ("
+            "SELECT 1 FROM embeddings e WHERE e.qualified_name = n.qualified_name "
+            "AND e.provider = ?)",
+            (provider_name,),
+        ).fetchone()[0]
+
+    def disk_bytes(self, provider_name: str | None = None) -> int:
+        """Bytes of stored vector data (all providers, or one)."""
+        if provider_name is None:
+            row = self._conn.execute("SELECT SUM(LENGTH(vector)) FROM embeddings").fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT SUM(LENGTH(vector)) FROM embeddings WHERE provider = ?",
+                (provider_name,),
+            ).fetchone()
+        return int(row[0] or 0)
 
     def search(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
         """Search for nodes by semantic similarity.
@@ -1252,12 +1471,19 @@ class EmbeddingStore:
         the same ranking (up to float tolerance). A zero-norm query vector
         returns an empty list rather than a list of meaningless ties; a
         stored zero-norm row always scores 0.0 and never wins the ranking.
+        Only rows of the current provider and the query's dimension take
+        part, so a partial re-embed can never mix vector spaces.
         """
         if not self.provider:
             return []
 
         provider_name = self.provider.name
-        query_vec = self.provider.embed_query(query)
+        # Checked before embedding the query so an empty index never loads a model.
+        if self._conn.execute(
+            "SELECT 1 FROM embeddings WHERE provider = ? LIMIT 1", (provider_name,),
+        ).fetchone() is None:
+            return []
+        query_vec = list(self.provider.embed_query(query))
         query_norm = sum(x * x for x in query_vec) ** 0.5
         if query_norm == 0.0:
             return []
@@ -1271,20 +1497,38 @@ class EmbeddingStore:
             return self._search_vectorized(np, query_vec, query_norm, provider_name, limit)
         return self._search_pure_python(query_vec, provider_name, limit)
 
-    def _search_vectorized(
-        self, np: Any, query_vec: list[float], query_norm: float,
-        provider_name: str, limit: int,
-    ) -> list[tuple[str, float]]:
-        """Rank stored vectors against ``query_vec`` using numpy.
+    def _cache_token(self) -> tuple[Any, ...]:
+        generation = None
+        if _has_table(self._conn, "metadata"):
+            row = self._conn.execute(
+                "SELECT value FROM metadata WHERE key = 'embeddings_generation'",
+            ).fetchone()
+            generation = row[0] if row else None
+        count, max_rowid = self._conn.execute(
+            "SELECT COUNT(*), MAX(rowid) FROM embeddings",
+        ).fetchone()
+        with _matrix_lock:
+            local = _local_generation.get(_db_key(self.db_path), 0)
+        return (local, generation, count, max_rowid)
 
-        ``query_norm`` must already be known non-zero (checked by ``search``).
-        A stored zero-norm row is left unnormalized (all zeros), so its dot
-        product with the query is 0.0 rather than a division-by-zero/NaN.
+    def _matrix(self, np: Any, provider_name: str, dim: int) -> tuple[list[str], Any]:
+        """Unit-length rows of one provider and dimension, cached until the table changes.
+
+        float16 rows stay float16 in memory (half the RAM); any float32 row
+        makes the matrix float32 so legacy rows keep full precision.
         """
-        q = np.asarray(query_vec, dtype=np.float32) / query_norm
+        key = (_db_key(self.db_path), provider_name, dim)
+        token = self._cache_token()
+        with _matrix_lock:
+            cached = _matrix_cache.get(key)
+            if cached is not None and cached[0] == token:
+                _matrix_cache.move_to_end(key)
+                return cached[1], cached[2]
 
         names: list[str] = []
-        chunks: list[bytes] = []
+        half: list[tuple[int, bytes]] = []
+        full: list[tuple[int, bytes]] = []
+        skipped = 0
         cursor = self._conn.execute(
             "SELECT qualified_name, vector FROM embeddings WHERE provider = ?",
             (provider_name,),
@@ -1293,27 +1537,75 @@ class EmbeddingStore:
             rows = cursor.fetchmany(20000)
             if not rows:
                 break
-            names.extend(row["qualified_name"] for row in rows)
-            chunks.extend(row["vector"] for row in rows)
+            for row in rows:
+                blob = row["vector"]
+                size = len(blob)
+                if size == 2 * dim:
+                    half.append((len(names), blob))
+                elif size == 4 * dim:
+                    full.append((len(names), blob))
+                else:
+                    skipped += 1
+                    continue
+                names.append(row["qualified_name"])
+        if skipped:
+            logger.warning(
+                "Ignored %d stored vector(s) under %s whose dimension is not %d; "
+                "re-embed to include them", skipped, provider_name, dim,
+            )
 
-        if not names:
+        dtype = np.float32 if full else np.float16
+        mat = np.zeros((len(names), dim), dtype=dtype)
+        for group, np_dtype in ((half, np.float16), (full, np.float32)):
+            if group:
+                idx = np.fromiter((i for i, _ in group), dtype=np.int64, count=len(group))
+                raw = b"".join(blob for _, blob in group)
+                mat[idx] = np.frombuffer(raw, dtype=np_dtype).reshape(len(group), dim)
+        if full:
+            # Legacy float32 rows were stored unnormalized.
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            nonzero = norms[:, 0] > 0
+            mat[nonzero] = mat[nonzero] / norms[nonzero]
+
+        with _matrix_lock:
+            _matrix_cache[key] = (token, names, mat)
+            _matrix_cache.move_to_end(key)
+            while len(_matrix_cache) > _MATRIX_CACHE_MAX:
+                _matrix_cache.popitem(last=False)
+        return names, mat
+
+    def _search_vectorized(
+        self, np: Any, query_vec: list[float], query_norm: float,
+        provider_name: str, limit: int,
+    ) -> list[tuple[str, float]]:
+        """Rank stored vectors against ``query_vec`` using numpy.
+
+        ``query_norm`` must already be known non-zero (checked by ``search``).
+        A stored zero-norm row stays all zeros, so it scores 0.0 rather
+        than a division-by-zero/NaN.
+        """
+        q = np.asarray(query_vec, dtype=np.float32) / np.float32(query_norm)
+        names, mat = self._matrix(np, provider_name, len(query_vec))
+        if not names or limit <= 0:
             return []
-
-        raw = b"".join(chunks)
-        dim = len(raw) // (4 * len(names))
-        mat = np.frombuffer(raw, dtype=np.float32).reshape(len(names), dim).copy()
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        safe_rows = norms[:, 0] > 0
-        mat[safe_rows] = mat[safe_rows] / norms[safe_rows]
-        sims = mat @ q
-        top = np.argsort(sims)[::-1][:limit]
+        if mat.dtype == np.float32:
+            sims = mat @ q
+        else:
+            # Upcast in slices: float16 matmul has no BLAS path.
+            sims = np.empty(len(names), dtype=np.float32)
+            for start in range(0, len(names), _MATMUL_CHUNK):
+                stop = start + _MATMUL_CHUNK
+                sims[start:stop] = mat[start:stop].astype(np.float32) @ q
+        k = min(limit, len(names))
+        top = np.argpartition(-sims, k - 1)[:k] if k < len(names) else np.arange(len(names))
+        top = top[np.argsort(-sims[top], kind="stable")]
         return [(names[i], float(sims[i])) for i in top]
 
     def _search_pure_python(
         self, query_vec: list[float], provider_name: str, limit: int,
     ) -> list[tuple[str, float]]:
         """Rank stored vectors against ``query_vec`` without numpy."""
-        # Process in chunks, only matching current provider
+        dim = len(query_vec)
         scored: list[tuple[str, float]] = []
         cursor = self._conn.execute(
             "SELECT qualified_name, vector FROM embeddings WHERE provider = ?",
@@ -1325,44 +1617,459 @@ class EmbeddingStore:
             if not rows:
                 break
             for row in rows:
-                vec = _decode_vector(row["vector"])
-                sim = _cosine_similarity(query_vec, vec)
-                scored.append((row["qualified_name"], sim))
+                vec = _decode_stored(row["vector"], dim)
+                if vec is None:
+                    continue
+                scored.append((row["qualified_name"], _cosine_similarity(query_vec, vec)))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:limit]
 
-    def remove_node(self, qualified_name: str) -> None:
-        self._conn.execute(
-            "DELETE FROM embeddings WHERE qualified_name = ?", (qualified_name,)
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,),
+    ).fetchone() is not None
+
+
+def _db_key(db_path: str | Path) -> str:
+    try:
+        return str(Path(db_path).resolve())
+    except OSError:
+        return str(db_path)
+
+
+def clear_matrix_cache() -> None:
+    """Drop cached search matrices (tests, or to free memory)."""
+    with _matrix_lock:
+        _matrix_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Profiles, state metadata and background embedding
+# ---------------------------------------------------------------------------
+
+EMBEDDINGS_STATES = ("off", "ready", "stale", "unavailable")
+EMBEDDINGS_META_KEYS = (
+    "embeddings_provider",
+    "embeddings_model",
+    "embeddings_dim",
+    "embeddings_state",
+    "embeddings_stale_count",
+)
+MLX_PARITY_KEY = "embeddings_mlx_parity"
+
+_PROFILE_PROVIDERS: dict[str, EmbeddingProvider] = {}
+_PROFILE_PROVIDERS_LOCK = threading.Lock()
+
+
+def repo_root_for_db(db_path: str | Path) -> Path | None:
+    """The repository of a graph stored at ``<repo>/.code-review-graph/graph.db``."""
+    path = Path(db_path)
+    if path.parent.name == ".code-review-graph":
+        return path.parent.parent
+    return None
+
+
+def provider_for_settings(
+    settings: EmbeddingSettings, *, mlx_parity: bool | None = None,
+) -> tuple[EmbeddingProvider | None, Resolution]:
+    """Build (or reuse) the provider serving *settings*; never loads a model.
+
+    Returns ``(None, resolution)`` when the profile's backend is missing;
+    ``resolution.warning`` says what to install. Local model providers are
+    shared process-wide per provider id, so the model loads once.
+    """
+    resolution = resolve_profile(settings, mlx_parity=mlx_parity)
+    if not resolution.available:
+        return None, resolution
+    if resolution.cloud:
+        try:
+            provider = get_provider(resolution.profile, model=settings.model)
+        except ValueError as exc:
+            return None, replace(resolution, available=False, warning=str(exc))
+        if provider is None:
+            return None, replace(
+                resolution, available=False,
+                warning=f"embedding provider '{resolution.profile}' is not installed",
+            )
+        return provider, resolution
+    spec = resolution.spec
+    assert spec is not None
+    if spec.backend == "sentence-transformers":
+        return LocalEmbeddingProvider(resolution.model), resolution
+
+    from .embedding_providers.backends import BACKEND_CLASSES
+
+    with _PROFILE_PROVIDERS_LOCK:
+        cached = _PROFILE_PROVIDERS.get(resolution.provider_id)
+        if cached is None:
+            cached = BACKEND_CLASSES[spec.backend](
+                spec, resolution.model, resolution.dim,
+                threads=settings.effective_threads,
+                batch_size=settings.batch_size,
+                idle_unload_s=settings.idle_unload_s,
+            )
+            _PROFILE_PROVIDERS[resolution.provider_id] = cached
+    return cached, resolution
+
+
+def read_embeddings_meta(conn: sqlite3.Connection) -> dict[str, str]:
+    """The ``embeddings_*`` metadata keys that are set."""
+    if not _has_table(conn, "metadata"):
+        return {}
+    keys = EMBEDDINGS_META_KEYS + (MLX_PARITY_KEY,)
+    marks = ",".join("?" * len(keys))
+    return {
+        str(row[0]): str(row[1]) for row in conn.execute(
+            f"SELECT key, value FROM metadata WHERE key IN ({marks})",  # nosec B608
+            keys,
         )
-        self._conn.commit()
+    }
 
-    def purge_orphans(self) -> int:
-        """Delete vectors whose graph node no longer exists.
 
-        Embeddings and graph nodes normally share a SQLite file.  Standalone
-        embedding databases remain supported, so a missing ``nodes`` table is
-        an intentional no-op rather than an error.
-        """
-        has_nodes = self._conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'nodes'",
-        ).fetchone()
-        if has_nodes is None:
-            return 0
-        cursor = self._conn.execute(
-            "DELETE FROM embeddings "
-            "WHERE NOT EXISTS ("
-            "SELECT 1 FROM nodes "
-            "WHERE nodes.qualified_name = embeddings.qualified_name"
-            ")",
+def write_embeddings_meta(conn: sqlite3.Connection, values: dict[str, Any]) -> None:
+    """Upsert ``embeddings_*`` metadata in one transaction (no-op without the table)."""
+    if not values or not _has_table(conn, "metadata"):
+        return
+    own_tx = not conn.in_transaction
+    if own_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            [(key, str(value)) for key, value in values.items()],
         )
-        self._conn.commit()
-        return max(cursor.rowcount, 0)
+        if own_tx:
+            conn.execute("COMMIT")
+    except BaseException:
+        if own_tx:
+            conn.execute("ROLLBACK")
+        raise
 
-    def count(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+
+def mlx_parity_for(conn: sqlite3.Connection, model: str) -> bool | None:
+    """Recorded MLX parity result for *model* on this machine (None: never checked)."""
+    import json
+
+    from .embedding_providers.profiles import platform_key
+
+    raw = read_embeddings_meta(conn).get(MLX_PARITY_KEY)
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("model") != model or record.get("platform") != platform_key():
+        return None
+    return bool(record.get("ok"))
+
+
+def _state_values(
+    state: str, provider: EmbeddingProvider, resolution: Resolution, stale_count: int,
+) -> dict[str, Any]:
+    dim = resolution.dim
+    # Asking an unloaded sentence-transformers model for its size would load it.
+    if not isinstance(provider, LocalEmbeddingProvider) or provider._model is not None:
+        dim = provider.dimension
+    return {
+        "embeddings_state": state,
+        "embeddings_provider": provider.name,
+        "embeddings_model": resolution.model,
+        "embeddings_dim": dim,
+        "embeddings_stale_count": stale_count,
+    }
+
+
+def _mlx_model(settings: EmbeddingSettings) -> str:
+    from .embedding_providers.profiles import BALANCED_MLX
+
+    return settings.model or BALANCED_MLX.model
+
+
+def embed_changed(
+    store: GraphStore,
+    changed_qualified_names: Iterable[str] | None,
+    *,
+    repo_root: str | Path | None = None,
+    wait: bool = True,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any] | threading.Thread:
+    """Embed the changed nodes at low priority; the writer path calls this last.
+
+    Call it after the readiness stamp, under the writer lock. It never touches
+    readiness: failures only set ``embeddings_state``.
+
+    Args:
+        store: the graph just written. Its database path (not its connection)
+            is used; with ``wait=False`` keep the database in place until the
+            returned thread finishes.
+        changed_qualified_names: nodes added or re-parsed by this update;
+            ``None`` embeds every node (first enable, full build).
+        repo_root: where ``.code-review-graph.toml`` lives; derived from the
+            database path when omitted.
+        wait: ``True`` (default) blocks and returns the result dict;
+            ``False`` returns the started daemon thread, whose result lands
+            in ``thread.result`` (a dict) when it ends.
+        env: environment for settings overrides (default ``os.environ``).
+
+    The work runs in its own thread, which lowers only its own priority
+    (nice +10 on Linux, utility QoS on macOS) so the caller keeps its
+    priority. Model threads are capped at half the cores unless configured.
+    Returns ``{"state", "provider", "embedded", "purged", "stale_count",
+    "priority"}``; ``state`` is ``off``, ``ready``, ``stale`` or
+    ``unavailable`` (plus ``"warning"`` or ``"error"`` when set).
+    """
+    db_path = Path(store.db_path)
+    root = Path(repo_root) if repo_root is not None else repo_root_for_db(db_path)
+    names = None if changed_qualified_names is None else sorted(set(changed_qualified_names))
+    holder: dict[str, Any] = {}
+
+    def work() -> None:
+        from .embedding_providers.priority import lower_current_thread_priority
+
+        priority = lower_current_thread_priority()
+        try:
+            holder["result"] = _embed_changed_now(db_path, root, names, env)
+        except Exception as exc:  # recorded, never raised into the writer path
+            logger.warning("Background embedding failed: %s", exc)
+            holder["result"] = {"state": "stale", "error": str(exc), "embedded": 0}
+        holder["result"]["priority"] = priority
+
+    class _Worker(threading.Thread):
+        result: dict[str, Any] | None = None
+
+        def run(self) -> None:
+            work()
+            self.result = holder.get("result")
+
+    worker = _Worker(name="crg-embed", daemon=True)
+    worker.start()
+    if not wait:
+        return worker
+    worker.join()
+    return holder["result"]
+
+
+def _embed_changed_now(
+    db_path: Path, repo_root: Path | None, names: list[str] | None,
+    env: dict[str, str] | None,
+) -> dict[str, Any]:
+    settings = load_embedding_settings(repo_root, env)
+    graph = GraphStore(db_path)
+    try:
+        conn = graph._conn
+        if not settings.enabled:
+            write_embeddings_meta(conn, {"embeddings_state": "off"})
+            return {"state": "off", "provider": None, "embedded": 0, "purged": 0,
+                    "stale_count": 0}
+        provider, resolution = provider_for_settings(
+            settings, mlx_parity=mlx_parity_for(conn, _mlx_model(settings)),
+        )
+        if provider is None:
+            if resolution.warning:
+                logger.warning("Embeddings unavailable: %s", resolution.warning)
+            write_embeddings_meta(conn, {"embeddings_state": "unavailable",
+                                         "embeddings_model": resolution.model})
+            return {"state": "unavailable", "provider": None, "embedded": 0, "purged": 0,
+                    "stale_count": 0, "warning": resolution.warning}
+
+        emb = EmbeddingStore(db_path, embedding_provider=provider, dtype=settings.dtype)
+        try:
+            purged = emb.purge_orphans()
+            if names is None:
+                nodes = graph.get_all_nodes(exclude_files=True)
+            else:
+                nodes = []
+                for i in range(0, len(names), _SQL_CHUNK):
+                    chunk = names[i:i + _SQL_CHUNK]
+                    marks = ",".join("?" * len(chunk))
+                    nodes.extend(
+                        graph._row_to_node(row) for row in conn.execute(
+                            f"SELECT * FROM nodes WHERE qualified_name IN ({marks})",  # nosec B608
+                            chunk,
+                        )
+                    )
+            embedded = emb.embed_nodes(nodes, batch_size=settings.batch_size)
+            stale = emb.stale_count(provider.name)
+        finally:
+            emb.close()
+        state = "ready" if stale == 0 else "stale"
+        write_embeddings_meta(conn, _state_values(state, provider, resolution, stale))
+        result: dict[str, Any] = {
+            "state": state, "provider": provider.name, "embedded": embedded,
+            "purged": purged, "stale_count": stale,
+        }
+        if resolution.warning:
+            result["warning"] = resolution.warning
+        return result
+    finally:
+        graph.close()
+
+
+def embeddings_status(db_path: str | Path, repo_root: str | Path | None = None) -> dict[str, Any]:
+    """What ``code-review-graph embeddings status`` prints; never loads a model."""
+    root = Path(repo_root) if repo_root is not None else repo_root_for_db(db_path)
+    settings = load_embedding_settings(root)
+    out: dict[str, Any] = {
+        "enabled": settings.enabled,
+        "profile": settings.profile,
+        "settings_source": settings.source,
+        "state": "off",
+        "backend": None,
+        "provider": None,
+        "model": None,
+        "dim": None,
+        "dtype": settings.dtype,
+        "vectors": 0,
+        "vectors_all_providers": 0,
+        "stale_count": 0,
+        "disk_bytes": 0,
+        "warning": None,
+    }
+    path = Path(db_path)
+    if not path.exists():
+        out["warning"] = "no graph database; run `code-review-graph build` first"
+        return out
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        meta = read_embeddings_meta(conn)
+        has_table = _has_table(conn, "embeddings")
+        if has_table:
+            count_all, disk_all = conn.execute(
+                "SELECT COUNT(*), SUM(LENGTH(vector)) FROM embeddings",
+            ).fetchone()
+            out["vectors_all_providers"] = int(count_all or 0)
+            out["disk_bytes"] = int(disk_all or 0)
+        resolution = resolve_profile(
+            settings, mlx_parity=mlx_parity_for(conn, _mlx_model(settings)),
+        )
+        out.update(
+            backend=resolution.backend, model=resolution.model, dim=resolution.dim,
+            profile=resolution.profile, warning=resolution.warning,
+        )
+        provider_id = resolution.provider_id
+        if resolution.cloud:
+            provider_id = meta.get("embeddings_provider", "")
+        out["provider"] = provider_id or None
+        if has_table and provider_id:
+            out["vectors"] = int(conn.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE provider = ?", (provider_id,),
+            ).fetchone()[0])
+        if _has_table(conn, "nodes"):
+            if has_table and provider_id:
+                out["stale_count"] = int(conn.execute(
+                    "SELECT COUNT(*) FROM nodes n WHERE n.kind != 'File' AND NOT EXISTS ("
+                    "SELECT 1 FROM embeddings e WHERE e.qualified_name = n.qualified_name "
+                    "AND e.provider = ?)",
+                    (provider_id,),
+                ).fetchone()[0])
+            else:
+                out["stale_count"] = int(conn.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE kind != 'File'",
+                ).fetchone()[0])
+        if not settings.enabled:
+            out["state"] = "off"
+        elif not resolution.available:
+            out["state"] = "unavailable"
+        elif out["vectors"] and out["stale_count"] == 0:
+            out["state"] = "ready"
+        else:
+            out["state"] = "stale"
+    finally:
+        conn.close()
+    return out
+
+
+def open_search_store(
+    db_path: str | Path,
+    *,
+    repo_root: str | Path | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[EmbeddingStore | None, dict[str, Any]]:
+    """An :class:`EmbeddingStore` ready to search, or ``None`` and why not.
+
+    An explicit *provider*/*model* (MCP tool arguments) is a per-call opt-in
+    and bypasses the settings. Otherwise the repository settings decide; with
+    embeddings off no store is opened and no model is loaded. The info dict
+    carries ``state`` (off|ready|stale|unavailable), ``provider`` and a
+    ``warning`` whenever the caller must fall back to keyword search.
+    """
+    info: dict[str, Any] = {"state": "off", "provider": None, "warning": None}
+    root = Path(repo_root) if repo_root is not None else repo_root_for_db(db_path)
+    store: EmbeddingStore | None
+    if provider or model:
+        store = EmbeddingStore(db_path, provider=provider, model=model)
+        if not store.available:
+            store.close()
+            info.update(state="unavailable",
+                        warning=f"embedding provider '{provider or 'local'}' is not available")
+            return None, info
+    else:
+        settings = load_embedding_settings(root, env)
+        if not settings.enabled:
+            return None, info
+        store = None
+        try:
+            with sqlite3.connect(str(db_path), timeout=5) as conn:
+                parity = mlx_parity_for(conn, _mlx_model(settings))
+        except sqlite3.Error:
+            parity = None
+        prov, resolution = provider_for_settings(settings, mlx_parity=parity)
+        if prov is None:
+            info.update(state="unavailable", warning=resolution.warning)
+            return None, info
+        store = EmbeddingStore(db_path, embedding_provider=prov, dtype=settings.dtype)
+        info["warning"] = resolution.warning
+
+    assert store is not None and store.provider is not None
+    name = store.provider.name
+    info["provider"] = name
+    if store.count_for_provider(name) == 0:
+        store.close()
+        info.update(
+            state="stale",
+            warning=f"no vectors for {name} yet; run `code-review-graph embeddings enable`",
+        )
+        return None, info
+    stale = store.stale_count(name)
+    info["state"] = "ready" if stale == 0 else "stale"
+    if stale:
+        info["stale_count"] = stale
+    return store, info
+
+
+class _NullProvider(EmbeddingProvider):
+    """Stands in for maintenance that must never embed."""
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("no embedding provider configured")
+
+    def embed_query(self, text: str) -> list[float]:
+        raise RuntimeError("no embedding provider configured")
+
+    @property
+    def dimension(self) -> int:
+        return 0
+
+    @property
+    def name(self) -> str:
+        return "none"
+
+
+def purge_vectors(db_path: str | Path, provider_name: str | None = None) -> int:
+    """Delete stored vectors (all, or one provider's) without resolving a provider."""
+    store = EmbeddingStore(db_path, embedding_provider=_NullProvider())
+    try:
+        return store.remove_provider(provider_name)
+    finally:
+        store.close()
 
 
 def embed_all_nodes(graph_store: GraphStore, embedding_store: EmbeddingStore) -> int:

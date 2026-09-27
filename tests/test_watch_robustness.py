@@ -43,6 +43,8 @@ from code_review_graph.incremental import (
 )
 from code_review_graph.parser import NodeInfo
 
+from ._watch_sleep import watch_loop_sleep
+
 
 @pytest.fixture(autouse=True)
 def _fresh_nested_ignore_cache():
@@ -740,7 +742,7 @@ class TestWatchLoop:
     def _watch_with(self, tmp_path, store, observer, sleeper, health_interval=0.0, **kwargs):
         with (
             patch("watchdog.observers.Observer", return_value=observer),
-            patch("time.sleep", side_effect=sleeper),
+            watch_loop_sleep(sleeper),
             patch(
                 "code_review_graph.incremental._WATCH_HEALTH_INTERVAL",
                 health_interval,
@@ -868,6 +870,45 @@ class TestWatchLoop:
         # src is watched, node_modules is not.
         assert (str(tmp_path / "src"), True) in observer.scheduled
         assert not any("node_modules" in path for path, _ in observer.scheduled)
+
+    def test_other_threads_sleeping_do_not_consume_watch_ticks(self, tmp_path):
+        """Leftover threads that sleep must neither steal a tick nor get the interrupt."""
+        from watchdog.events import FileCreatedEvent
+
+        (tmp_path / "src").mkdir()
+        source = tmp_path / "src" / "app.py"
+        source.write_text("def handler():\n    return 1\n", encoding="utf-8")
+        observer = FakeObserver()
+        store = GraphStore(tmp_path / "graph.db")
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def noisy_sleeper():
+            try:
+                while not stop.is_set():
+                    time.sleep(0.001)
+            except BaseException as exc:  # noqa: BLE001 - recorded for the assert
+                errors.append(exc)
+
+        noisy = threading.Thread(target=noisy_sleeper, daemon=True)
+        noisy.start()
+        try:
+            self._watch_with(
+                tmp_path,
+                store,
+                observer,
+                _tick_driver(
+                    lambda: observer.handler.process([FileCreatedEvent(str(source))]),
+                    lambda: None,
+                ),
+            )
+            assert store.get_nodes_by_file(str(source)), "watch never parsed the change"
+        finally:
+            stop.set()
+            noisy.join(timeout=5)
+            store.close()
+        assert not noisy.is_alive()
+        assert errors == []
 
     def test_relative_repo_keeps_a_graph_built_with_an_absolute_root(
         self, tmp_path, monkeypatch
@@ -1010,7 +1051,7 @@ class TestWatchLoop:
         try:
             with (
                 patch("watchdog.observers.Observer", return_value=FakeObserver()),
-                patch("time.sleep", side_effect=KeyboardInterrupt),
+                watch_loop_sleep(KeyboardInterrupt),
                 patch(
                     "code_review_graph.incremental.incremental_update",
                     side_effect=record_initial_health,
@@ -1080,6 +1121,12 @@ class TestRealObserver:
             time.sleep(interval)
         return False
 
+    def _watching(self, repo) -> bool:
+        """Wait until the observer runs: the health file exists from the initial build on."""
+        return self._wait_for(
+            lambda: (read_watch_health(repo) or {}).get("phase") == "watching"
+        )
+
     def test_new_top_level_directory_is_indexed(self, tmp_path):
         repo = tmp_path / "repo"
         (repo / "src").mkdir(parents=True)
@@ -1104,9 +1151,7 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(
-                    lambda: watch_health_path(repo).exists()
-                ), "the watch loop never started"
+                assert self._watching(repo), "the watch loop never started"
 
                 # The whole point: this directory did not exist when the
                 # watches were planned.
@@ -1161,7 +1206,7 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                assert self._watching(repo)
 
                 # Delete and recreate back to back, well inside one tick.
                 shutil.rmtree(repo / "src")
@@ -1206,7 +1251,7 @@ class TestRealObserver:
             thread = threading.Thread(target=run_watch, name="watch-under-test", daemon=True)
             thread.start()
             try:
-                assert self._wait_for(lambda: watch_health_path(repo).exists())
+                assert self._watching(repo)
                 shutil.rmtree(repo / "lib")
                 time.sleep(1.0)  # several ticks
                 still_running = thread.is_alive()
