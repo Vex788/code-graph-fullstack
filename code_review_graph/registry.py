@@ -23,7 +23,7 @@ from .locking import writer_lock
 _T = TypeVar("_T")
 
 # Separate from the graph writer token so holding one never admits the other.
-_REGISTRY_TOKEN_ENV = "CRG_REGISTRY_LOCK_TOKEN"
+_REGISTRY_TOKEN_ENV = "CRG_REGISTRY_LOCK_TOKEN"  # nosec B105 - env var name, not a secret
 _REGISTRY_LOCK_WAIT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)

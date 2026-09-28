@@ -225,7 +225,7 @@ class MlxLmProvider(LocalModelProvider):
     """Qwen3-Embedding on Apple Silicon through ``mlx-lm`` with last-token pooling."""
 
     query_template = QWEN_QUERY
-    end_token = "<|endoftext|>"
+    end_token = "<|endoftext|>"  # nosec B105 - tokenizer sentinel, not a secret
 
     def _load(self) -> Any:
         from mlx_lm import load

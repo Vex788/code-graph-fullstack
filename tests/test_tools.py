@@ -2498,20 +2498,25 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
 
 
 def _query_repo(tmp_path):
-    """A repo whose graph holds one caller of ``target``."""
+    """A repo whose graph holds one caller of ``target``.
+
+    Stored identities use the POSIX spelling on every platform (#774) — the
+    same convention production writes follow via ``normalize_file_path``.
+    """
     root = tmp_path / "repo"
     (root / ".git").mkdir(parents=True)
     (root / ".code-review-graph").mkdir()
     store = GraphStore(root / ".code-review-graph" / "graph.db")
+    module = (root / "m.py").as_posix()
     try:
         for name in ("target", "caller"):
             store.upsert_node(NodeInfo(
-                kind="Function", name=name, file_path=str(root / "m.py"),
+                kind="Function", name=name, file_path=module,
                 line_start=1, line_end=2, language="python",
             ))
         store.upsert_edge(EdgeInfo(
-            kind="CALLS", source=f"{root / 'm.py'}::caller",
-            target=f"{root / 'm.py'}::target", file_path=str(root / "m.py"), line=1,
+            kind="CALLS", source=f"{module}::caller",
+            target=f"{module}::target", file_path=module, line=1,
         ))
         store.commit()
     finally:

@@ -6,7 +6,12 @@ from code_review_graph.embeddings import GoogleEmbeddingProvider
 
 
 def main() -> None:
-    requirements = metadata.requires("code-review-graph") or []
+    try:
+        requirements = metadata.requires("code-graph-fullstack") or []
+    except metadata.PackageNotFoundError:
+        # The upstream distribution name, when this script runs against an
+        # upstream checkout instead of this fork's package.
+        requirements = metadata.requires("code-review-graph") or []
     assert any(
         requirement.startswith("google-genai")
         and "google-embeddings" in requirement

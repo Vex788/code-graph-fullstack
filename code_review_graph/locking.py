@@ -31,7 +31,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-TOKEN_ENV = "CRG_WRITER_LOCK_TOKEN"
+TOKEN_ENV = "CRG_WRITER_LOCK_TOKEN"  # nosec B105 - env var name, not a secret
 
 # Process exit codes shared by the CLI and hook scripts.
 EXIT_OK = 0

@@ -581,8 +581,8 @@ def main(argv: list[str]) -> int:
     # Observer contract: never raise, never block the tool call.
     try:
         handle_event(sys.stdin.read())
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:  # noqa: BLE001, S110 - observer contract: never raise
+        pass  # nosec B110 - observer contract: never block the tool call
     return 0
 
 
