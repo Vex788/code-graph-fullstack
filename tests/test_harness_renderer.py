@@ -129,12 +129,24 @@ def test_parity_with_render_agents_on_kit_markers_and_home(tmp_path, monkeypatch
     home = str(tmp_path / "home")
     assert f"route {home}/AGENTS.md\nend\n" in ours["alpha.md"]
     assert f"skills: {home}/skills/a\n" in ours["alpha.md"]
-    # render-agents (zcode-harness @4e9c587) has no kit-line stripping yet, so
-    # it rejects any role whose body carries crg-kit markers. Parity holds on
-    # the common directive syntax (see the other parity tests); kit regions in
-    # roles are a kit-side extension until the harness grows the same strip.
+    # render-agents strips crg-kit marker lines and the GENERATED header from
+    # roles exactly like the kit does, so kit-marked roles render identically
+    # on both sides (strip-parity).
+    theirs = _render_with_zcode(src, tmp_path / "zcode")
+    assert ours == theirs
+
+    # Stripping covers crg-kit markers only: a directive neither engine
+    # recognizes (no endif here) is still a hard error for render-agents.
+    broken = tmp_path / "broken"
+    (broken / "roles").mkdir(parents=True)
+    (broken / "blocks").mkdir()
+    (broken / "harnesses.json").write_text((src / "harnesses.json").read_text(encoding="utf-8"))
+    (broken / "roles" / "alpha.md").write_text(
+        "---\nname: alpha\ndescription: Alpha\ntier: work\neffort: high\n"
+        "harnesses: zcode\n---\n\n# alpha\n<!-- if:zcode -->\nunterminated\n"
+    )
     with pytest.raises(AssertionError, match="leftover directive"):
-        _render_with_zcode(src, tmp_path / "zcode")
+        _render_with_zcode(broken, tmp_path / "zcode-broken")
 
 
 def test_kit_file_rendering_keeps_region_markers():
