@@ -91,6 +91,11 @@ def prepare_fixture(dest: Path, scale: int) -> Path:
     """Generate the fullstack fixture at *scale* files as a one-commit repository."""
     _load_generator().generate(dest, scale=scale)
     _git(dest, "init", "-q")
+    # Benchmark repos must not fire machine-level git hooks (a global
+    # core.hooksPath can post-commit a background graph refresh, racing the
+    # one-file update this benchmark times). A nonexistent hooks path runs
+    # no hooks.
+    _git(dest, "config", "core.hooksPath", str(dest / ".githooks-disabled"))
     _git(dest, "add", "-A")
     _git(dest, "commit", "-q", "-m", "fixture")
     return dest.resolve()
