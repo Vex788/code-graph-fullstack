@@ -84,6 +84,10 @@ def prepare_fork_copy(source: Path, dest: Path, ref: str = "HEAD") -> Path:
         stdin=subprocess.DEVNULL,
     )
     _git(dest, "checkout", "-q", "--detach", ref)
+    # Same hook blackout as prepare_fixture: a global core.hooksPath can
+    # post-commit a background graph refresh that races this benchmark's
+    # own one-file update.
+    _git(dest, "config", "core.hooksPath", str(dest / ".githooks-disabled"))
     return dest.resolve()
 
 
