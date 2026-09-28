@@ -66,10 +66,12 @@ class JspResolverConfig:
     bean_attribute: str = "beanclass"
     bean_package_prefix: str = "com."
     # Framework routing suffixes that are an artifact of the front controller,
-    # not part of the route. ".action" cannot live here: the default
-    # route_annotations already include Stripes @UrlBinding, whose routes
-    # end in ".action" — dropping it would hide exactly those routes.
-    dead_url_suffixes: tuple[str, ...] = (".xhtml", ".faces", ".do")
+    # not part of the route. The default is empty: no framework convention is
+    # safe to drop generically (Stripes routes end in ".action", Faces in
+    # ".xhtml" — both are real routes in real repositories, so hardcoding
+    # either as "dead" hides live endpoints). A repository whose suffixes
+    # really are routing artifacts overrides this key.
+    dead_url_suffixes: tuple[str, ...] = ()
     # Leading URL path segments that are a servlet context path, not a disk
     # directory: "/myapp/css/x.css" probes "<web_root>/css/x.css" after the
     # plain "<web_root>/myapp/css/x.css" probe misses.

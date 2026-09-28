@@ -1135,6 +1135,110 @@ def test_full_build_binds_parser_output_into_resolver_edges(tmp_path: Path) -> N
         store.close()
 
 
+XHTML_BEAN_JAVA = """package com.example;
+
+import net.sourceforge.stripes.action.ActionBean;
+import net.sourceforge.stripes.action.ActionBeanContext;
+import net.sourceforge.stripes.action.DefaultHandler;
+import net.sourceforge.stripes.action.ForwardResolution;
+import net.sourceforge.stripes.action.Resolution;
+import net.sourceforge.stripes.action.UrlBinding;
+
+@UrlBinding("/list/Items.xhtml")
+public class ItemsBean implements ActionBean {
+
+    private ActionBeanContext context;
+
+    public ActionBeanContext getContext() {
+        return context;
+    }
+
+    public void setContext(ActionBeanContext context) {
+        this.context = context;
+    }
+
+    @DefaultHandler
+    public Resolution view() {
+        return new ForwardResolution("/index.jsp");
+    }
+}
+"""
+
+XHTML_INDEX_JSP = """<html>
+  <a href="/list/Items.xhtml">items</a>
+</html>
+"""
+
+
+def test_xhtml_urlbinding_route_survives_an_update(tmp_path: Path) -> None:
+    """Regression (pms shape): `@UrlBinding` routes ending in ".xhtml" are
+    live routes. The default ``dead_url_suffixes`` is empty, so the Stripes
+    endpoint exists and the page's ``.xhtml`` link binds to it — and the
+    binding survives an incremental update. With ".xhtml" hardcoded as a
+    dead suffix, `_normalize_url` drops the route on both sides and exactly
+    these edges vanish (277 of pms's 278 `@UrlBinding` routes end in
+    ".xhtml"; one jsp pass deleted 1209 REQUESTS edges there)."""
+    repo = tmp_path / "xhtml-repo"
+    (repo / "src/com/example").mkdir(parents=True)
+    (repo / "web").mkdir()
+    (repo / "src/com/example/ItemsBean.java").write_text(XHTML_BEAN_JAVA, encoding="utf-8")
+    (repo / "web/index.jsp").write_text(XHTML_INDEX_JSP, encoding="utf-8")
+    _git_ok(repo, "init", "-b", "main")
+    _git_ok(repo, "config", "user.email", "test@test.com")
+    _git_ok(repo, "config", "user.name", "Test")
+    _git_ok(repo, "add", ".")
+    _git_ok(repo, "commit", "-qm", "xhtml urlbinding routes")
+
+    store = GraphStore(tmp_path / "xhtml.db")
+    try:
+        result = full_build(repo, store)
+        assert result["errors"] == []
+
+        endpoint_rows = store._conn.execute(
+            "SELECT qualified_name FROM nodes WHERE kind = 'Endpoint'"
+        ).fetchall()
+        assert len(endpoint_rows) == 1
+        endpoint_qn = endpoint_rows[0]["qualified_name"]
+        assert endpoint_qn.endswith(
+            "::ItemsBean.ItemsBean@UrlBinding[0:0] ANY /list/Items.xhtml"
+        )
+        index_qn = str(repo / "web" / "index.jsp")
+
+        def bound_requests() -> list:
+            return [
+                row for row in store._conn.execute(
+                    "SELECT target_qualified, extra FROM edges "
+                    "WHERE kind = 'REQUESTS' AND source_qualified = ?",
+                    (index_qn,),
+                ).fetchall()
+                if row["target_qualified"] == endpoint_qn
+            ]
+
+        assert len(bound_requests()) == 1
+        assert json.loads(bound_requests()[0]["extra"])["route"] == "/list/Items.xhtml"
+
+        # An incremental update (bean file changed, resolvers re-derive) must
+        # keep the endpoint and the page's binding to it.
+        bean = repo / "src/com/example/ItemsBean.java"
+        bean.write_text(
+            bean.read_text(encoding="utf-8").replace("{\n", "{\n    // touched\n", 1),
+            encoding="utf-8",
+        )
+        _git_ok(repo, "commit", "-qam", "touch bean")
+        update = build_or_update_graph(
+            full_rebuild=False, repo_root=str(repo), postprocess="none",
+        )
+        assert update["errors"] == []
+        assert update["jsp_resolution"] is not None
+        assert len(bound_requests()) == 1
+        assert json.loads(bound_requests()[0]["extra"])["route"] == "/list/Items.xhtml"
+        assert store._conn.execute(
+            "SELECT count(*) FROM nodes WHERE qualified_name = ?", (endpoint_qn,),
+        ).fetchone()[0] == 1
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("direction", ["a_to_b", "b_to_a"])
 def test_branch_switch_web_layer_matches_a_fresh_full_rebuild(
     tmp_path: Path, monkeypatch, direction: str,

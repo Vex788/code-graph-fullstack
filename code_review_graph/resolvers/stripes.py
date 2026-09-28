@@ -342,10 +342,6 @@ def _resolve(store: GraphStore, repo_root: Path) -> dict[str, int]:
     handles, forwards = _apply(
         store, conn, wanted_endpoints, wanted_handles, wanted_forwards,
     )
-
-    handles, forwards = _apply(
-        store, conn, wanted_endpoints, wanted_handles, wanted_forwards,
-    )
     store._invalidate_cache()
     result = {
         "beans": len(beans),

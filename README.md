@@ -158,18 +158,18 @@ Details: [READINESS.md](docs/spec/READINESS.md).
 | Edge | From → to | State |
 |---|---|---|
 | `RENDERS` | JSP → ActionBean / Endpoint (`useActionBean`, `beanclass`) | now |
-| `REQUESTS` | JSP/JS URL → Endpoint or handler | now (jQuery `$.ajax` planned) |
+| `REQUESTS` | JSP/JS URL → Endpoint or handler (jQuery `$.get`/`$.post`/`$.getJSON` included) | now |
 | `INCLUDES` | JSP → JSPF / script | now |
 | `REFERENCES` | page → script, stylesheet, page | now |
 | `INJECTS` | ActionBean → Spring bean (`@SpringBean`) | now |
-| `FORWARDS_TO` | handler → JSP (`ForwardResolution`, `RedirectResolution`) | planned |
-| `HANDLES_EVENT` | method → Stripes event (`@HandlesEvent`, `@DefaultHandler`) | planned |
-| `BINDS` | form field → bean property | planned |
-| `USES_STYLE` | `class=` → CSS selector | planned |
-| `MAPS_TO` | `@Entity` / `*.hbm.xml` → table | planned |
+| `FORWARDS_TO` | handler → JSP / bean / route (`ForwardResolution`, `RedirectResolution`) | now |
+| `HANDLES` | Stripes handler method → its `@UrlBinding` Endpoint | now |
+| `BINDS` | form field → bean property setter | now |
+| `USES_STYLE` | `class=` → CSS selector | now |
+| `MAPS_TO` | `@Entity` / `*.hbm.xml` → table | now |
 
-Planned kinds are already in the registry ([EDGES.md](docs/spec/EDGES.md)). Their
-query patterns return empty until the edges are produced.
+All registered cross-stack kinds are produced since fs.6 ([EDGES.md](docs/spec/EDGES.md));
+the query patterns below return live results.
 
 **Example** (the `tests/fixtures/fullstack_stripes` fixture): JSP → ActionBean →
 service → DAO → table.

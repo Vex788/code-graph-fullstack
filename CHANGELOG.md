@@ -69,9 +69,12 @@ Covers fs.5 and fs.6. **Run `code-review-graph build` once after upgrading.**
   - First-party page trees under a root-level `vendor/` directory are no
     longer dropped as third-party: the vendor exclusion is root-anchored
     (composer/Go convention), not any-depth.
-  - Default `dead_url_suffixes` no longer contains `.action` — the default
-    route annotations already include Stripes `@UrlBinding`, whose routes
-    end in `.action`; `.xhtml/.faces/.do` remain dead by default.
+  - Default `dead_url_suffixes` is now `()` (was `(".action",)`): no URL
+    suffix is treated as a dead routing artifact by default. Both `.action`
+    (Stripes) and `.xhtml` (Faces-style, e.g. 277 of pms's 278 `@UrlBinding`
+    routes) are live routes in real repositories, so any hardcoded default
+    hides live endpoints; repositories whose suffixes really are artifacts
+    override the key. Regression-tested with the pms shape.
   - HANDLES_EVENT was removed from the registry unused: Stripes handlers
     reuse HANDLES against their bean's Endpoint node.
 - Benchmark and witness fixture repositories disable git hooks
