@@ -6,6 +6,7 @@ The shape is ``contract.SCHEMAS["harness_fragment"]``.
 
 from __future__ import annotations
 
+import shutil
 from typing import Any
 
 from .. import __version__
@@ -20,6 +21,12 @@ MCP_ARGS = ["serve", "--tools", "agent"]
 READ_ONLY_CLI = ("status", "contract", "query", "impact", "search")
 UPDATE_HOOK = "crg-update.py"
 UPDATE_TIMEOUT = 15
+
+
+def _binary() -> str:
+    # Absolute path: GUI-launched harness processes (Claude Desktop's embedded
+    # code sessions) see no ~/.local/bin in PATH and a bare name fails to start.
+    return shutil.which(MCP_SERVER) or MCP_SERVER
 
 
 def _read_only_tools() -> list[str]:
@@ -49,7 +56,7 @@ def fragment(target: str | Target) -> dict[str, Any]:
                 "timeout": UPDATE_TIMEOUT,
             },
         ],
-        "mcpServers": {MCP_SERVER: {"command": "code-review-graph", "args": list(MCP_ARGS)}},
+        "mcpServers": {MCP_SERVER: {"command": _binary(), "args": list(MCP_ARGS)}},
         "permissions": {"allow": allow},
     }
     errors = validate_fragment(doc)

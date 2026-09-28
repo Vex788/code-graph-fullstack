@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,7 +51,10 @@ def test_fragment_permissions_are_read_only(fragments):
     assert "Bash(code-review-graph status:*)" in allow
     assert not any("build" in a or "update" in a for a in allow if a.startswith("Bash("))
     server = fragments["claude"]["mcpServers"]["code-review-graph"]
-    assert server == {"command": "code-review-graph", "args": ["serve", "--tools", "agent"]}
+    # The command resolves to the installed binary's absolute path so
+    # GUI-launched harnesses (no ~/.local/bin on PATH) can start it.
+    expected = shutil.which("code-review-graph") or "code-review-graph"
+    assert server == {"command": expected, "args": ["serve", "--tools", "agent"]}
 
 
 def test_region_only_target_has_no_fragment():
