@@ -211,11 +211,17 @@ class MlxEmbeddingsProvider(LocalModelProvider):
     def _encode(self, model: Any, texts: list[str], query: bool) -> Any:
         import mlx.core as mx
         import numpy as np
-        from mlx_embeddings import generate
 
         net, tokenizer = model
-        output = generate(net, tokenizer, texts=texts, max_length=MAX_TOKENS)
-        return np.array(output.text_embeds.astype(mx.float32))
+        # mlx-embeddings 0.1.0's generate() splats the HF tokenizer's
+        # `input_ids` key into gemma3_text.Model.__call__(inputs=...) and dies
+        # on every batch; tokenize here and call the net positionally.
+        batch = tokenizer(
+            texts, return_tensors="mlx", padding=True,
+            truncation=True, max_length=MAX_TOKENS,
+        )
+        outputs = net(batch["input_ids"], batch.get("attention_mask"))
+        return np.array(outputs.text_embeds.astype(mx.float32))
 
     def _release(self) -> None:
         _mlx_clear_cache()

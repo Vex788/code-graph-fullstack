@@ -193,17 +193,27 @@ def fake_mlx(monkeypatch):
 @needs_numpy
 def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fake_mlx):
     calls: list[list[str]] = []
+    net_args: list[tuple] = []
 
-    def generate(model, tokenizer, texts, max_length):
+    class _Net:
+        # gemma3_text.Model.__call__(inputs, attention_mask): a keyword
+        # `input_ids` call (mlx-embeddings 0.1.0 generate) must die here
+        def __call__(self, inputs, attention_mask=None):
+            net_args.append((inputs, attention_mask))
+            out = np.zeros((len(inputs), 768), dtype=np.float32)
+            out[:, 0], out[:, 1], out[:, 300] = 3.0, 4.0, 100.0  # beyond the 256 prefix
+            return SimpleNamespace(text_embeds=_mx_array(out))
+
+    def tokenizer(texts, return_tensors, padding, truncation, max_length):
+        assert return_tensors == "mlx" and padding and truncation
         calls.append(list(texts))
-        out = np.zeros((len(texts), 768), dtype=np.float32)
-        out[:, 0], out[:, 1], out[:, 300] = 3.0, 4.0, 100.0  # beyond the 256 prefix
-        return SimpleNamespace(text_embeds=_mx_array(out))
+        n = max(len(t) for t in texts)
+        return {"input_ids": np.full((len(texts), n), 1),
+                "attention_mask": np.ones((len(texts), n))}
 
     loads: list[str] = []
     mod = ModuleType("mlx_embeddings")
-    mod.load = lambda name: loads.append(name) or ("model", "tok")
-    mod.generate = generate
+    mod.load = lambda name: loads.append(name) or (_Net(), tokenizer)
     monkeypatch.setitem(sys.modules, "mlx_embeddings", mod)
 
     provider = backends.MlxEmbeddingsProvider(
@@ -215,6 +225,7 @@ def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fak
     assert loads == [profiles.BALANCED_MLX.model]
     assert calls == [["title: none | text: a", "title: none | text: b"],
                      ["task: search result | query: find x"]]
+    assert all(args[1] is not None for args in net_args)
     assert len(docs[0]) == 256 and docs[0][:2] == pytest.approx([0.6, 0.8])
     assert query[:2] == pytest.approx([0.6, 0.8])
     provider.unload()
