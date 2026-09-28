@@ -110,7 +110,11 @@ jobs:
         with:
           python-version: "3.10"
       - name: Install optional dependency set
-        run: pip install -e ".[${{ matrix.extra }}]"
+        # pip's resolver chokes on the extras set (python-dateutil backtracking
+        # spiral, 2026-09-28); the project resolves with uv everywhere else.
+        run: |
+          pip install -q uv
+          uv pip install --system -e ".[${{ matrix.extra }}]"
       - name: Construct Google embedding provider
         run: python scripts/smoke_google_embeddings.py
 
