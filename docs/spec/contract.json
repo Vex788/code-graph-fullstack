@@ -84,6 +84,12 @@
         "vscode_color": "#f38ba8",
         "since": null,
         "description": "Application event published or handled"
+      },
+      {
+        "name": "Table",
+        "vscode_color": "#94e2d5",
+        "since": "fs.6",
+        "description": "Database table of an ORM mapping"
       }
     ],
     "edge_kinds": [
@@ -329,8 +335,8 @@
       },
       {
         "name": "FORWARDS_TO",
-        "direction": null,
-        "impact_weight": null,
+        "direction": "incoming",
+        "impact_weight": 0.6,
         "community_weight": null,
         "dependents_trigger": false,
         "cross_stack": true,
@@ -341,8 +347,8 @@
       },
       {
         "name": "BINDS",
-        "direction": null,
-        "impact_weight": null,
+        "direction": "incoming",
+        "impact_weight": 0.5,
         "community_weight": null,
         "dependents_trigger": false,
         "cross_stack": true,
@@ -353,39 +359,27 @@
       },
       {
         "name": "USES_STYLE",
-        "direction": null,
-        "impact_weight": null,
+        "direction": "incoming",
+        "impact_weight": 0.4,
         "community_weight": null,
         "dependents_trigger": false,
         "cross_stack": true,
         "risk_counts": false,
         "vscode_color": "#f2cdcd",
         "since": "fs.6",
-        "description": "Page uses a stylesheet"
+        "description": "Page uses a stylesheet class selector"
       },
       {
         "name": "MAPS_TO",
-        "direction": null,
-        "impact_weight": null,
+        "direction": "incoming",
+        "impact_weight": 0.6,
         "community_weight": null,
         "dependents_trigger": false,
         "cross_stack": true,
         "risk_counts": false,
         "vscode_color": "#74c7ec",
         "since": "fs.6",
-        "description": "URL binding maps to an action"
-      },
-      {
-        "name": "HANDLES_EVENT",
-        "direction": null,
-        "impact_weight": null,
-        "community_weight": null,
-        "dependents_trigger": false,
-        "cross_stack": true,
-        "risk_counts": false,
-        "vscode_color": "#eba0ac",
-        "since": "fs.6",
-        "description": "Action method handles a named request event"
+        "description": "Entity or mapping file maps to a database table"
       }
     ]
   },

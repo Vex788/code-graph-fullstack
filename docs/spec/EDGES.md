@@ -32,11 +32,10 @@ community default for clustering).
 | `PRODUCES` | - | - | - |  |  |  |  | Code produces a message |
 | `TEMPORAL_STUB` | - | - | - |  |  |  |  | Unresolved Temporal workflow/activity stub |
 | `DEPENDS_ON_CONFIG` | - | - | - |  |  |  |  | Code reads a configuration key |
-| `FORWARDS_TO` | - | - | - |  | yes |  | fs.6 | Action forwards or redirects to a page |
-| `BINDS` | - | - | - |  | yes |  | fs.6 | Form field binds to a bean property |
-| `USES_STYLE` | - | - | - |  | yes |  | fs.6 | Page uses a stylesheet |
-| `MAPS_TO` | - | - | - |  | yes |  | fs.6 | URL binding maps to an action |
-| `HANDLES_EVENT` | - | - | - |  | yes |  | fs.6 | Action method handles a named request event |
+| `FORWARDS_TO` | incoming | 0.6 | - |  | yes |  | fs.6 | Action forwards or redirects to a page |
+| `BINDS` | incoming | 0.5 | - |  | yes |  | fs.6 | Form field binds to a bean property |
+| `USES_STYLE` | incoming | 0.4 | - |  | yes |  | fs.6 | Page uses a stylesheet class selector |
+| `MAPS_TO` | incoming | 0.6 | - |  | yes |  | fs.6 | Entity or mapping file maps to a database table |
 
 ## Node kinds
 
@@ -51,3 +50,4 @@ community default for clustering).
 | `ConfigProperty` |  | Configuration key |
 | `Scheduler` |  | Scheduled job trigger |
 | `Event` |  | Application event published or handled |
+| `Table` | fs.6 | Database table of an ORM mapping |
