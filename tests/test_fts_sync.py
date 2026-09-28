@@ -50,26 +50,71 @@ class TestFTSSync:
         """Test that rebuild_fts_index clears existing FTS data before repopulating."""
         # 1. Add and index one node
         node1 = NodeInfo(
-            kind="Function", name="old_func", file_path="old.py", 
+            kind="Function", name="old_func", file_path="old.py",
             line_start=1, line_end=5, language="python"
         )
         store.store_file_nodes_edges("old.py", [node1], [])
         rebuild_fts_index(store)
-        
+
         # 2. Delete the file/nodes
         store.remove_file_data("old.py")
         store.commit()
-        
+
         # 3. Add a new node
         node2 = NodeInfo(
-            kind="Function", name="new_func", file_path="new.py", 
+            kind="Function", name="new_func", file_path="new.py",
             line_start=1, line_end=5, language="python"
         )
         store.store_file_nodes_edges("new.py", [node2], [])
-        
+
         # 4. Rebuild FTS - should ONLY have new_func
         rebuild_fts_index(store)
-        
+
         fts_rows = store._conn.execute("SELECT name FROM nodes_fts").fetchall()
         assert len(fts_rows) == 1
         assert fts_rows[0]["name"] == "new_func"
+
+    def test_store_repairs_a_shrunken_fts_table(self, tmp_path):
+        """A v10 database whose nodes_fts lost name_tokens heals on open.
+
+        Field shape (fs.6 verification campaign): schema_version already 10,
+        v10 triggers installed, but nodes_fts back at the pre-v10 four-column
+        form. Every node write then died with ``no column named name_tokens``
+        because the schema check trusted the version and the trigger text.
+        """
+        db = tmp_path / "graph.db"
+        with GraphStore(db):
+            pass
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("DROP TABLE nodes_fts")
+            conn.execute(
+                "CREATE VIRTUAL TABLE nodes_fts USING fts5("
+                "name, qualified_name, file_path, signature, "
+                "content='nodes', content_rowid='rowid', "
+                "tokenize='porter unicode61')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        store = GraphStore(db)
+        try:
+            node = NodeInfo(
+                kind="Function", name="repro_func", file_path="repro.py",
+                line_start=1, line_end=5, language="python",
+            )
+            # Raised sqlite3.OperationalError before the repair existed: the
+            # first write fires nodes_fts_sync_ins, which inserts name_tokens.
+            store.store_file_nodes_edges("repro.py", [node], [])
+            columns = [
+                row[1] for row in store._conn.execute("PRAGMA table_info(nodes_fts)")
+            ]
+            assert columns == ["name", "qualified_name", "file_path", "signature",
+                               "name_tokens"]
+            rows = store._conn.execute(
+                "SELECT name FROM nodes_fts WHERE name MATCH 'repro*'"
+            ).fetchall()
+            assert len(rows) == 1
+        finally:
+            store.close()

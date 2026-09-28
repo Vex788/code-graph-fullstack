@@ -42,7 +42,7 @@ from .migrations import (
     MIGRATION_LOCK_WAIT_SECONDS,
     SchemaMigrationPending,
     check_readable,
-    fts_triggers_outdated,
+    fts_index_outdated,
     get_schema_version,
     run_migrations,
     split_name_tokens,
@@ -322,10 +322,15 @@ class GraphStore:
         A current schema needs no lock. Otherwise this waits up to
         ``MIGRATION_LOCK_WAIT_SECONDS`` for the writer lock and raises
         :class:`SchemaMigrationPending` if another writer keeps it.
+
+        ``fts_index_outdated`` re-verifies the v10 migration's outcome (the
+        ``nodes_fts`` shape its sync triggers assume) — a database whose
+        schema_version already says 10 but whose FTS table drifted is
+        repaired here instead of failing every later write.
         """
         version = check_readable(self._conn)
         if version > LATEST_VERSION or (
-            version == LATEST_VERSION and not fts_triggers_outdated(self._conn)
+            version == LATEST_VERSION and not fts_index_outdated(self._conn)
         ):
             return
         if str(self.db_path) in ("", ":memory:"):

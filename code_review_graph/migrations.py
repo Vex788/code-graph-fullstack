@@ -439,19 +439,56 @@ def fts_triggers_outdated(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def replace_outdated_fts_triggers(conn: sqlite3.Connection) -> bool:
-    """Rebuild FTS with current triggers if outdated ones are installed.
+def fts_triggers_installed(conn: sqlite3.Connection) -> bool:
+    """True when every trigger that keeps ``nodes_fts`` in sync exists."""
+    placeholders = ", ".join("?" * len(FTS_TRIGGERS))
+    row = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' "
+        f"AND name IN ({placeholders})",  # noqa: S608
+        FTS_TRIGGERS,
+    ).fetchone()
+    return bool(row[0] == len(FTS_TRIGGERS))
 
-    Early v10 databases carry triggers that call an app-registered SQL
-    function, which breaks every raw writer. Returns True when replaced.
+
+def fts_index_outdated(conn: sqlite3.Connection) -> bool:
+    """True when ``nodes_fts`` drifted from the schema its triggers assume.
+
+    Covers both drift shapes a v10 database can carry: triggers written in a
+    form this build did not write, and a table recreated with the pre-v10
+    four-column shape while the v10 (``name_tokens``-referencing) triggers
+    stayed installed. Until the table is repaired, every node write that
+    fires a sync trigger fails with ``no column named name_tokens``.
+
+    A missing table alone is not drift: a bulk load drops triggers and table
+    in one transaction and rebuilds both, so a committed database without
+    ``nodes_fts`` and without triggers is a consistent mid-bulk-load shape.
     """
-    if not fts_triggers_outdated(conn):
+    if fts_triggers_outdated(conn):
+        return True
+    if not fts_triggers_installed(conn):
+        return False
+    if not _table_exists(conn, "nodes_fts"):
+        return True
+    cursor = conn.execute("PRAGMA table_info(nodes_fts)")
+    columns = {row[1] if isinstance(row, tuple) else row["name"] for row in cursor}
+    return columns != set(FTS_COLUMNS)
+
+
+def replace_outdated_fts_triggers(conn: sqlite3.Connection) -> bool:
+    """Rebuild FTS with current triggers if drifted, otherwise return False.
+
+    Drift means outdated triggers (early v10 databases carried triggers that
+    call an app-registered SQL function, which breaks every raw writer) or a
+    ``nodes_fts`` table whose columns no longer match what the installed
+    triggers insert. Runs inside its own ``BEGIN IMMEDIATE`` transaction.
+    """
+    if not fts_index_outdated(conn):
         return False
     if conn.in_transaction:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        replaced = fts_triggers_outdated(conn)
+        replaced = fts_index_outdated(conn)
         if replaced:
             rebuild_fts_in_transaction(conn)
         conn.execute("COMMIT")
@@ -459,7 +496,7 @@ def replace_outdated_fts_triggers(conn: sqlite3.Connection) -> bool:
         conn.execute("ROLLBACK")
         raise
     if replaced:
-        logger.info("Replaced outdated FTS triggers and rebuilt nodes_fts")
+        logger.info("Replaced drifted FTS triggers/table and rebuilt nodes_fts")
     return replaced
 
 
