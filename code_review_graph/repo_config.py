@@ -17,7 +17,7 @@ A repo overrides the defaults by dropping
     route_annotations = ["UrlBinding", "RequestMapping"]
     bean_attribute = "beanclass"
     bean_package_prefix = "com."
-    dead_url_suffixes = [".action"]
+    dead_url_suffixes = [".xhtml"]
     context_paths = ["/myapp"]
 
 Sits beside the ``languages.toml`` loader in :mod:`custom_languages` and
@@ -65,7 +65,13 @@ class JspResolverConfig:
     route_annotations: tuple[str, ...] = ("UrlBinding", "RequestMapping")
     bean_attribute: str = "beanclass"
     bean_package_prefix: str = "com."
-    dead_url_suffixes: tuple[str, ...] = (".action",)
+    # Framework routing suffixes that are an artifact of the front controller,
+    # not part of the route. The default is empty: no framework convention is
+    # safe to drop generically (Stripes routes end in ".action", Faces in
+    # ".xhtml" — both are real routes in real repositories, so hardcoding
+    # either as "dead" hides live endpoints). A repository whose suffixes
+    # really are routing artifacts overrides this key.
+    dead_url_suffixes: tuple[str, ...] = ()
     # Leading URL path segments that are a servlet context path, not a disk
     # directory: "/myapp/css/x.css" probes "<web_root>/css/x.css" after the
     # plain "<web_root>/myapp/css/x.css" probe misses.

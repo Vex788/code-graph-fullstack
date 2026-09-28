@@ -154,7 +154,9 @@ def test_detect_changes_honours_max_depth(fixture_app: Path):
     kwargs = {"changed_files": [HEADER_JSPF], "repo_root": str(fixture_app)}
     flat = detect_changes_func(max_depth=0, **kwargs)
     one_hop = detect_changes_func(max_depth=1, **kwargs)
-    assert flat["impacted_nodes"] == [] and flat["impacted_nodes_total"] == 0
+    # Depth 0 lists only the cross-stack targets of the changed page: the
+    # two routes its anchors request and the selector it uses.
+    assert _names(flat) == {"List.action", "Invoice.action", "common.css::page-header"}
     # Pages that include the header are one hop away.
     assert {"view.jsp", "list.jsp"} <= _names(one_hop)
     assert one_hop["max_depth"] == 1

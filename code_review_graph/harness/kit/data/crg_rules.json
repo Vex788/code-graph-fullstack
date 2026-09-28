@@ -220,10 +220,6 @@
     {
       "name": "MAPS_TO",
       "since": "fs.6"
-    },
-    {
-      "name": "HANDLES_EVENT",
-      "since": "fs.6"
     }
   ]
 }

@@ -421,6 +421,8 @@ _EXTENSION_LANGUAGES: dict[str, str] = {
     ".htm": "html",
     ".css": "css",
     ".scss": "scss",
+    # ORM mapping files: the Hibernate resolver derives Table nodes from them.
+    ".xml": "xml",
 }
 
 
@@ -444,6 +446,8 @@ _RESOLVER_RESULT_KEYS: dict[str, str] = {
     "spring": "spring_resolution",
     "spring_event": "event_resolution",
     "temporal": "temporal_resolution",
+    "stripes": "stripes_resolution",
+    "hibernate": "hibernate_resolution",
     "jsp": "jsp_resolution",
     "hcl": "hcl_resolution",
     "scoped": "scoped_resolution",
@@ -460,9 +464,12 @@ def _resolver_results_section(
 # Resolvers that must also re-run on a deletion-only change (a stale or
 # missing path, not just a freshly changed one), because they maintain
 # derived/virtual graph state (e.g. Spring Event nodes — issue #474; JSP
-# link edges derived from live templates). Every other resolver only looks
-# at newly changed files, as before this refactor.
-_RECONCILE_ON_DELETE = frozenset({"python", "spring", "spring_event", "temporal", "jsp"})
+# link edges derived from live templates; Stripes FORWARDS_TO edges bound
+# to jsp File nodes). Every other resolver only looks at newly changed
+# files, as before this refactor.
+_RECONCILE_ON_DELETE = frozenset({
+    "python", "spring", "spring_event", "temporal", "stripes", "hibernate", "jsp",
+})
 
 
 # Default ignore patterns (in addition to .gitignore).

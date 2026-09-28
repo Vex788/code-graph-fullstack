@@ -11,6 +11,10 @@ older database without jsp File nodes is a clean no-op.
                             call to a route-annotated endpoint)
   INCLUDES   jsp -> jsp (``<%@ include %>`` / ``<jsp:include>``)
   REFERENCES jsp/html -> File (script src, stylesheet link, page links)
+  BINDS      jsp -> Function (a form field whose first property segment has
+                            a setter on the form's bean)
+  USES_STYLE jsp -> css Class node (a ``class=`` value defined in a
+                   stylesheet the page or its include closure references)
 
 REQUESTS/RENDERS targets bind to real graph nodes in priority order:
 Endpoint nodes (Spring request mappings — handler-method visibility comes
@@ -54,12 +58,17 @@ PAGE_SUFFIXES = (*JSP_SUFFIXES, ".html", ".htm")
 # Vendored, generated or documentation assets: their links say nothing about
 # an application's own routing, regardless of which framework generated them.
 # Common third-party library and tooling directory names, not tied to any
-# one organisation's conventions.
+# one organisation's conventions. ``/vendor/`` is deliberately NOT here: as
+# an anywhere-in-path marker it swallowed first-party page trees such as
+# ``web/WEB-INF/jsp/vendor/``; vendored trees are matched root-anchored in
+# ``_excluded`` (``ROOT_EXCLUDED_PREFIXES``), the composer/Go convention.
 _EXCLUDED_PARTS = (
-    "/node_modules/", "/.git/", "/bower_components/", "/vendor/",
-    "/jquery", "/bootstrap", "/datatables/", "/ckeditor/",
+    "/node_modules/", "/.git/", "/bower_components/", "/jquery",
+    "/bootstrap", "/datatables/", "/ckeditor/",
 )
 _EXCLUDED_SUFFIXES = (".min.js", ".min.css")
+# Dependency trees anchored at the repository root only.
+ROOT_EXCLUDED_PREFIXES = ("vendor/",)
 
 CLASS_DECL = re.compile(r"^\s*(?:public\s+|final\s+|abstract\s+)*class\s+(\w+)", re.M)
 PACKAGE_DECL = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
@@ -67,14 +76,28 @@ PACKAGE_DECL = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
 HREF_URL = re.compile(r'\b(?:href|action|url)\s*=\s*"([^"]+)"')
 AJAX_URL = re.compile(r"""\burl\s*:\s*['"]([^'"]+)['"]""")
 FETCH_URL = re.compile(r"""\bfetch\s*\(\s*['"]([^'"]+)['"]""")
+AJAX_CALL = re.compile(r"\$\.(?:get|post|getJSON|getScript|load|ajax)\s*\(", re.I)
+AJAX_STRING = re.compile(r"""['"]([^'"]+)['"]""")
 INCLUDE_DIRECTIVE = re.compile(r'<%@\s*include\s+file\s*=\s*"([^"]+)"')
 INCLUDE_TAG = re.compile(r'<\s*jsp:include\b[^>]*\bpage\s*=\s*"([^"]+)"', re.I | re.S)
+JSP_FORWARD = re.compile(r'<\s*jsp:forward\b[^>]*\bpage\s*=\s*"([^"]+)"', re.I | re.S)
 
 SCRIPT_TAG = re.compile(r"<script\b[^>]*>", re.I | re.S)
 LINK_TAG = re.compile(r"<link\b[^>]*>", re.I | re.S)
 ANCHOR_HREF = re.compile(r'<a\b[^>]*\bhref\s*=\s*"([^"]+)"', re.I | re.S)
 FORM_ACTION = re.compile(r'<form\b[^>]*\baction\s*=\s*"([^"]+)"', re.I | re.S)
 TAG_ATTRIBUTE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+# A form block and the bindable fields inside it. The backreference keeps
+# ``<form>``/``</form>`` and ``<stripes:form>``/``</stripes:form>`` paired.
+FORM_BLOCK = re.compile(
+    r"<\s*((?:stripes:)?form)\b([^>]*)>(.*?)</\s*\1\s*>", re.I | re.S,
+)
+FIELD_NAME = re.compile(
+    r'<\s*(?:stripes:[\w-]+|input|select|textarea|button)\b[^>]*?\bname\s*=\s*"([^"]+)"',
+    re.I,
+)
+CLASS_ATTR = re.compile(r'\bclass\s*=\s*"([^"]+)"', re.I)
+SETTER_PREFIX = "set"
 
 # Href forms that can never name a repository file: skip them before the
 # unresolvable count so it measures real misses, not external links.
@@ -90,6 +113,8 @@ _STATS_ZERO = {
     "requests": 0,
     "includes": 0,
     "references": 0,
+    "binds": 0,
+    "styles": 0,
     "unresolved_references": 0,
     "unresolved_targets": 0,
 }
@@ -98,9 +123,18 @@ _STATS_ZERO = {
 _Link = tuple[str, str, str, int, dict]
 
 
-def _excluded(path_text: str) -> bool:
+def _excluded(path_text: str, repo_root: Path | None = None) -> bool:
+    """A third-party tree, by anywhere-markers or root-anchored prefixes."""
     text = path_text.replace("\\", "/")
-    return any(part in text for part in _EXCLUDED_PARTS) or text.endswith(_EXCLUDED_SUFFIXES)
+    if any(part in text for part in _EXCLUDED_PARTS) or text.endswith(_EXCLUDED_SUFFIXES):
+        return True
+    if repo_root is not None:
+        prefix = str(repo_root).rstrip("/") + "/"
+        if text.startswith(prefix):
+            relative = text[len(prefix):]
+            if any(relative.startswith(part) for part in ROOT_EXCLUDED_PREFIXES):
+                return True
+    return False
 
 
 def _read(path: Path) -> str:
@@ -244,22 +278,28 @@ def _java_bindings(
     return found
 
 
-def _graph_pages(conn, language: str) -> list[str]:
+def _graph_pages(conn, language: str, repo_root: Path) -> list[str]:
     """File-node qualified names (absolute paths) for one page language."""
     rows = conn.execute(
         "SELECT qualified_name FROM nodes "
         "WHERE kind = 'File' AND language = ? ORDER BY qualified_name",
         (language,),
     ).fetchall()
-    return [row["qualified_name"] for row in rows if not _excluded(row["qualified_name"])]
+    return [
+        row["qualified_name"] for row in rows
+        if not _excluded(row["qualified_name"], repo_root)
+    ]
 
 
-def _graph_scripts(conn) -> list[str]:
+def _graph_scripts(conn, repo_root: Path) -> list[str]:
     rows = conn.execute(
         "SELECT qualified_name FROM nodes "
         "WHERE kind = 'File' AND language = 'javascript' ORDER BY qualified_name"
     ).fetchall()
-    return [row["qualified_name"] for row in rows if not _excluded(row["qualified_name"])]
+    return [
+        row["qualified_name"] for row in rows
+        if not _excluded(row["qualified_name"], repo_root)
+    ]
 
 
 def _class_index(conn) -> dict[str, list[tuple[str, str]]]:
@@ -399,6 +439,61 @@ def _dedupe(links: list[_Link], by_asset: bool = False) -> list[_Link]:
     return unique
 
 
+def _css_selector_index(conn) -> set[str]:
+    """Qualified names of the css/scss class-selector Class nodes."""
+    rows = conn.execute(
+        "SELECT qualified_name FROM nodes "
+        "WHERE kind = 'Class' AND language IN ('css', 'scss')"
+    )
+    return {row["qualified_name"] for row in rows}
+
+
+def _java_method_index(conn) -> dict[str, list[str]]:
+    """Java Function simple name -> its qualified names."""
+    index: dict[str, list[str]] = {}
+    rows = conn.execute(
+        "SELECT name, qualified_name FROM nodes "
+        "WHERE kind = 'Function' AND language = 'java'"
+    )
+    for row in rows:
+        index.setdefault(row["name"], []).append(row["qualified_name"])
+    return index
+
+
+def _endpoint_class_index(conn) -> dict[str, str]:
+    """Endpoint qualified name -> the bean Class node it serves, when known."""
+    beans: dict[str, str] = {}
+    rows = conn.execute("SELECT qualified_name, extra FROM nodes WHERE kind = 'Endpoint'")
+    for row in rows:
+        try:
+            extra = json.loads(row["extra"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        handler = extra.get("handler_qualified") if isinstance(extra, dict) else None
+        if isinstance(handler, str) and handler:
+            beans[row["qualified_name"]] = handler
+    return beans
+
+
+def _setter_qn(class_qn: str, prop: str, methods: dict[str, list[str]]) -> str | None:
+    """Method node for ``set<Prop>`` on exactly this bean class, if declared."""
+    setter = SETTER_PREFIX + prop[:1].upper() + prop[1:]
+    prefix = class_qn + "."
+    for qn in methods.get(setter, ()):
+        if qn.startswith(prefix):
+            return qn
+    return None
+
+
+def _includer_map(page_includes: dict[str, set[str]]) -> dict[str, set[str]]:
+    """Reverse of the include graph: page -> the pages that include it."""
+    includers: dict[str, set[str]] = {}
+    for page, included in page_includes.items():
+        for target in included:
+            includers.setdefault(target, set()).add(page)
+    return includers
+
+
 def resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     """Rebuild RENDERS/REQUESTS/INCLUDES/REFERENCES edges from graph state.
 
@@ -414,7 +509,7 @@ def resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
 # Per-file extraction cache, kept with the graph and invalidated with the
 # config or this format.
 _STATE_KEY = "jsp_resolver_state"
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 # Pre-binding link records: (tag, raw text, line).
 _Raw = list
 
@@ -423,7 +518,7 @@ def _extract_page(text: str, kind: str, bean_pattern: re.Pattern[str]) -> list[_
     """The raw links of one page or script, in the order edges are emitted.
 
     Tags: B bean class, R request URL, I include, S script src, C stylesheet,
-    P page link.
+    P page link, F form bean reference, N form field, K CSS class use.
     """
     lines = _Lines(text)
     found: list[_Raw] = []
@@ -437,10 +532,14 @@ def _extract_page(text: str, kind: str, bean_pattern: re.Pattern[str]) -> list[_
     for pattern in request_patterns:
         for match in pattern.finditer(text):
             found.append(["R", match.group(1), lines.of(match.start())])
+    if kind in ("jsp", "javascript", "html"):
+        for url, line in _ajax_call_urls(text):
+            found.append(["R", url, line])
     if kind == "jsp":
-        for pattern in (INCLUDE_DIRECTIVE, INCLUDE_TAG):
+        for pattern in (INCLUDE_DIRECTIVE, INCLUDE_TAG, JSP_FORWARD):
             for match in pattern.finditer(text):
-                found.append(["I", match.group(1), lines.of(match.start())])
+                tag = "I" if pattern is not JSP_FORWARD else "R"
+                found.append([tag, match.group(1), lines.of(match.start())])
     if kind in ("jsp", "html"):
         for match in SCRIPT_TAG.finditer(text):
             source_attr = _tag_attributes(match.group(0)).get("src")
@@ -454,6 +553,57 @@ def _extract_page(text: str, kind: str, bean_pattern: re.Pattern[str]) -> list[_
         for pattern in (ANCHOR_HREF, FORM_ACTION):
             for match in pattern.finditer(text):
                 found.append(["P", match.group(1), lines.of(match.start())])
+        for match in CLASS_ATTR.finditer(text):
+            for name in match.group(1).split():
+                found.append(["K", name, lines.of(match.start())])
+        for block in FORM_BLOCK.finditer(text):
+            attributes = _tag_attributes(block.group(2))
+            bean = attributes.get("beanclass", "")
+            line = lines.of(block.start())
+            if bean:
+                found.append(["F", f"beanclass:{bean}", line])
+            elif attributes.get("action"):
+                found.append(["F", f"action:{attributes['action']}", line])
+            for field in FIELD_NAME.finditer(block.group(3)):
+                found.append(["N", field.group(1), lines.of(field.start())])
+    return found
+
+
+def _ajax_call_urls(text: str) -> list[tuple[str, int]]:
+    """``(URL fragment, line)`` quoted inside jQuery AJAX first arguments.
+
+    ``$.get``/``$.post``/``$.getJSON``/``$.getScript``/``$.load``/``$.ajax``
+    take the URL as their first argument, which is often a concatenation
+    (``ctx + '/vendor/Invoice.action'``) — every quoted fragment of that
+    first argument is a URL candidate; fragments inside callbacks are not.
+    """
+    found: list[tuple[str, int]] = []
+    lines = _Lines(text)
+    for call in AJAX_CALL.finditer(text):
+        i = call.end()
+        depth = 1
+        arg_end = len(text)
+        n = len(text)
+        while i < n and depth:
+            ch = text[i]
+            if ch in "'\"":
+                quote = ch
+                i += 1
+                while i < n and text[i] != quote:
+                    i += 2 if text[i] == "\\" else 1
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    arg_end = i
+                    break
+            elif ch == "," and depth == 1:
+                arg_end = i
+                break
+            i += 1
+        for match in AJAX_STRING.finditer(text[call.end():arg_end]):
+            found.append((match.group(1), lines.of(call.start())))
     return found
 
 
@@ -493,9 +643,9 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
         f"AND ({stale_page_refs})"
     )
 
-    jsp_pages = _graph_pages(conn, "jsp")
-    html_pages = _graph_pages(conn, "html")
-    scripts = _graph_scripts(conn)
+    jsp_pages = _graph_pages(conn, "jsp", repo_root)
+    html_pages = _graph_pages(conn, "html", repo_root)
+    scripts = _graph_scripts(conn, repo_root)
     if not jsp_pages and not html_pages and not scripts:
         _write_edges(conn, [])
         store._invalidate_cache()
@@ -517,6 +667,9 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     bindings = _binding_map(repo_root, config, hashes, state["java"], fresh["java"])
     bean_pattern = _bean_attribute_pattern(config)
     web_root = (repo_root / config.web_root).resolve()
+    css_selectors = _css_selector_index(conn)
+    java_methods = _java_method_index(conn)
+    endpoint_classes = _endpoint_class_index(conn)
 
     def _links(qualified: str, kind: str) -> list[_Raw]:
         key = _file_key(qualified, hashes)
@@ -534,6 +687,13 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     requests: list[_Link] = []
     includes: list[_Link] = []
     references: list[_Link] = []
+    binds: list[_Link] = []
+    styles: list[_Link] = []
+    # Per-page facts the USES_STYLE pass needs: stylesheets referenced, pages
+    # included and class= values used.
+    page_css: dict[str, set[str]] = {}
+    page_includes: dict[str, set[str]] = {}
+    page_classes: dict[str, list[tuple[str, int]]] = {}
     unresolved_references = 0
     unresolved_targets = 0
 
@@ -560,8 +720,25 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
         unresolved_targets += 1
         return fqn, {"resolution": "raw", "fqn": fqn, "unresolved": True}
 
+    def _form_class(ref: str) -> str | None:
+        """Bean Class node for a form reference ``beanclass:FQN``/``action:URL``."""
+        kind, _, value = ref.partition(":")
+        if kind == "beanclass":
+            return _resolve_class(value, classes)
+        route = _normalize_url(value, config.dead_url_suffixes)
+        if not route:
+            return None
+        endpoint = endpoints.get(route)
+        if endpoint is not None:
+            bean = endpoint_classes.get(endpoint)
+            if bean is not None:
+                return bean
+        fqn = bindings.get(route)
+        return _resolve_class(fqn, classes) if fqn else None
+
     def _bind(source_qn: str, found: list[_Raw]) -> None:
         nonlocal unresolved_references
+        form_class: str | None = None
         for tag, raw, line in found:
             if tag == "B":
                 target, binding_extra = _bind_bean(raw)
@@ -573,6 +750,39 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
                     target, binding_extra = bound
                     extra = {"route": route, "url": raw, **binding_extra}
                     requests.append(("REQUESTS", source_qn, target, line, extra))
+            elif tag == "F":
+                form_class = _form_class(raw)
+            elif tag == "N":
+                prop = raw.split(".", 1)[0]
+                if form_class is None or not prop:
+                    continue
+                setter = _setter_qn(form_class, prop, java_methods)
+                if setter is not None:
+                    binds.append((
+                        "BINDS", source_qn, setter, line,
+                        {"field": raw, "property": prop},
+                    ))
+            elif tag == "K":
+                page_classes.setdefault(source_qn, []).append((raw, line))
+            elif tag == "P":
+                # An anchor or form action may name a route rather than a file.
+                route = _normalize_url(raw, config.dead_url_suffixes)
+                bound = _bind_route(route) if route else None
+                if bound is not None:
+                    target, binding_extra = bound
+                    extra = {"route": route, "url": raw, **binding_extra}
+                    requests.append(("REQUESTS", source_qn, target, line, extra))
+                    continue
+                resolved, countable = _resolve_reference(
+                    source_qn, raw, web_root, config.context_paths, file_index,
+                )
+                if resolved is not None and resolved.endswith(PAGE_SUFFIXES):
+                    references.append((
+                        "REFERENCES", source_qn, resolved, line,
+                        {"asset": "page", "href": raw},
+                    ))
+                elif resolved is None and countable:
+                    unresolved_references += 1
             else:
                 resolved, countable = _resolve_reference(
                     source_qn, raw, web_root, config.context_paths, file_index,
@@ -580,6 +790,7 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
                 if tag == "I":
                     if resolved is not None and resolved.endswith(PAGE_SUFFIXES):
                         includes.append(("INCLUDES", source_qn, resolved, line, {"href": raw}))
+                        page_includes.setdefault(source_qn, set()).add(resolved)
                 elif resolved is None:
                     if countable:
                         unresolved_references += 1
@@ -593,6 +804,8 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
                         "REFERENCES", source_qn, resolved, line,
                         {"asset": "stylesheet", "href": raw},
                     ))
+                    if resolved.endswith((".css", ".scss")):
+                        page_css.setdefault(source_qn, set()).add(resolved)
                 elif resolved.endswith(PAGE_SUFFIXES):
                     references.append((
                         "REFERENCES", source_qn, resolved, line,
@@ -606,11 +819,41 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
     for script_qn in scripts:
         _bind(script_qn, _links(script_qn, "javascript"))
 
+    # Stylesheet closure over the include graph: a fragment renders inside
+    # whatever page includes it, so a class it uses resolves against that
+    # page's stylesheets too (footer.jspf sees the includer's common.css).
+    css_closure = {page: set(css) for page, css in page_css.items()}
+    changed = True
+    while changed:
+        changed = False
+        for page, included in page_includes.items():
+            own = css_closure.setdefault(page, set())
+            for target in included:
+                inherited = css_closure.get(target)
+                if inherited and not inherited <= own:
+                    own |= inherited
+                    changed = True
+        for fragment, includers in _includer_map(page_includes).items():
+            own = css_closure.setdefault(fragment, set())
+            for page in includers:
+                inherited = css_closure.get(page)
+                if inherited and not inherited <= own:
+                    own |= inherited
+                    changed = True
+    for page, used in page_classes.items():
+        for name, line in used:
+            for css in sorted(css_closure.get(page, ())):
+                selector = f"{css}::{name}"
+                if selector in css_selectors:
+                    styles.append(("USES_STYLE", page, selector, line, {"class": name}))
+
     deduped = {
         "RENDERS": _dedupe(renders),
         "REQUESTS": _dedupe(requests),
         "INCLUDES": _dedupe(includes),
         "REFERENCES": _dedupe(references, by_asset=True),
+        "BINDS": _dedupe(binds),
+        "USES_STYLE": _dedupe(styles),
     }
     _write_edges(conn, [
         (kind, source, target, source, line, json.dumps(extra, sort_keys=True))
@@ -629,6 +872,8 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
         "requests": len(deduped["REQUESTS"]),
         "includes": len(deduped["INCLUDES"]),
         "references": len(deduped["REFERENCES"]),
+        "binds": len(deduped["BINDS"]),
+        "styles": len(deduped["USES_STYLE"]),
         "unresolved_references": unresolved_references,
         "unresolved_targets": unresolved_targets,
     }
@@ -639,13 +884,15 @@ def _resolve_jsp_links(store: GraphStore, repo_root: Path) -> dict[str, int]:
 def _write_edges(conn, wanted: list[tuple]) -> None:
     """Make this resolver's edges exactly *wanted*, touching only the difference.
 
-    RENDERS/REQUESTS/INCLUDES have no other producer; REFERENCES does (Blade,
-    HCL), so only those sourced at a page File node are this resolver's.
+    RENDERS/REQUESTS/INCLUDES/BINDS/USES_STYLE have no other producer;
+    REFERENCES does (Blade, HCL), so only those sourced at a page File node
+    are this resolver's.
     """
     existing: dict[tuple, list[int]] = {}
     for row in conn.execute(
         "SELECT id, kind, source_qualified, target_qualified, file_path, line, extra "
-        "FROM edges WHERE kind IN ('RENDERS', 'REQUESTS', 'INCLUDES') "
+        "FROM edges WHERE kind IN "
+        "('RENDERS', 'REQUESTS', 'INCLUDES', 'BINDS', 'USES_STYLE') "
         "UNION ALL "
         "SELECT id, kind, source_qualified, target_qualified, file_path, line, extra "
         "FROM edges WHERE kind = 'REFERENCES' AND source_qualified IN ("

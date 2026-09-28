@@ -51,7 +51,7 @@ The builder uses `base...head`, records the merge base and SHA-256 of `diff.patc
 | Diff/hunk exceeds its review budget | Do not dispatch; split or ESCALATE |
 | Graph output is truncated | Use focused fallback and preserve the truncation state |
 
-Use `references/context-pack.schema.json` when changing the packet format. JSP/JSPF/tag/JS/JSX/HTML/CSS/SCSS/XML/YAML are graph-indexed File nodes carrying RENDERS/REQUESTS/INCLUDES/REFERENCES edges (FORWARDS_TO, HANDLES_EVENT, BINDS, USES_STYLE, MAPS_TO and jQuery REQUESTS are not produced yet), so page and asset questions belong to the graph too, through the cross-stack `query_graph_tool` patterns (`pages_for`, `requests_to`, `included_by`, `views_of`); `callers_of`/`importers_of` follow only CALLS/IMPORTS_FROM; coverage is still inferred only through the coverage gate. Whatever the gate reports missing or excluded stays a text-search surface.
+Use `references/context-pack.schema.json` when changing the packet format. JSP/JSPF/tag/JS/JSX/HTML/CSS/SCSS/XML/YAML are graph-indexed File nodes carrying RENDERS/REQUESTS/INCLUDES/REFERENCES/FORWARDS_TO/HANDLES/BINDS/USES_STYLE/MAPS_TO edges (all produced since fs.6, jQuery REQUESTS included), so page and asset questions belong to the graph too, through the cross-stack `query_graph_tool` patterns (`pages_for`, `requests_to`, `included_by`, `views_of`); `callers_of`/`importers_of` follow only CALLS/IMPORTS_FROM; coverage is still inferred only through the coverage gate. Whatever the gate reports missing or excluded stays a text-search surface.
 
 The legacy `--graph-db` flag is accepted for old callers, but its path is ignored: it probes the live graph through the CLI instead. No script here opens `graph.db`.
 

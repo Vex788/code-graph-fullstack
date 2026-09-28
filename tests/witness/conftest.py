@@ -36,6 +36,10 @@ def copy_fixture(dest: Path) -> Path:
     """Copy the fixture app into *dest* as a one-commit git repository."""
     shutil.copytree(FIXTURE_SRC, dest, ignore=shutil.ignore_patterns("expected_edges.tsv"))
     git(dest, "init", "-q")
+    # Fixture repos must not fire machine-level git hooks: a global
+    # core.hooksPath with a post-commit graph refresh would race the builds
+    # under test. A nonexistent hooks path runs no hooks.
+    git(dest, "config", "core.hooksPath", str(dest / ".githooks-disabled"))
     git(dest, "add", "-A")
     git(dest, "commit", "-q", "-m", "fixture")
     return dest.resolve()

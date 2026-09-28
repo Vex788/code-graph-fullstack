@@ -20,8 +20,9 @@ DIRECTION_NONE = "none"
 FALLBACK_NODE_COLOR = "#cdd6f4"
 FALLBACK_EDGE_COLOR = "#8b949e"
 
-# Release that introduced planned kinds; nothing emits them yet.
-PLANNED_SINCE = "fs.6"
+# Release that introduced the newest node and edge kinds. Kinds marked with
+# it are emitted by the fs.6 cross-stack resolvers.
+SINCE_FS6 = "fs.6"
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ NODE_KINDS: tuple[NodeKind, ...] = (
     NodeKind("ConfigProperty", "#f9e2af", description="Configuration key"),
     NodeKind("Scheduler", "#fab387", description="Scheduled job trigger"),
     NodeKind("Event", "#f38ba8", description="Application event published or handled"),
+    NodeKind("Table", "#94e2d5", since=SINCE_FS6, description="Database table of an ORM mapping"),
 )
 
 EDGE_KINDS: tuple[EdgeKind, ...] = (
@@ -138,26 +140,27 @@ EDGE_KINDS: tuple[EdgeKind, ...] = (
         "DEPENDS_ON_CONFIG", vscode_color="#f9e2af",
         description="Code reads a configuration key",
     ),
-    # Planned cross-stack kinds for the Stripes/JSP stack.
+    # Cross-stack kinds for the Stripes/JSP stack, introduced in fs.6. Like
+    # RENDERS/REQUESTS they pull impact from the page back to the server side.
     EdgeKind(
-        "FORWARDS_TO", cross_stack=True, vscode_color="#89b4fa", since=PLANNED_SINCE,
+        "FORWARDS_TO", DIRECTION_INCOMING, 0.6,
+        cross_stack=True, vscode_color="#89b4fa", since=SINCE_FS6,
         description="Action forwards or redirects to a page",
     ),
     EdgeKind(
-        "BINDS", cross_stack=True, vscode_color="#94e2d5", since=PLANNED_SINCE,
+        "BINDS", DIRECTION_INCOMING, 0.5,
+        cross_stack=True, vscode_color="#94e2d5", since=SINCE_FS6,
         description="Form field binds to a bean property",
     ),
     EdgeKind(
-        "USES_STYLE", cross_stack=True, vscode_color="#f2cdcd", since=PLANNED_SINCE,
-        description="Page uses a stylesheet",
+        "USES_STYLE", DIRECTION_INCOMING, 0.4,
+        cross_stack=True, vscode_color="#f2cdcd", since=SINCE_FS6,
+        description="Page uses a stylesheet class selector",
     ),
     EdgeKind(
-        "MAPS_TO", cross_stack=True, vscode_color="#74c7ec", since=PLANNED_SINCE,
-        description="URL binding maps to an action",
-    ),
-    EdgeKind(
-        "HANDLES_EVENT", cross_stack=True, vscode_color="#eba0ac", since=PLANNED_SINCE,
-        description="Action method handles a named request event",
+        "MAPS_TO", DIRECTION_INCOMING, 0.6,
+        cross_stack=True, vscode_color="#74c7ec", since=SINCE_FS6,
+        description="Entity or mapping file maps to a database table",
     ),
 )
 

@@ -30,19 +30,23 @@ def test_registry_order_matches_the_old_hardcoded_chain():
     # temporal_stats, hcl_stats, scoped_stats.
     # jsp joined the Java-adjacent group after temporal; it has no ordering
     # dependency of its own, it reads .java sources straight off disk.
+    # stripes and hibernate joined ahead of jsp in fs.6: the JSP linker binds
+    # page links to Stripes Endpoint nodes, so those must exist first.
     assert list(RESOLVERS.keys()) == [
         "python",
         "rescript",
         "spring",
         "spring_event",
         "temporal",
+        "stripes",
+        "hibernate",
         "jsp",
         "hcl",
         "scoped",
     ]
     print(
         "OK: registry order == python, rescript, spring, spring_event, "
-        "temporal, hcl, scoped"
+        "temporal, stripes, hibernate, jsp, hcl, scoped"
     )
 
 
@@ -52,10 +56,12 @@ def test_gating_reproduces_the_old_per_resolver_booleans():
     # temporal. Reproduce that exactly, not "fix" it.
     # "jsp" joined _RECONCILE_ON_DELETE with the fullstack fork: its edges
     # are derived from live templates, so a deletion that only surfaces
-    # through reconciliation must still clear them.
-    assert incremental_module._RECONCILE_ON_DELETE == frozenset(
-        {"python", "spring", "spring_event", "temporal", "jsp"}
-    )
+    # through reconciliation must still clear them. "stripes" and
+    # "hibernate" joined in fs.6 for the same reason: FORWARDS_TO binds to
+    # jsp File nodes and MAPS_TO maintains virtual Table nodes.
+    assert incremental_module._RECONCILE_ON_DELETE == frozenset({
+        "python", "spring", "spring_event", "temporal", "stripes", "hibernate", "jsp",
+    })
     assert (
         RESOLVERS["spring"][2]
         == RESOLVERS["spring_event"][2]
@@ -64,6 +70,8 @@ def test_gating_reproduces_the_old_per_resolver_booleans():
     )
     assert RESOLVERS["python"][2] == frozenset({"python"})
     assert RESOLVERS["rescript"][2] == frozenset({"rescript"})
+    assert RESOLVERS["stripes"][2] == frozenset({"java", "jsp"})
+    assert RESOLVERS["hibernate"][2] == frozenset({"java", "xml"})
     assert RESOLVERS["hcl"][2] == frozenset({"hcl"})
     assert RESOLVERS["scoped"][2] == frozenset({"php", "rust", "csharp"})
     # The jsp resolver binds to Java Endpoint/Class nodes and to frontend
@@ -146,6 +154,8 @@ def test_unchanged_language_resolver_is_not_run_on_the_incremental_path():
     assert ran["spring"] is False
     assert ran["spring_event"] is False
     assert ran["temporal"] is False
+    assert ran["stripes"] is False
+    assert ran["hibernate"] is False
     assert ran["jsp"] is False
     assert ran["rescript"] is False
     assert ran["scoped"] is False

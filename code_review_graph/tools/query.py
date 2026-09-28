@@ -105,7 +105,9 @@ _CROSS_STACK_PATTERNS: dict[str, tuple[str, frozenset[str], frozenset[str]]] = {
     ),
 }
 _QUERY_PATTERNS.update({name: spec[0] for name, spec in _CROSS_STACK_PATTERNS.items()})
-_ROUTE_PATTERNS = frozenset({"pages_for", "requests_to"})
+# forwards_to joins the URL-addressable patterns: its edges record the
+# matched route in extra, so "/x/Y.action" resolves like a requests_to URL.
+_ROUTE_PATTERNS = frozenset({"pages_for", "requests_to", "forwards_to"})
 _MEMBER_DEPTH = 2
 
 

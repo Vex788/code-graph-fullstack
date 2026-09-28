@@ -33,7 +33,7 @@ Use the cheapest tool that answers the question; escalate only for structural-co
 
 ## Cross-stack query patterns
 
-Edges that exist now: RENDERS (JSP → handler class or Endpoint), REQUESTS (JSP/JS URL → Endpoint or handler), INCLUDES (JSP → JSP), REFERENCES (asset tags: script, stylesheet, page). Edge kinds registered but not produced yet (fs.6+): FORWARDS_TO (`ForwardResolution`/`RedirectResolution`), HANDLES_EVENT (`@HandlesEvent`/`@DefaultHandler`), BINDS (form `name=` → property), USES_STYLE (`class=` → CSS selector), MAPS_TO (`@Entity`/`@Table`/`*.hbm.xml` → table) and jQuery `$.ajax`/`$.get` REQUESTS.
+Edges that exist now: RENDERS (JSP → handler class or Endpoint), REQUESTS (JSP/JS URL → Endpoint or handler; jQuery `$.get`/`$.post`/`$.getJSON` included), INCLUDES (JSP → JSP), REFERENCES (asset tags: script, stylesheet, page), FORWARDS_TO (`ForwardResolution`/`RedirectResolution`), HANDLES (`@HandlesEvent`/`@DefaultHandler` → the `@UrlBinding` Endpoint), BINDS (form `name=` → property setter), USES_STYLE (`class=` → CSS selector) and MAPS_TO (`@Table`/`*.hbm.xml` → table).
 
 `query_graph_tool` patterns for them (also usable inside `batch_query_tool`; patterns over the not-yet-produced kinds return empty today):
 

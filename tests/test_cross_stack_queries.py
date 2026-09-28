@@ -59,12 +59,14 @@ def stripes(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return repo
 
 
-def test_pages_for_action_bean_follows_renders(stripes: Path):
+def test_pages_for_action_bean_follows_renders_and_forwards(stripes: Path):
     result = query_graph("pages_for", "OrderActionBean", repo_root=str(stripes))
     assert result["status"] == "ok", result
     assert _names(result) == {"view.jsp"}
-    [row] = result["results"]
-    assert (row["via"], row["direction"]) == ("RENDERS", "incoming")
+    assert {(row["via"], row["direction"]) for row in result["results"]} == {
+        ("RENDERS", "incoming"),
+        ("FORWARDS_TO", "outgoing"),
+    }
     assert result["edges"][0]["kind"] == "RENDERS"
 
 
@@ -73,7 +75,7 @@ def test_included_by_lists_including_pages(stripes: Path):
         "included_by", "web/WEB-INF/jsp/common/header.jspf", repo_root=str(stripes),
     )
     assert result["status"] == "ok", result
-    assert {"view.jsp", "list.jsp"} <= _names(result)
+    assert _names(result) == {"view.jsp", "list.jsp", "invoice.jsp", "invoice_list.jsp"}
     assert {r["via"] for r in result["results"]} == {"INCLUDES"}
 
 
@@ -83,9 +85,76 @@ def test_batch_query_accepts_cross_stack_patterns(stripes: Path):
         {"pattern": "included_by", "target": "web/WEB-INF/jsp/common/footer.jspf"},
     ], repo_root=str(stripes))
     pages, included = result["results"]
-    assert pages["status"] == "ok" and pages["prod_count"] == 1
+    assert pages["status"] == "ok" and pages["prod_count"] == 2
     assert "view.jsp" in pages["prod"][0]
     assert included["status"] == "ok" and included["prod_count"] >= 2
+
+
+def test_requests_to_stripes_endpoint_by_url(stripes: Path):
+    result = query_graph("requests_to", "/vendor/Invoice.action", repo_root=str(stripes))
+    assert result["status"] == "ok", result
+    assert _names(result) == {"invoice.jsp", "invoice.js", "header.jspf", "index.jsp"}
+    assert {r["via"] for r in result["results"]} == {"REQUESTS"}
+
+
+def test_forwards_to_and_views_of_round_trip(stripes: Path):
+    forwards = query_graph(
+        "forwards_to", "web/WEB-INF/jsp/order/view.jsp", repo_root=str(stripes),
+    )
+    assert forwards["status"] == "ok", forwards
+    assert _names(forwards) == {"OrderActionBean.java::OrderActionBean.view",
+                                "OrderActionBean.java::OrderActionBean.place"}
+    views = query_graph("views_of", "OrderActionBean", repo_root=str(stripes))
+    assert _names(views) == {"view.jsp"}
+
+
+def test_redirect_resolution_binds_to_the_endpoint(stripes: Path):
+    forwards = query_graph(
+        "forwards_to", "/user/List.action", repo_root=str(stripes),
+    )
+    assert forwards["status"] == "ok", forwards
+    assert _names(forwards) == {"UserListActionBean.java::UserListActionBean.register"}
+
+
+def test_binds_to_form_fields_and_back(stripes: Path):
+    page = query_graph(
+        "binds_to", "web/WEB-INF/jsp/vendor/invoice.jsp", repo_root=str(stripes),
+    )
+    assert page["status"] == "ok", page
+    assert _names(page) == {
+        "VendorInvoiceActionBean.java::VendorInvoiceActionBean.setInvoice",
+        "VendorInvoiceActionBean.java::VendorInvoiceActionBean.setInvoiceId",
+    }
+    assert {r["direction"] for r in page["results"]} == {"outgoing"}
+    setter = query_graph(
+        "binds_to", "VendorInvoiceActionBean.setInvoiceId", repo_root=str(stripes),
+    )
+    assert _names(setter) == {"invoice.jsp"}
+
+
+def test_styles_of_stylesheet_and_page(stripes: Path):
+    stylesheet = query_graph("styles_of", "web/css/invoice.css", repo_root=str(stripes))
+    assert stylesheet["status"] == "ok", stylesheet
+    # invoice_list.jsp also links invoice.css and uses its .invoice-table.
+    assert _names(stylesheet) == {"invoice.jsp", "invoice_list.jsp"}
+    page = query_graph(
+        "styles_of", "web/WEB-INF/jsp/vendor/invoice.jsp", repo_root=str(stripes),
+    )
+    assert _names(page) == {"invoice.css::invoice-form", "invoice.css::invoice-total"}
+
+
+def test_maps_to_entities_and_tables(stripes: Path):
+    entity = query_graph(
+        "maps_to", "src/main/java/com/acme/model/User.java::User",
+        repo_root=str(stripes),
+    )
+    assert entity["status"] == "ok", entity
+    assert _names(entity) == {"table::users"}
+    table = query_graph("maps_to", "table::invoices", repo_root=str(stripes))
+    assert _names(table) == {"Invoice.java::Invoice"}
+    [row] = table["results"]
+    # The far end of the table query is the entity Class node.
+    assert row["kind"] == "Class" and row["name"] == "Invoice"
 
 
 _CONTROLLER = """package com.acme;
@@ -113,7 +182,11 @@ def spring(tmp_path_factory: pytest.TempPathFactory) -> Path:
     (repo / "src/main/webapp/WEB-INF/jsp").mkdir(parents=True)
     (repo / "src/main/java/com/acme/OrderController.java").write_text(_CONTROLLER)
     (repo / "src/main/webapp/WEB-INF/jsp/orders.jsp").write_text(_PAGE)
-    for args in (["init", "-q"], ["add", "-A"],
+    for args in (["init", "-q"],
+                 # No machine-level hooks: a global post-commit graph refresh
+                 # would race the build under test.
+                 ["config", "core.hooksPath", str(repo / ".githooks-disabled")],
+                 ["add", "-A"],
                  ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "f"]):
         subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
     with pytest.MonkeyPatch.context() as patch:
@@ -175,7 +248,7 @@ def synthetic(tmp_path: Path):
     edge("FORWARDS_TO", f"{BEAN}.view", PAGE, BEAN_FILE)
     edge("BINDS", PAGE, f"{BEAN}.setInvoiceId", PAGE)
     edge("USES_STYLE", PAGE, f"{CSS}::invoice-total", PAGE)
-    edge("MAPS_TO", ENTITY, "table:invoices", ENTITY_FILE)
+    edge("MAPS_TO", ENTITY, "table::invoices", ENTITY_FILE)
     store.commit()
     yield store, Path("/repo")
     store.close()
@@ -191,7 +264,7 @@ def synthetic(tmp_path: Path):
     ("binds_to", f"{BEAN}.setInvoiceId", {"invoice.jsp"}, "incoming"),
     ("styles_of", PAGE, {"invoice.css::invoice-total"}, "outgoing"),
     ("styles_of", CSS, {"invoice.jsp"}, "incoming"),
-    ("maps_to", ENTITY, {"table:invoices"}, "outgoing"),
+    ("maps_to", ENTITY, {"table::invoices"}, "outgoing"),
 ])
 def test_synthetic_cross_stack_edges(synthetic, pattern, target, expected, direction):
     result = query_graph(pattern, target, _store=synthetic)

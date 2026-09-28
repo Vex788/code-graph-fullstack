@@ -52,8 +52,35 @@ Covers fs.5 and fs.6. **Run `code-review-graph build` once after upgrading.**
 ### Fullstack
 - Kind registry (`kinds.py`) generates `docs/spec/EDGES.md` and the VS Code kinds.
 - JSP resolver re-reads only changed pages; web-file changes are risk-scored
-  through their cross-stack links. FORWARDS_TO, HANDLES_EVENT, BINDS, USES_STYLE,
-  MAPS_TO and jQuery REQUESTS are registered but not produced yet.
+  through their cross-stack links.
+- W5a resolvers produce every registered cross-stack kind on the Stripes
+  fixture; the golden graph (101 rows) passes with no xfails left:
+  - New Stripes resolver: one Endpoint node per `@UrlBinding` bean (with
+    `extra.route` and `handler_qualified`), HANDLES from `@HandlesEvent`/
+    `@DefaultHandler` methods, FORWARDS_TO from `ForwardResolution` /
+    `RedirectResolution` to the page file, bean class or route endpoint.
+  - New Hibernate resolver: Table nodes (`table::<name>`) with MAPS_TO from
+    `@Table` entity classes and `*.hbm.xml` mapping files.
+  - JSP resolver: BINDS from form fields to bean setters, USES_STYLE from
+    `class=` values to selectors defined in the page's stylesheet closure
+    (include graph, both directions), REQUESTS from jQuery
+    `$.get/$.post/$.getJSON` first arguments, `jsp:forward` targets and
+    anchor/form links that name a route.
+  - First-party page trees under a root-level `vendor/` directory are no
+    longer dropped as third-party: the vendor exclusion is root-anchored
+    (composer/Go convention), not any-depth.
+  - Default `dead_url_suffixes` is now `()` (was `(".action",)`): no URL
+    suffix is treated as a dead routing artifact by default. Both `.action`
+    (Stripes) and `.xhtml` (Faces-style, e.g. 277 of pms's 278 `@UrlBinding`
+    routes) are live routes in real repositories, so any hardcoded default
+    hides live endpoints; repositories whose suffixes really are artifacts
+    override the key. Regression-tested with the pms shape.
+  - HANDLES_EVENT was removed from the registry unused: Stripes handlers
+    reuse HANDLES against their bean's Endpoint node.
+- Benchmark and witness fixture repositories disable git hooks
+  (`core.hooksPath` -> a nonexistent path): a machine-level global
+  post-commit hook that refreshes a graph in the background raced the
+  one-file update the stage-timing benchmark measures.
 
 ### Search and embeddings
 - Tracked `.code-review-graph.toml`; profiles `fast`, `balanced`, `accurate`,
