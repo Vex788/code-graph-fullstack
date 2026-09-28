@@ -2901,6 +2901,29 @@ def _create_watch_handler(
             self.failure: BaseException | None = None
             self.last_event_at: float | None = None
             self.events_seen: int = 0
+            self._batch_store: GraphStore | None = None
+
+        def _batch_connection(self) -> GraphStore:
+            """A connection owned by the thread that runs the batches.
+
+            The caller keeps using ``store`` on its own thread while a batch
+            runs, and one sqlite3 connection is not safe across threads
+            (``check_same_thread=False`` only lifts the check): concurrent
+            ``execute`` on the shared statement cache ends in
+            ``sqlite3.InterfaceError: bad parameter or other API misuse``.
+            WAL lets the owner's reads proceed during batch writes.
+            """
+            if self._batch_store is None:
+                if str(store.db_path) in ("", ":memory:"):
+                    self._batch_store = store
+                else:
+                    self._batch_store = GraphStore(store.db_path)
+            return self._batch_store
+
+        def close(self) -> None:
+            if self._batch_store is not None and self._batch_store is not store:
+                self._batch_store.close()
+            self._batch_store = None
 
         def _relative_path(self, path: str) -> str | None:
             candidate = Path(os.path.abspath(path))
@@ -2932,7 +2955,7 @@ def _create_watch_handler(
             directory = normalize_file_path(repo_root / relative_directory) + "/"
             return {
                 str(Path(file_path).relative_to(repo_root))
-                for file_path in store.get_all_files()
+                for file_path in self._batch_connection().get_all_files()
                 if file_path.startswith(directory)
             }
 
@@ -2997,15 +3020,16 @@ def _create_watch_handler(
                 )
                 if not changed_files:
                     return
+                batch_store = self._batch_connection()
                 result = incremental_update(
                     repo_root,
-                    store,
+                    batch_store,
                     changed_files=changed_files,
                     reconcile_stale=False,
                 )
                 _raise_watch_update_errors(result, "incremental update")
                 if result["files_updated"] > 0 and on_files_updated is not None:
-                    postprocess_result = on_files_updated(store)
+                    postprocess_result = on_files_updated(batch_store)
                     _raise_watch_postprocess_warnings(postprocess_result)
             except BaseException as exc:
                 self.failure = exc
@@ -3031,6 +3055,7 @@ def _create_watch_handler(
         def stop(self) -> None:
             debouncer.stop()
             debouncer.join()
+            processor.close()
 
         def process(self, events: list[FileSystemEvent]) -> None:
             processor.process(events)

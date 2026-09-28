@@ -6,6 +6,7 @@ nothing would ever report such a change until the file is touched again.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -83,3 +84,58 @@ def test_file_edited_during_startup_is_reindexed(tmp_path: Path) -> None:
         assert "app_renamed" in _names(store, app)
     finally:
         store.close()
+
+
+def test_owner_reads_during_a_watch_batch_do_not_corrupt_the_store(tmp_path: Path) -> None:
+    """The owning thread may use its store while a watch batch runs.
+
+    Batches are processed on the debouncer thread, and the owner keeps
+    reading meanwhile — the polling in ``wait_for_index`` above is exactly
+    such a read, and on CI (run 36374365209) it died with
+    ``sqlite3.InterfaceError: bad parameter or other API misuse`` because
+    both threads drove one connection.  So the batch must never touch the
+    owner's connection; this pins that seam directly: every statement on
+    the owner's connection is recorded, and none may come from another
+    thread.
+    """
+    (tmp_path / "src").mkdir()
+    app = tmp_path / "src" / "app.py"
+    app.write_text("def app():\n    return 1\n", encoding="utf-8")
+    store = GraphStore(tmp_path / "graph.db")
+    late = tmp_path / "src" / "newpkg" / "late.py"
+
+    class SpyConnection:
+        """Forward everything, record which thread executes statements."""
+
+        def __init__(self, conn: object) -> None:
+            self._inner = conn
+            self.executed_by: list[threading.Thread] = []
+
+        def execute(self, sql: str, parameters: object = ()) -> object:
+            self.executed_by.append(threading.current_thread())
+            return self._inner.execute(sql, parameters)  # type: ignore[attr-defined]
+
+        def executemany(self, sql: str, seq: object) -> object:
+            self.executed_by.append(threading.current_thread())
+            return self._inner.executemany(sql, seq)  # type: ignore[attr-defined]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    spy = SpyConnection(store._conn)
+    store._conn = spy
+    owner = threading.current_thread()
+
+    def during_window():
+        late.parent.mkdir()
+        late.write_text("def late_handler():\n    return 2\n", encoding="utf-8")
+
+    _run_watch(tmp_path, store, during_window, lambda: _names(store, late))
+
+    foreign = [thread for thread in spy.executed_by if thread is not owner]
+    assert not foreign, (
+        f"{len(foreign)} statements ran on the owner's connection from "
+        f"another thread ({foreign[0].name}); that is the "
+        f"sqlite3.InterfaceError race"
+    )
+    assert "late_handler" in _names(store, late)

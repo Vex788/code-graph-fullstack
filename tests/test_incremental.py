@@ -1653,7 +1653,12 @@ class TestWatchReconciliation:
 
             handler.process([FileDeletedEvent(str(source))])
 
-            callback.assert_called_once_with(store)
+            # The batch (and the callback with it) runs on the debouncer
+            # thread's own connection — never on the caller's, which the
+            # caller may read concurrently.
+            callback.assert_called_once()
+            (batch_store,) = callback.call_args[0]
+            assert str(batch_store.db_path) == str(store.db_path)
             assert store.get_nodes_by_file(str(source)) == []
         finally:
             store.close()
