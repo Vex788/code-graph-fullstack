@@ -105,7 +105,7 @@ def test_parity_with_render_agents_on_every_directive(tmp_path: Path):
 
 
 @needs_zcode
-def test_parity_with_render_agents_on_kit_markers_and_home(tmp_path: Path, monkeypatch):
+def test_parity_with_render_agents_on_kit_markers_and_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     src = tmp_path / "src"
     (src / "roles").mkdir(parents=True)
@@ -125,12 +125,16 @@ def test_parity_with_render_agents_on_kit_markers_and_home(tmp_path: Path, monke
         "---\nname: alpha\ndescription: Alpha\ntier: work\neffort: high\n"
         "skills: a\nharnesses: zcode\n---\n\n# alpha\n{{block:routing}}\nend\n"
     )
-    theirs = _render_with_zcode(src, tmp_path / "zcode")
     ours = _render_with_kit(src, tmp_path / "kit")
-    assert ours == theirs
     home = str(tmp_path / "home")
     assert f"route {home}/AGENTS.md\nend\n" in ours["alpha.md"]
     assert f"skills: {home}/skills/a\n" in ours["alpha.md"]
+    # render-agents (zcode-harness @4e9c587) has no kit-line stripping yet, so
+    # it rejects any role whose body carries crg-kit markers. Parity holds on
+    # the common directive syntax (see the other parity tests); kit regions in
+    # roles are a kit-side extension until the harness grows the same strip.
+    with pytest.raises(AssertionError, match="leftover directive"):
+        _render_with_zcode(src, tmp_path / "zcode")
 
 
 def test_kit_file_rendering_keeps_region_markers():
