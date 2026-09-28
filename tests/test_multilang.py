@@ -992,6 +992,8 @@ class TestCSharpReceiverCallResolution:
         for name, content in files.items():
             (tmp_path / name).write_text(content, encoding="utf-8")
         store = GraphStore(tmp_path / ".code-review-graph" / "graph.db")
+        self._opened_stores = getattr(self, "_opened_stores", [])
+        self._opened_stores.append(store)
         with patch(
             "code_review_graph.incremental.get_all_tracked_files",
             return_value=sorted(files),
@@ -3139,6 +3141,12 @@ class TestRescriptEdgeCases:
 
 
 class TestRescriptCrossModuleResolver:
+
+    def teardown_method(self):
+        """Close stores _build opened; the tests only read after building."""
+        for store in getattr(self, "_opened_stores", []):
+            store.close()
+
     """Integration test for the cross-module resolver post-pass."""
 
     def _build(self, tmp_path):
@@ -3169,6 +3177,8 @@ class TestRescriptCrossModuleResolver:
         )
 
         store = GraphStore(tmp_path / "graph.db")
+        self._opened_stores = getattr(self, "_opened_stores", [])
+        self._opened_stores.append(store)
         result = full_build(tmp_path, store)
         return store, result
 
@@ -3436,6 +3446,12 @@ class TestSpringDIParsing:
 
 
 class TestSpringDIResolver:
+
+    def teardown_method(self):
+        """Close stores _build opened; the tests only read after building."""
+        for store in getattr(self, "_opened_stores", []):
+            store.close()
+
     """Integration tests for the Spring DI post-build resolver."""
 
     def _build(self, tmp_path):
@@ -3577,6 +3593,12 @@ class TestTemporalParsing:
 
 
 class TestTemporalResolver:
+
+    def teardown_method(self):
+        """Close stores _build opened; the tests only read after building."""
+        for store in getattr(self, "_opened_stores", []):
+            store.close()
+
     """Integration tests for the Temporal post-build call resolver."""
 
     def _build(self, tmp_path):
@@ -3613,6 +3635,8 @@ class TestTemporalResolver:
         from code_review_graph.incremental import full_build
 
         store = GraphStore(str(tmp_path / "graph.db"))
+        self._opened_stores = getattr(self, "_opened_stores", [])
+        self._opened_stores.append(store)
         result = full_build(tmp_path, store)
         return store, result
 

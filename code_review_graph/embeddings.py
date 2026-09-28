@@ -19,6 +19,7 @@ float16; older float32 rows are still read.
 from __future__ import annotations
 
 import collections
+import contextlib
 import hashlib
 import logging
 import os
@@ -2017,7 +2018,9 @@ def open_search_store(
             return None, info
         store = None
         try:
-            with sqlite3.connect(str(db_path), timeout=5) as conn:
+            # ``closing`` (not ``with`` alone): a sqlite3 connection used as a
+            # context manager only commits, it never closes the handle.
+            with contextlib.closing(sqlite3.connect(str(db_path), timeout=5)) as conn:
                 parity = mlx_parity_for(conn, _mlx_model(settings))
         except sqlite3.Error:
             parity = None
