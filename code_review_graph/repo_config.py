@@ -17,7 +17,7 @@ A repo overrides the defaults by dropping
     route_annotations = ["UrlBinding", "RequestMapping"]
     bean_attribute = "beanclass"
     bean_package_prefix = "com."
-    dead_url_suffixes = [".action"]
+    dead_url_suffixes = [".xhtml"]
     context_paths = ["/myapp"]
 
 Sits beside the ``languages.toml`` loader in :mod:`custom_languages` and
@@ -65,7 +65,11 @@ class JspResolverConfig:
     route_annotations: tuple[str, ...] = ("UrlBinding", "RequestMapping")
     bean_attribute: str = "beanclass"
     bean_package_prefix: str = "com."
-    dead_url_suffixes: tuple[str, ...] = (".action",)
+    # Framework routing suffixes that are an artifact of the front controller,
+    # not part of the route. ".action" cannot live here: the default
+    # route_annotations already include Stripes @UrlBinding, whose routes
+    # end in ".action" — dropping it would hide exactly those routes.
+    dead_url_suffixes: tuple[str, ...] = (".xhtml", ".faces", ".do")
     # Leading URL path segments that are a servlet context path, not a disk
     # directory: "/myapp/css/x.css" probes "<web_root>/css/x.css" after the
     # plain "<web_root>/myapp/css/x.css" probe misses.

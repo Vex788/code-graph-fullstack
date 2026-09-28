@@ -284,6 +284,8 @@ def test_enabled_false_returns_zero_stats_and_preserves_existing_edges():
                 "requests": 0,
                 "includes": 0,
                 "references": 0,
+                "binds": 0,
+                "styles": 0,
                 "unresolved_references": 0,
                 "unresolved_targets": 0,
             }

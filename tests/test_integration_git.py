@@ -1080,7 +1080,8 @@ def test_full_build_binds_parser_output_into_resolver_edges(tmp_path: Path) -> N
                 "SELECT qualified_name, extra FROM nodes WHERE kind = 'Endpoint'"
             ).fetchall()
         }
-        assert len(endpoints) == 2  # GET and POST /api/items
+        # GET and POST /api/items, plus the Stripes @UrlBinding("/home") bean.
+        assert len(endpoints) == 3
         get_qn = next(qn for qn, extra in endpoints.items() if '"GET"' in extra)
         assert '"route": "/api/items"' in endpoints[get_qn]
 
@@ -1094,10 +1095,14 @@ def test_full_build_binds_parser_output_into_resolver_edges(tmp_path: Path) -> N
                     return json.loads(row["extra"])
             raise AssertionError(f"missing {kind} edge {source} -> {target}")
 
-        # @UrlBinding-style class binding, reached from the form action.
-        assert _extra_of("REQUESTS", index_qn, bean_qn) == {
-            "fqn": "com.example.HomeActionBean",
-            "resolution": "class",
+        # @UrlBinding-style binding, reached from the form action: the
+        # Stripes resolver's Endpoint node wins over the class fallback.
+        home_endpoint_qn = next(
+            qn for qn, extra in endpoints.items()
+            if '"UrlBinding"' in extra and '"/home"' in extra
+        )
+        assert _extra_of("REQUESTS", index_qn, home_endpoint_qn) == {
+            "resolution": "endpoint",
             "route": "/home",
             "url": "/home",
         }

@@ -1,9 +1,12 @@
 """Golden graph for the fullstack Stripes fixture (``expected_edges.tsv``).
 
-``now`` rows describe edges the current code already produces correctly and
-must keep producing. Each ``target`` kind is one xfail(strict) test: when the
-wave that adds those edges lands, the test XPASSes, fails the suite, and the
-fixer removes its entry from ``_TARGET_REASONS``.
+``now`` rows describe edges the current code produces and must keep
+producing — the fullstack resolvers (Stripes actions, Hibernate mappings and
+the extended JSP linker) all feed these, so a regression in any of them
+fails here.
+
+Every row carries an executed derivation: none is aspirational any more, so
+there is no xfail scaffolding left to maintain.
 """
 
 from __future__ import annotations
@@ -16,17 +19,7 @@ import pytest
 from ._golden import GraphEdges, load_rows
 from .conftest import FIXTURE_SRC, GOLDEN_TSV, open_store
 
-_TARGET_REASONS = {
-    "HANDLES": "W5a: @HandlesEvent/@DefaultHandler bind to the @UrlBinding endpoint",
-    "FORWARDS_TO": "W5a: ForwardResolution/RedirectResolution edges",
-    "REQUESTS": "W5a: jQuery $.get/$.post/$.getJSON, ctx + '/...', and .action links",
-    "RENDERS": "W5a: jsp resolver skips first-party pages under a vendor/ directory",
-    "INCLUDES": "W5a: jsp resolver skips first-party pages under a vendor/ directory",
-    "REFERENCES": "W5a: jsp resolver skips first-party pages under a vendor/ directory",
-    "BINDS": "W5a: form name= binds to the ActionBean property",
-    "USES_STYLE": "W5a: class= links to the CSS selector",
-    "MAPS_TO": "W5a: @Entity/@Table and *.hbm.xml map to Table nodes",
-}
+_TARGET_REASONS: dict[str, str] = {}
 
 ROWS = load_rows(GOLDEN_TSV)
 TARGET_KINDS = sorted({row.kind for row in ROWS if row.status == "target"})

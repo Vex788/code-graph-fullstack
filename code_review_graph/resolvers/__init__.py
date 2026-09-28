@@ -24,7 +24,9 @@ from ..rescript_resolver import resolve_rescript_cross_module
 from ..scoped_resolver import resolve_scoped_calls
 from ..spring_resolver import resolve_spring_di_calls
 from ..temporal_resolver import resolve_temporal_calls
+from .hibernate import resolve_hibernate_mappings
 from .jsp import resolve_jsp_links
+from .stripes import resolve_stripes_actions
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,20 @@ RESOLVERS: dict[str, tuple[Resolver, str, frozenset[str]]] = {
         resolve_temporal_calls,
         "Temporal resolver",
         frozenset({"java"}),
+    ),
+    # Stripes endpoints must exist before the JSP linker binds page links to
+    # routes, and Hibernate tables before entity pages are traversed; both
+    # sit ahead of "jsp" in every build.
+    "stripes": (
+        resolve_stripes_actions,
+        "Stripes action resolver",
+        # FORWARDS_TO binds to jsp File nodes, so page deletions reconcile it.
+        frozenset({"java", "jsp"}),
+    ),
+    "hibernate": (
+        resolve_hibernate_mappings,
+        "Hibernate mapping resolver",
+        frozenset({"java", "xml"}),
     ),
     "jsp": (
         resolve_jsp_links,
