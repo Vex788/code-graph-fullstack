@@ -57,6 +57,8 @@ class ReadinessFacts:
     git_state: str = GIT_OK
     head_commit: Optional[str] = None
     built_at_commit: Optional[str] = None
+    # The last write could not capture HEAD, so the anchor may predate it.
+    git_capture_failed: bool = False
     # No missing or deleted indexed files; edits don't count. None: not checked.
     source_matches: Optional[bool] = None
     embeddings_enabled: bool = False
@@ -131,6 +133,7 @@ def compute_readiness(facts: ReadinessFacts) -> Readiness:
         (ReadinessStatus.PARTIAL_INDEX, "failed_files", facts.failed_files > 0),
         (ReadinessStatus.PARTIAL_INDEX, "resolver_failures", facts.resolver_failures > 0),
         (ReadinessStatus.STALE_GRAPH, "git_unavailable", facts.git_state == GIT_UNAVAILABLE),
+        (ReadinessStatus.STALE_GRAPH, "git_capture_failed", facts.git_capture_failed),
         (ReadinessStatus.STALE_GRAPH, "head_moved",
          facts.git_state == GIT_OK and not head_matches(facts)),
         (ReadinessStatus.STALE_WORKTREE, "worktree_changed", facts.source_matches is not True),

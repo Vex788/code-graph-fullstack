@@ -207,6 +207,13 @@ def stamp_write_epoch(
             if vcs.revision:
                 # The build anchor readiness compares with HEAD.
                 store.set_metadata("git_head_sha", vcs.revision)
+                store.delete_metadata("git_capture_failed")
+            else:
+                # git could not report HEAD when this write started: keeping the
+                # previous anchor would look fresh while being wrong. Flag the
+                # capture failure so readiness stays stale until a later update
+                # restamps the real anchor.
+                store.set_metadata("git_capture_failed", "1")
             if vcs.dirty is None:
                 # Without a snapshot the drift check reports "unavailable".
                 store.delete_metadata("indexed_dirty_paths")
@@ -1047,37 +1054,34 @@ _GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds, configurabl
 _RECURSE_SUBMODULES = os.environ.get("CRG_RECURSE_SUBMODULES", "").lower() in ("1", "true", "yes")
 
 
+def _git_output(repo_root: Path, args: list[str]) -> str | None:
+    """One ``git`` call; a single retry at double timeout on any failure.
+
+    Anchor and base capture run while builds hammer the repository, so a
+    timeout or a busy exit must not be read as definitive knowledge.
+    """
+    for timeout in (_GIT_TIMEOUT, _GIT_TIMEOUT * 2):
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                cwd=str(repo_root),
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
+            continue
+        if result.returncode == 0:
+            return result.stdout.strip()
+    return None
+
+
 def _git_branch_info(repo_root: Path) -> tuple[str, str]:
-    """Return (branch_name, head_sha) for the current repo state."""
-    branch = ""
-    sha = ""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            branch = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
-        pass
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            sha = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
-        pass
-    return branch, sha
+    """Return (branch_name, head_sha); empty strings only when git failed."""
+    branch = _git_output(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    sha = _git_output(repo_root, ["rev-parse", "HEAD"])
+    return branch or "", sha or ""
 
 
 def _svn_revision_info(repo_root: Path) -> tuple[str, str]:
@@ -1149,17 +1153,7 @@ def _commit_object_exists(repo_root: Path, ref: str) -> bool:
     """
     if not ref or ref.startswith("-") or not _SAFE_GIT_REF.fullmatch(ref):
         return False
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-            capture_output=True,
-            cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    return _git_output(repo_root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"]) is not None
 
 
 def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None:
@@ -1188,45 +1182,68 @@ def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None
     return None
 
 
-def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
-    """Get list of changed files via git diff or svn status.
+def _git_diff_output(repo_root: Path, args: list[str]) -> bytes | None:
+    """``git diff`` stdout, or None when git could not answer after one retry."""
+    for timeout in (_GIT_TIMEOUT, _GIT_TIMEOUT * 2):
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                capture_output=True,
+                cwd=str(repo_root),
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            return result.stdout
+    return None
 
-    For SVN working copies the *base* parameter is ignored; modified/added/
-    deleted files are detected from ``svn status``.  Pass an SVN revision
-    range (e.g. ``"r100:HEAD"``) as *base* to compare against a specific
-    revision instead.
+
+def get_changed_files_strict(repo_root: Path, base: str = "HEAD~1") -> Optional[list[str]]:
+    """Changed files; ``None`` when git could not answer (``[]`` means none).
+
+    Callers that treat the result as knowledge must distinguish the two: a
+    failed discovery read as an empty diff once made updates exit "up to date"
+    without stamping the anchor, freezing the receipt on a stale graph.
     """
+    is_git = detect_vcs(repo_root) == "git"
     if detect_vcs(repo_root) == "svn":
         return _get_svn_changed_files(repo_root, base if _SAFE_SVN_REV.match(base) else None)
     # Git path
     if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
         logger.warning("Invalid git ref rejected: %s", base)
         return []
-    try:
-        # --name-status (not --name-only): renames/copies must report BOTH
-        # paths, or the old path never reaches the purge loop (issue #684).
-        result = subprocess.run(
-            ["git", "diff", "--name-status", "-z", base, "--"],
-            capture_output=True,
-            cwd=str(repo_root),
-            timeout=_GIT_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-        if result.returncode != 0:
-            # Fallback: try diff against empty tree (initial commit)
-            result = subprocess.run(
-                ["git", "diff", "--name-status", "-z", "--cached"],
-                capture_output=True,
-                cwd=str(repo_root),
-                timeout=_GIT_TIMEOUT,
-                stdin=subprocess.DEVNULL,
-            )
-        if result.returncode != 0:
-            logger.warning("git diff failed while discovering changed files")
+    # --name-status (not --name-only): renames/copies must report BOTH
+    # paths, or the old path never reaches the purge loop (issue #684).
+    output = _git_diff_output(repo_root, ["diff", "--name-status", "-z", base, "--"])
+    if output is None:
+        # Fallback: try diff against empty tree (initial commit)
+        output = _git_diff_output(repo_root, ["diff", "--name-status", "-z", "--cached"])
+    if output is None:
+        if not is_git or _git_output(repo_root, ["rev-parse", "--git-dir"]) is None:
+            # Either no VCS marker at all, or git itself cannot run here
+            # (an empty .git marker directory, a broken checkout): the failed
+            # diff is expected, and there is no diff to discover.
             return []
-        return _decode_name_status_paths(result.stdout)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+        logger.warning("git diff failed while discovering changed files")
+        return None
+    return _decode_name_status_paths(output)
+
+
+def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
+    """Get list of changed files via git diff or svn status.
+
+    Legacy wrapper: a failed discovery reads as an empty list. New callers
+    that must know the difference use :func:`get_changed_files_strict`.
+
+    For SVN working copies the *base* parameter is ignored; modified/added/
+    deleted files are detected from ``svn status``.  Pass an SVN revision
+    range (e.g. ``"r100:HEAD"``) as *base* to compare against a specific
+    revision instead.
+    """
+    strict = get_changed_files_strict(repo_root, base)
+    return strict if strict is not None else []
 
 def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
     """Return changed files in an SVN working copy.
@@ -2059,11 +2076,26 @@ def _incremental_update_journaled(
             stored_cache.append(store.get_all_files())
         return stored_cache[0]
 
-    # Determine changed files
+    # Determine changed files. A failed discovery is not an empty diff: one
+    # retry for a busy git, then give up without writing, or the anchor stays
+    # un-stamped and the graph reports stale forever while updates exit "ok".
     auto_discovery = changed_files is None
-    changed: list[str] = (
-        get_changed_files(repo_root, base) if changed_files is None else list(changed_files)
+    discovered: Optional[list[str]] = (
+        get_changed_files_strict(repo_root, base) if changed_files is None else list(changed_files)
     )
+    if discovered is None:
+        discovered = get_changed_files_strict(repo_root, base)
+    if discovered is None:
+        return {
+            **_noop_update_result([]),
+            "status": "error",
+            "reason": "git_diff_failed",
+            "summary": (
+                "git diff failed while discovering changed files; nothing was "
+                "written and the graph was left as-is. Retry when git is healthy."
+            ),
+        }
+    changed: list[str] = discovered
     # A changed ignore policy is invisible to a diff: files it newly admits were
     # never in the graph and never appear in `git diff`, so without this they
     # stay missing until a full rebuild. Comparison happens before any inventory
@@ -2121,9 +2153,19 @@ def _incremental_update_journaled(
     changed = changed + retried
     retry_resolvers = [name for name in RESOLVERS if name in resolver_failures]
 
+    # An empty diff does not prove the anchor is current: the previous write
+    # may have failed to capture HEAD (flagged), leaving a graph whose content
+    # is right but whose freshness answer is a permanent lie. Both still need
+    # a stamping write, so neither may take the no-op exit below.
+    head_now = _git_output(repo_root, ["rev-parse", "HEAD"]) if auto_discovery else None
+    anchor_stale = store.get_metadata("git_capture_failed") == "1" or bool(
+        head_now and base != head_now
+    )
+
     if (
         not changed and not stale_files and not vanished
         and not recovering and not retry_resolvers
+        and not anchor_stale
     ):
         if policy_changed:
             # Nothing was added and nothing removed, so the new policy really

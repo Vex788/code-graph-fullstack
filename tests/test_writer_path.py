@@ -442,3 +442,106 @@ def test_sigkill_at_any_stage_never_reads_ok(repo: Path, stage: str, command: st
     assert recovered.returncode == 0, recovered.stdout + recovered.stderr
     assert compute_readiness(gather_facts(repo, db)).status.value == "ok"
     assert _fts_integrity_error(db) is None
+
+
+# ---------------------------------------------------------------------------
+# Anchor capture: a failed capture must never read as fresh
+# ---------------------------------------------------------------------------
+
+
+def _set_meta(repo: Path, key: str, value: str) -> None:
+    conn = sqlite3.connect(get_db_path(repo))
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", (key, value)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _head(repo: Path) -> str:
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_update_after_commit_restamps_anchor(repo: Path):
+    build(repo)
+
+    _append_method(repo, USER_SERVICE, "anchorProbe")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "move head")
+
+    result = build(repo, full=False)
+    meta = _meta(repo)
+
+    assert result["status"] == "ok", result
+    assert meta["git_head_sha"] == _head(repo)
+    assert "git_capture_failed" not in meta
+    assert compute_readiness(gather_facts(repo, get_db_path(repo))).status.value == "ok"
+
+
+def test_failed_capture_keeps_old_anchor_and_flags(repo: Path):
+    build(repo)
+    _append_method(repo, USER_SERVICE, "captureProbe")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "move head")
+    stale_anchor = _meta(repo)["git_head_sha"]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(incremental, "_git_branch_info", lambda root: ("", ""))
+        result = build(repo, full=False)
+    meta = _meta(repo)
+
+    assert result["status"] == "ok", result
+    assert meta["git_head_sha"] == stale_anchor  # not silently kept looking fresh
+    assert meta["git_capture_failed"] == "1"
+    readiness = compute_readiness(gather_facts(repo, get_db_path(repo)))
+    assert readiness.status.value == "stale_graph"
+    assert {"git_capture_failed", "head_moved"} <= set(readiness.reasons)
+
+    # Healthy git on the next update restamps and clears the flag.
+    recovered = build(repo, full=False)
+    meta = _meta(repo)
+    assert recovered["status"] == "ok", recovered
+    assert meta["git_head_sha"] == _head(repo)
+    assert "git_capture_failed" not in meta
+
+
+def test_capture_flag_forces_restamp_on_clean_diff(repo: Path):
+    """Flagged graph, clean tree: the no-op exit must not keep the flag."""
+    build(repo)
+    _set_meta(repo, "git_capture_failed", "1")
+
+    result = build(repo, full=False)
+    meta = _meta(repo)
+
+    assert result["status"] == "ok", result
+    assert "No changes detected" not in result.get("summary", "")
+    assert "git_capture_failed" not in meta
+    assert meta["git_head_sha"] == _head(repo)
+
+
+def test_git_diff_failure_is_an_error_not_up_to_date(repo: Path, monkeypatch):
+    build(repo)
+    anchor = _meta(repo)["git_head_sha"]
+    _append_method(repo, USER_SERVICE, "diffProbe")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "move head")
+
+    monkeypatch.setattr(incremental, "_git_diff_output", lambda *args, **kwargs: None)
+    result = build(repo, full=False)
+
+    assert result["status"] == "error", result
+    assert result["reason"] == "git_diff_failed"
+    assert "No changes detected" not in result.get("summary", "")
+    assert _meta(repo)["git_head_sha"] == anchor  # untouched, honestly stale
+
+
+def test_changed_files_strict_separates_failure_from_empty(repo: Path, monkeypatch):
+    from code_review_graph.incremental import get_changed_files, get_changed_files_strict
+
+    assert get_changed_files_strict(repo, "HEAD~1") == []  # healthy git, empty diff
+
+    monkeypatch.setattr(incremental, "_git_diff_output", lambda *args, **kwargs: None)
+    assert get_changed_files_strict(repo, "HEAD~1") is None  # git failed
+    assert get_changed_files(repo, "HEAD~1") == []  # legacy wrapper keeps its shape

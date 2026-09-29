@@ -43,6 +43,7 @@ _META_KEYS = (
     "built_at_commit",
     "git_head_sha",
     "git_branch",
+    "git_capture_failed",
     "last_updated",
 )
 
@@ -270,6 +271,7 @@ def gather_report(
         git_state=git_state,
         head_commit=head,
         built_at_commit=meta.get("built_at_commit") or meta.get("git_head_sha"),
+        git_capture_failed=meta.get("git_capture_failed") == "1",
         source_matches=source_matches,
         embeddings_enabled=embeddings[0],
         embeddings_provider_available=embeddings[1],

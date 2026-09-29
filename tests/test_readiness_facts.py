@@ -108,6 +108,19 @@ def test_built_at_commit_key_wins_over_legacy_sha(tmp_path):
     assert facts.built_at_commit == "f" * 40
 
 
+def test_capture_failure_flag_is_stale_even_with_matching_head(tmp_path):
+    """A write that could not capture HEAD never reads as fresh."""
+    from code_review_graph.readiness import compute_readiness
+
+    repo, db = _repo(tmp_path, {"git_capture_failed": "1"})
+    facts = _gather(repo, db)
+    assert facts.git_capture_failed is True
+    assert facts.head_commit == facts.built_at_commit  # anchor happens to match
+    readiness = compute_readiness(facts)
+    assert readiness.status.value == "stale_graph"
+    assert "git_capture_failed" in readiness.reasons
+
+
 def test_untracked_file_is_not_a_source_match(tmp_path):
     repo, db = _repo(tmp_path)
     (repo / "new.py").write_text("def fresh():\n    pass\n", encoding="utf-8")
