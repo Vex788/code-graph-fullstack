@@ -1,7 +1,7 @@
 {
   "contract_version": "1.0.0-rc1",
   "compat_epoch": 1,
-  "fork_version": "2.3.8+fs.6",
+  "fork_version": "2.3.8+fs.7",
   "schema_version": 10,
   "reader_compat": 9,
   "min_writer_version": 10,
