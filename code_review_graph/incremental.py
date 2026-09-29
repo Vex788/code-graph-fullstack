@@ -201,13 +201,16 @@ def stamp_write_epoch(
         store.set_metadata("last_updated", started_at)
         store.set_metadata("last_build_type", build_type)
         store.set_metadata(_IGNORE_POLICY_METADATA_KEY, ignore_policy)
+        # Cleared unconditionally: a flag left by a repo that stopped being a
+        # git checkout would keep readiness stale forever (nothing git-path
+        # would ever clear it), and the flag means nothing for svn/none.
+        store.delete_metadata("git_capture_failed")
         if vcs.vcs == "git":
             if vcs.branch:
                 store.set_metadata("git_branch", vcs.branch)
             if vcs.revision:
                 # The build anchor readiness compares with HEAD.
                 store.set_metadata("git_head_sha", vcs.revision)
-                store.delete_metadata("git_capture_failed")
             else:
                 # git could not report HEAD when this write started: keeping the
                 # previous anchor would look fresh while being wrong. Flag the
@@ -1207,8 +1210,9 @@ def get_changed_files_strict(repo_root: Path, base: str = "HEAD~1") -> Optional[
     failed discovery read as an empty diff once made updates exit "up to date"
     without stamping the anchor, freezing the receipt on a stale graph.
     """
-    is_git = detect_vcs(repo_root) == "git"
-    if detect_vcs(repo_root) == "svn":
+    vcs_kind = detect_vcs(repo_root)
+    is_git = vcs_kind == "git"
+    if vcs_kind == "svn":
         return _get_svn_changed_files(repo_root, base if _SAFE_SVN_REV.match(base) else None)
     # Git path
     if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
@@ -2076,15 +2080,14 @@ def _incremental_update_journaled(
             stored_cache.append(store.get_all_files())
         return stored_cache[0]
 
-    # Determine changed files. A failed discovery is not an empty diff: one
-    # retry for a busy git, then give up without writing, or the anchor stays
-    # un-stamped and the graph reports stale forever while updates exit "ok".
+    # Determine changed files. A failed discovery is not an empty diff: strict
+    # already retries internally, so a second failure gives up without
+    # writing, or the anchor stays un-stamped and the graph reports stale
+    # forever while updates exit "ok".
     auto_discovery = changed_files is None
     discovered: Optional[list[str]] = (
         get_changed_files_strict(repo_root, base) if changed_files is None else list(changed_files)
     )
-    if discovered is None:
-        discovered = get_changed_files_strict(repo_root, base)
     if discovered is None:
         return {
             **_noop_update_result([]),
@@ -2156,11 +2159,17 @@ def _incremental_update_journaled(
     # An empty diff does not prove the anchor is current: the previous write
     # may have failed to capture HEAD (flagged), leaving a graph whose content
     # is right but whose freshness answer is a permanent lie. Both still need
-    # a stamping write, so neither may take the no-op exit below.
+    # a stamping write, so neither may take the no-op exit below. The base is
+    # resolved to a commit first: a symbolic base ("main") that points at HEAD
+    # must not force a stamping write on every update.
     head_now = _git_output(repo_root, ["rev-parse", "HEAD"]) if auto_discovery else None
-    anchor_stale = store.get_metadata("git_capture_failed") == "1" or bool(
-        head_now and base != head_now
+    base_now = (
+        _git_output(repo_root, ["rev-parse", "--verify", f"{base}^{{commit}}"])
+        if head_now else None
     )
+    anchor_stale = (
+        detect_vcs(repo_root) == "git" and store.get_metadata("git_capture_failed") == "1"
+    ) or bool(head_now and base_now != head_now)
 
     if (
         not changed and not stale_files and not vanished

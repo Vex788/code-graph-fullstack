@@ -547,6 +547,9 @@ def selftest() -> dict:
     assert not moves_head("ls -la")
     assert git_command_roots("git -C /tmp/repo checkout main") == [Path("/tmp/repo")]
     assert git_command_roots("git --git-dir=/tmp/repo/.git status") == [Path("/tmp/repo")]
+    assert git_command_roots("git --git-dir /tmp/repo/.git status") == [Path("/tmp/repo")]
+    assert git_command_roots('git -C "/tmp/my repo" switch x') == [Path("/tmp/my repo")]
+    assert git_command_roots("git -C relative/repo switch x") == [Path("relative/repo")]
     assert git_command_roots("git -C /tmp/a -C /tmp/b switch x") == [
         Path("/tmp/a"), Path("/tmp/b")]
     assert git_command_roots("git -c core.pager=cat stash pop") == []

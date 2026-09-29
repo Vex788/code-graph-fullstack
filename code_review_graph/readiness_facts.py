@@ -271,7 +271,9 @@ def gather_report(
         git_state=git_state,
         head_commit=head,
         built_at_commit=meta.get("built_at_commit") or meta.get("git_head_sha"),
-        git_capture_failed=meta.get("git_capture_failed") == "1",
+        # The flag is a git-capture failure: for a non-git root (or one whose
+        # git cannot even be probed) it is inert leftovers, never staleness.
+        git_capture_failed=git_state == GIT_OK and meta.get("git_capture_failed") == "1",
         source_matches=source_matches,
         embeddings_enabled=embeddings[0],
         embeddings_provider_available=embeddings[1],

@@ -2250,7 +2250,11 @@ def main() -> None:
             nodes = result.get("total_nodes", 0)
             edges = result.get("total_edges", 0)
             if not args.quiet:
-                if result.get("build_type") == "full":
+                if result.get("status") == "error":
+                    # Discovery failed: the success-shaped line below would
+                    # read as "all good" while the graph was left as-is.
+                    print(result.get("summary") or "update failed", file=sys.stderr)
+                elif result.get("build_type") == "full":
                     # No usable incremental base (fresh/legacy graph, or the
                     # last-synced commit was lost to a rewrite/shallow clone),
                     # so the update fell back to a full rebuild.

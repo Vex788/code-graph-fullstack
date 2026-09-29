@@ -545,3 +545,36 @@ def test_changed_files_strict_separates_failure_from_empty(repo: Path, monkeypat
     monkeypatch.setattr(incremental, "_git_diff_output", lambda *args, **kwargs: None)
     assert get_changed_files_strict(repo, "HEAD~1") is None  # git failed
     assert get_changed_files(repo, "HEAD~1") == []  # legacy wrapper keeps its shape
+
+
+def test_capture_flag_is_inert_on_a_non_git_root(tmp_path: Path):
+    """A flag left by a repo that stopped being git never reads as stale."""
+    root = tmp_path / "plain"
+    root.mkdir()
+    (root / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    # The registered-root shape: a graph without any VCS marker.
+    (root / ".code-review-graph").mkdir()
+    build(root)
+    _set_meta(root, "git_capture_failed", "1")
+
+    result = build(root, full=False)
+    facts = gather_facts(root, get_db_path(root))
+
+    assert result["status"] == "ok", result
+    assert facts.git_capture_failed is False
+    readiness = compute_readiness(facts)
+    # A non-git root stays drift-unverifiable (pre-existing stale_worktree);
+    # the flag itself must contribute nothing.
+    assert "git_capture_failed" not in readiness.reasons
+    assert readiness.status.value != "stale_graph"
+
+
+def test_symbolic_base_at_head_keeps_the_noop_fast_path(repo: Path):
+    from code_review_graph.tools.build import build_or_update_graph
+
+    build(repo)
+
+    result = build_or_update_graph(repo_root=str(repo), base="HEAD", postprocess="none")
+
+    assert result["status"] == "ok", result
+    assert "No changes detected" in result["summary"]
