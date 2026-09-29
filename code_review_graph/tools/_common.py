@@ -6,6 +6,7 @@ import copy
 import logging
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -297,7 +298,7 @@ def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
         return None
     ttl = env_float("CRG_RECEIPT_TTL", _RECEIPT_TTL_DEFAULT_SECONDS)
     if ttl <= 0:
-        return _compute_graph_receipt(root, db_path)
+        return _healed_or_receipt(root, db_path, _compute_graph_receipt(root, db_path))
     try:
         key = _receipt_cache_key(root, db_path)
     except OSError:
@@ -311,6 +312,10 @@ def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
     receipt = _compute_graph_receipt(root, db_path)
     if receipt is None:
         return None
+    if _self_heal_eligible(receipt):
+        # The pre-heal receipt is not cached: the healed one, or the honest
+        # stale answer when the heal is debounced, locked out or fails.
+        return _run_self_heal(root, db_path) or receipt
     try:
         after = _receipt_cache_key(root, db_path)
     except OSError:
@@ -325,6 +330,14 @@ def graph_receipt(repo_root: str | None = None) -> dict[str, Any] | None:
 
 def _without_index(key: tuple[Any, ...]) -> tuple[Any, ...]:
     return key[:_INDEX_KEY_POS] + key[_INDEX_KEY_POS + 1:]
+
+
+def _healed_or_receipt(
+    root: Path, db_path: Path, receipt: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if _self_heal_eligible(receipt):
+        return _run_self_heal(root, db_path) or receipt
+    return receipt
 
 
 def _compute_graph_receipt(root: Path, db_path: Path) -> dict[str, Any] | None:
@@ -390,6 +403,65 @@ def with_provenance(result: Any, repo_root: str | None = None) -> Any:
     if receipt:
         result["_graph"] = receipt
     return result
+
+
+# --- query-time self-heal -----------------------------------------------------
+#
+# Every event source that refreshes the graph (hooks, git hooks, schedulers)
+# is lossy, so a drifted anchor reaches agents as stale_graph and sends them
+# to grep. Before answering stale, run one bounded catch-up update: a missed
+# checkout then costs one slower answer instead of a degraded lane.
+
+# Per-root monotonic timestamp of the last heal attempt; parallel tool calls
+# share it under one lock, so at most one update runs per debounce window.
+_SELF_HEAL_DEBOUNCE_SECONDS = env_float("CRG_SELF_HEAL_DEBOUNCE", 60.0)
+_self_heal_lock = threading.Lock()
+_self_heal_last: dict[str, float] = {}
+
+
+def _self_heal_eligible(receipt: dict[str, Any] | None) -> bool:
+    """Only staleness an incremental update can fix, and only with an anchor.
+
+    ``git_unavailable`` means git itself failed (an update would too), and a
+    missing anchor would full-rebuild inside the budget, which stays the root
+    controller's call. ``rebuild_required``/``missing_graph`` never heal.
+    """
+    if not receipt or receipt.get("status") != "stale_graph":
+        return False
+    reasons = set(receipt.get("reasons") or [])
+    if not reasons & {"head_moved", "git_capture_failed"}:
+        return False
+    return bool(receipt.get("built_at_commit"))
+
+
+def _run_self_heal(root: Path, db_path: Path) -> dict[str, Any] | None:
+    """One bounded ``update`` for *root*; a fresh receipt, or None."""
+    budget = env_float("CRG_SELF_HEAL_BUDGET", 40.0)
+    if budget <= 0:
+        return None
+    now = time.monotonic()
+    with _self_heal_lock:
+        if now - _self_heal_last.get(str(root), float("-inf")) < _SELF_HEAL_DEBOUNCE_SECONDS:
+            return None
+        _self_heal_last[str(root)] = now
+    logger.info("Self-heal: catching the graph up for %s (budget %.0fs)", root, budget)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "code_review_graph", "update", "--skip-flows",
+             "--if-locked=skip", "--repo", str(root)],
+            capture_output=True, timeout=budget, stdin=subprocess.DEVNULL, check=False,
+        )
+        logger.debug("Self-heal rc=%s for %s", completed.returncode, root)
+    except subprocess.TimeoutExpired:
+        logger.warning("Self-heal timed out after %.0fs for %s", budget, root)
+    except OSError as error:
+        logger.warning("Self-heal failed to start for %s: %s", root, error)
+    with _receipt_cache_lock:
+        _receipt_cache.pop(str(root), None)
+    try:
+        return _compute_graph_receipt(root, db_path)
+    except Exception:
+        return None
 
 # Common JS/TS builtin method names filtered from callers_of results.
 # "Who calls .map()?" returns hundreds of hits and is never useful.

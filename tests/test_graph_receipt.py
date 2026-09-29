@@ -284,7 +284,10 @@ def test_index_touch_invalidates_the_receipt_cache(repo, git_status_calls):
     assert len(git_status_calls) == 2
 
 
-def test_commit_invalidates_the_receipt_cache(repo, git_status_calls):
+def test_commit_invalidates_the_receipt_cache(repo, git_status_calls, monkeypatch):
+    # Cache invalidation only: the query-time self-heal has its own tests
+    # and would add a third receipt computation here.
+    monkeypatch.setenv("CRG_SELF_HEAL_BUDGET", "0")
     first = common_module.graph_receipt(str(repo))
     _git(repo, "commit", "-q", "--allow-empty", "-m", "next")
     second = common_module.graph_receipt(str(repo))

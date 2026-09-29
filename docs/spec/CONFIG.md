@@ -56,6 +56,8 @@ not list. Defaults are the values at the read site.
 | `CRG_TOOLS` | all tools | Tool names and presets to expose, like `serve --tools` ([TOOLS.md](TOOLS.md)). |
 | `CRG_TOOL_TIMEOUT` | `0` (off) | Seconds before a tool call is cancelled. |
 | `CRG_RECEIPT_TTL` | `2` | Seconds the `_graph` receipt is reused while graph and git are unchanged; `0` disables. |
+| `CRG_SELF_HEAL_BUDGET` | `40` | Seconds a tool call may spend catching a stale graph up before answering; `0` disables the query-time self-heal. |
+| `CRG_SELF_HEAL_DEBOUNCE` | `60` | Seconds between self-heal attempts per repository. |
 | `CRG_MAX_SEARCH_RESULTS` | `20` | Default search result cap. |
 | `CRG_MAX_IMPACT_NODES` | `500` | Impact radius node cap. |
 | `CRG_MAX_IMPACT_DEPTH` | `2` | Default impact depth. |
