@@ -195,6 +195,19 @@ def test_hook_state_dir_expands_target_paths(tmp_path: Path):
     assert state_dir({"CLAUDE_PLUGIN_DATA": "/data"}) == "/data/state/crg-update"
 
 
+@skip_windows
+def test_crg_update_hook_selftest(tmp_path: Path):
+    """The rendered observer passes its own selftest, git -C resolution included."""
+    hook = _hook(tmp_path, "claude")
+    completed = subprocess.run(
+        [sys.executable, str(hook), "--selftest"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["selftest"] == "ok", payload
+
+
 def test_zcode_impact_claim_region_keeps_role_variable():
     regions = render_regions(get_target("zcode"))
     body = regions[("agent-src/blocks/impact-claim.md", "impact-claim")]

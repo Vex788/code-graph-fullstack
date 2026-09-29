@@ -61,6 +61,7 @@ COMMAND_WRAPPERS = frozenset({"sudo", "command", "env", "time", "nohup", "exec",
 SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|&\n()]")
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 PATCH_PATH = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.M)
+GIT_DIR_TARGET = re.compile(r"^--git-dir=(.+)$")
 ENV_REFERENCE = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
 STATE_HOME = "{{state_home}}"
 LOG_HOME = "{{log_home}}"
@@ -115,6 +116,45 @@ def moves_head(command: str) -> bool:
     return False
 
 
+def git_command_roots(command: str) -> list[Path]:
+    """Repository paths a git command addresses via ``-C`` or ``--git-dir``.
+
+    ``changes_for`` resolves the repository from the event cwd alone, so a
+    session rooted outside every repository (an orchestrator workspace) that
+    runs ``git -C repo checkout x`` detected the HEAD move and then dropped
+    it. A ``.git`` path resolves to its parent: ``rev-parse --show-toplevel``
+    rejects the metadata directory itself.
+    """
+    roots: list[Path] = []
+    for segment in SEGMENT_SPLIT.split(command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        while words and (ENV_ASSIGNMENT.match(words[0]) or words[0] in COMMAND_WRAPPERS):
+            words = words[1:]
+        if not words or os.path.basename(words[0]) != "git":
+            continue
+        rest = words[1:]
+        while rest and rest[0].startswith("-"):
+            option = rest.pop(0)
+            inline = GIT_DIR_TARGET.match(option)
+            value = None
+            if option in ("-C", "--git-dir") and rest:
+                value = rest.pop(0)
+            elif inline:
+                value = inline.group(1)
+            elif option in GIT_VALUE_OPTIONS and rest:
+                rest.pop(0)
+            if value is None:
+                continue
+            path = Path(value)
+            if path.name == ".git":
+                path = path.parent
+            roots.append(path)
+    return roots
+
+
 def edited_paths(tool_input: dict) -> list[str]:
     """File paths an edit tool touched: file_path/notebook_path/path, or an ApplyPatch body."""
     paths = [
@@ -151,10 +191,17 @@ def changes_for(event: dict) -> dict[Path, set[str]]:
     cwd = Path(str(event.get("cwd") or os.getcwd()))
     changes: dict[Path, set[str]] = {}
     if tool == "bash":
-        if moves_head(str(tool_input.get("command") or "")):
-            root = repo_root(cwd)
-            if root is not None:
-                changes[root] = {HEAD_MOVED}
+        command = str(tool_input.get("command") or "")
+        if moves_head(command):
+            candidates: list[Path] = [cwd]
+            for target in git_command_roots(command):
+                candidates.append(
+                    target if target.is_absolute() else (cwd / target).resolve(),
+                )
+            for candidate in candidates:
+                root = repo_root(candidate)
+                if root is not None:
+                    changes[root] = {HEAD_MOVED}
         return changes
     if not any(word in tool for word in ("edit", "write", "patch")):
         return changes
@@ -498,6 +545,11 @@ def selftest() -> dict:
     assert not moves_head("git log --grep=checkout")
     assert not moves_head("echo git checkout")
     assert not moves_head("ls -la")
+    assert git_command_roots("git -C /tmp/repo checkout main") == [Path("/tmp/repo")]
+    assert git_command_roots("git --git-dir=/tmp/repo/.git status") == [Path("/tmp/repo")]
+    assert git_command_roots("git -C /tmp/a -C /tmp/b switch x") == [
+        Path("/tmp/a"), Path("/tmp/b")]
+    assert git_command_roots("git -c core.pager=cat stash pop") == []
     patch = "*** Begin Patch\n*** Update File: src/A.java\n*** Move to: src/B.java\n"
     assert edited_paths({"patch": patch}) == ["src/A.java", "src/B.java"]
     assert edited_paths({"file_path": "a.jsp"}) == ["a.jsp"]
@@ -520,6 +572,15 @@ def selftest() -> dict:
         repo.mkdir()
         _git("init", "-q", str(repo))
         (repo / "a.jsp").write_text("<p/>\n", encoding="utf-8")
+
+        # A HEAD move addressed by `git -C` from a non-repo cwd must resolve
+        # to the target repository, not vanish with the cwd.
+        outside = changes_for({
+            "tool_name": "Bash",
+            "tool_input": {"command": f"git -C {repo} switch -c topic"},
+            "cwd": str(base),
+        })
+        assert outside == {repo: {HEAD_MOVED}}, outside
 
         handle_event("not json")
         handle_event(json.dumps({"tool_name": "Bash", "tool_input": {"command": "git log x"},
