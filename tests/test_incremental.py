@@ -26,6 +26,7 @@ from code_review_graph.incremental import (
     full_build,
     get_all_tracked_files,
     get_changed_files,
+    get_changed_files_strict,
     get_db_path,
     get_staged_and_unstaged,
     ignore_policy_fingerprint,
@@ -648,12 +649,25 @@ class TestGitOperations:
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_changed_files_rejects_failed_fallback(self, mock_run, tmp_path):
-        mock_run.side_effect = [
-            MagicMock(returncode=128, stdout=b""),
-            MagicMock(returncode=128, stdout=b"A\0misleading.py\0"),
-        ]
+        # A working git checkout where every diff attempt fails: strict
+        # reports the discovery failure (None); the legacy wrapper keeps
+        # its empty shape. A checkout git itself cannot serve (broken
+        # marker, wedged binary) reads as [] — no diff to discover.
+        (tmp_path / ".git").mkdir()
 
+        def failing_diff(cmd, *args, **kwargs):
+            if "rev-parse" in cmd:
+                return MagicMock(returncode=0, stdout=b".git\n")
+            return MagicMock(returncode=128, stdout=b"")
+
+        mock_run.side_effect = failing_diff
+        assert get_changed_files_strict(tmp_path) is None
         assert get_changed_files(tmp_path) == []
+
+        mock_run.side_effect = lambda *args, **kwargs: MagicMock(
+            returncode=128, stdout=b"",
+        )
+        assert get_changed_files_strict(tmp_path) == []
 
     @patch("code_review_graph.incremental.subprocess.run")
     def test_get_changed_files_timeout(self, mock_run, tmp_path):

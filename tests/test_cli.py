@@ -606,3 +606,10 @@ class TestGraphToolExplicitRepoResolution:
                 cli.main()
 
         assert mock_run.call_args.args[1] == module.resolve()
+
+
+def test_finish_build_exit_codes():
+    """A discovery error must exit 1 so hooks retry instead of trusting ok."""
+    assert cli._finish_build({"status": "error"}, None) == 1
+    assert cli._finish_build({"status": "partial"}, None) == 3
+    assert cli._finish_build({"status": "ok"}, None) == 0

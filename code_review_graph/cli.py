@@ -657,10 +657,15 @@ def _print_missing_graph_status(repo_root: Path, db_path: Path) -> None:
 
 
 def _finish_build(result: dict, progress) -> int:
-    """Record a finished build; a ``partial`` result exits 3 (degraded)."""
-    from .locking import EXIT_DEGRADED, EXIT_OK
+    """Record a finished build; ``partial`` exits 3 (degraded), ``error`` 1."""
+    from .locking import EXIT_DEGRADED, EXIT_ERROR, EXIT_OK
 
-    code = EXIT_DEGRADED if result.get("status") == "partial" else EXIT_OK
+    if result.get("status") == "error":
+        code = EXIT_ERROR
+    elif result.get("status") == "partial":
+        code = EXIT_DEGRADED
+    else:
+        code = EXIT_OK
     if progress is not None:
         # status stays "ok" so the job reader returns the result, which says partial.
         progress.update(status="ok", exit_code=code, phase="done", result=result)

@@ -639,6 +639,16 @@ def _build_locked(
                 ),
             }
         if "write_epoch" not in result:
+            if result.get("status") == "error":
+                # Discovery failed (git could not answer): nothing was written
+                # and the graph keeps its previous state. Reported as an error
+                # so hooks and schedulers retry instead of trusting "ok".
+                return {
+                    **result,
+                    "build_type": "incremental",
+                    "base_resolved": base_resolved,
+                    "postprocess_level": postprocess,
+                }
             unchanged = {
                 **result,
                 "build_type": "incremental",
