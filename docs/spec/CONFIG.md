@@ -109,7 +109,7 @@ not list. Defaults are the values at the read site.
 | `CRG_UPDATE_STATE_DIR` | target `state_home` | Hook queue and state directory. |
 | `CRG_UPDATE_LOG_DIR` | target `log_home` | Hook log directory. |
 | `CRG_HEAL_STATE_DIR` | `crg-heal` next to the target's hook state | `crg-heal` lock directory (per-repo locks, `clone.lock`). |
-| `CRG_RECONCILE_STATE_DIR` | `crg-reconcile` next to the target's hook state | Per-root update-attempt fingerprints `crg-heal` shares with the reconcile loop. |
+| `CRG_RECONCILE_STATE_DIR` | `crg-reconcile` next to the target's hook state | Per-root update-attempt fingerprints (worktree state plus the tool's `--version` and contract version) `crg-heal` shares with the reconcile loop. |
 | `CRG_HEAL_POLL_SECONDS` | `5` | Seconds `crg-heal` waits between status reads of a `building` graph (tests). |
 | `CRG_STUB_RC` | `0` | Exit code of the `--selftest` stub binary. |
 

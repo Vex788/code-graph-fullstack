@@ -10,27 +10,28 @@ Any agent heals a blocking graph with one `crg-heal` call; nobody runs a raw bui
 ## crg-heal
 
 ```bash
-crg-heal --repo ROOT --json [--budget 240] [--no-clone]
+crg-heal --repo ROOT --json [--budget 240] [--no-clone] [--clone-only]
 ```
 
-`crg-heal` is a shim for `{{skills_home}}/graph-bootstrap/scripts/crg_heal.py`. Run it once when `_graph.status` is `missing_graph`, `building`, `rebuild_required` or `error`, then continue. It prints `{repo_root, before, after, action, usable, claim_scope, healed, seconds, fingerprint, receipt, gaps, next}`; cite `gaps` and `claim_scope` in graph-backed claims. Exit 0 ready, 3 usable but degraded, 4 not usable (graph rows `UNVERIFIED`, nothing else), 75 busy past the budget.
+`crg-heal` is a shim for `{{skills_home}}/graph-bootstrap/scripts/crg_heal.py`. Run it once when `_graph.status` is `missing_graph`, `building`, `rebuild_required` or `error`, then continue. It prints `{repo_root, before, after, action, usable, claim_scope, healed, seconds, fingerprint, receipt, gaps, next}`; cite `gaps` and `claim_scope` in graph-backed claims. A gap `kind` is `missing`, `deleted`, `mismatched`, `failed_files` or `skipped_oversize` (a file over `CRG_MAX_FILE_BYTES` is never parsed and never counts as drift). Exit 0 ready, 3 usable but degraded, 4 not usable (graph rows `UNVERIFIED`, nothing else), 75 busy past the budget.
 
 | `before` | Action |
 |---|---|
 | `ok`, `partial_index` | none (`partial_index` reports its gaps) |
 | `stale_graph` | one `code-review-graph update --skip-flows --if-locked=wait --lock-wait 60`, at most 180 s |
-| `stale_worktree` | one update per fingerprint (HEAD + `git status --porcelain` + `git diff HEAD`, the `crg-reconcile` state), then continue with the gaps |
+| `stale_worktree` | one update per fingerprint (HEAD + `git status --porcelain` + `git diff HEAD` + the tool's `--version` and contract version, the `crg-reconcile` state; a tool upgrade re-arms it), then continue with the gaps |
 | `building` | poll every 5 s for at most 120 s; never starts a build |
 | `missing_graph`, `rebuild_required` on a PMS worktree | `clone-graph` from the validated seed (`--force` only for `rebuild_required`), one clone machine-wide |
+| `missing_graph` on the seed | `clone-graph` from the main PMS checkout when it reads `ok`, then one catch-up `update` if the clone lands `stale_graph`; otherwise exit 4, `next: main checkout is not ok: heal it first` |
 | `rebuild_required` on the seed or `sp_api_library` | none, exit 4, `next: nightly crg-postprocess-all` |
 | `schema_too_new`, `error` | none, exit 4 |
 
-Scope is an allowlist: the PMS checkout, `sp_api_library`, their worktrees and the seed checkout; any other path exits 4 with `out_of_scope`. The seed is `~/IdeaProjects/.crg-seed-pms` when it exists, else the PMS checkout, and must read `ok` (never `partial_index`). A per-repo lock serialises healers; a lock still held at the budget exits 75.
+Scope is an allowlist: the PMS checkout, `sp_api_library`, their worktrees and the seed checkout; any other path exits 4 with `out_of_scope`. The seed is `~/IdeaProjects/.crg-seed-pms` when it exists, else the PMS checkout, and must read `ok` (never `partial_index`). A per-repo lock serialises healers; a lock still held at the budget exits 75. `--clone-only` (the `crg-reconcile` loop) skips every update and poll and only clones a `missing_graph` or `rebuild_required` root from the validated seed.
 
 ## When (by hand, owner only)
 
 - A new worktree of a repository that already has a graph somewhere (a develop-pinned seed checkout): `crg-heal` seeds it, or run the script below.
-- No seed anywhere: the owner runs one full `code-review-graph build --repo ROOT`. This is the only full build, and the nightly postprocess covers `rebuild_required` on the seed.
+- No graph anywhere: the owner runs one full `code-review-graph build --repo ROOT` on the main checkout. This is the only full build; `crg-heal --repo SEED` then clones the seed from it, and the nightly postprocess covers `rebuild_required` on the seed.
 - An existing graph that is `stale_graph` or `stale_worktree`: `crg-heal`. The PostToolUse hook also updates it after edits and HEAD-moving git commands, but only for a graph that already exists.
 
 ## Seed a worktree

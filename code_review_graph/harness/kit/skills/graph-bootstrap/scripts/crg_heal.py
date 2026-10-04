@@ -3,10 +3,14 @@
 
 Self-heal covers a graph that exists. This covers what it refuses: a missing graph
 or ``rebuild_required`` on a PMS worktree is cloned from a validated seed graph
-(``clone-graph``), a ``building`` graph is polled, never rebuilt. Scope is an
-allowlist (the PMS checkout, ``sp_api_library``, their worktrees and the seed);
-every other path exits 4 with ``out_of_scope``. A per-repo lock serialises healers
-and one machine-wide lock caps clones at one.
+(``clone-graph``), a ``building`` graph is polled, never rebuilt. The seed itself,
+when it has no graph, is cloned once from the main PMS checkout if that is ``ok``
+(then caught up with one ``update``). ``--clone-only`` (crg-reconcile) skips every
+other heal. Scope is an allowlist (the PMS checkout, ``sp_api_library``, their
+worktrees and the seed); every other path exits 4 with ``out_of_scope``. A per-repo
+lock serialises healers and one machine-wide lock caps clones at one. A
+``stale_worktree`` update runs once per fingerprint of the worktree and the tool
+(``--version`` and contract version), so a tool upgrade re-arms it.
 
 Prints one JSON object with ``--json``. Exit 0 ready, 3 usable but degraded
 (``partial_index``/``stale_graph``/``stale_worktree``), 4 not usable, 75 busy past
@@ -41,6 +45,7 @@ DEGRADED = {"partial_index", "stale_graph", "stale_worktree"}
 EXIT_OK, EXIT_DEGRADED, EXIT_BLOCKED, EXIT_BUSY = 0, 3, 4, gb.LOCK_BUSY
 BUDGET_SECONDS = 240
 UPDATE_SECONDS = 180
+MIN_CATCH_UP_SECONDS = 10
 POLL_SECONDS = 120
 LOCK_WAIT_SECONDS = 30
 MAX_GAPS = 50
@@ -119,13 +124,24 @@ def locked(path: Path, deadline: float):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def fingerprint(root: Path) -> str:
-    """crg-reconcile's fingerprint: sha1 of HEAD + status --porcelain + diff HEAD, 16 hex."""
+def tool_version() -> str:
+    """First line of ``code-review-graph --version``; ``unknown`` when it prints nothing."""
+    try:
+        done = gb.run("version", ["--version"], gb.STATUS_SECONDS)
+    except gb.StageError:
+        return "unknown"
+    return done.stdout.strip().partition("\n")[0].strip() or "unknown"
+
+
+def fingerprint(root: Path, tool_id: str) -> str:
+    """crg-reconcile's fingerprint, 16 hex: sha1 of HEAD, status --porcelain, diff HEAD and
+    ``<tool_id>\\n``. The tool id makes a tool upgrade re-arm an update that already ran."""
     digest = hashlib.sha1()
     for args in (("rev-parse", "HEAD"), ("status", "--porcelain"), ("diff", "HEAD")):
         done = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
                               timeout=60, check=False)
         digest.update(done.stdout)
+    digest.update(f"{tool_id}\n".encode())
     return digest.hexdigest()[:16]
 
 
@@ -173,7 +189,8 @@ def gaps(doc: dict) -> tuple[list[dict], int]:
     found = [{"path": path, "kind": kind}
              for key, kind in (("missing_indexed_paths", "missing"),
                                ("deleted_indexed_paths", "deleted"),
-                               ("mismatched_indexed_paths", "mismatched"))
+                               ("mismatched_indexed_paths", "mismatched"),
+                               ("skipped_oversize_paths", "skipped_oversize"))
              for path in identity.get(key) or []]
     failed = doc.get("failed_files")
     if isinstance(failed, list):
@@ -212,17 +229,23 @@ def poll(root: Path, deadline: float) -> tuple[str, dict]:
             return status, doc
 
 
-def clone(root: Path, seed: Path, status: str, deadline: float) -> tuple[str, int, str]:
-    """(action, forced exit code or -1, note) for one clone from the validated seed."""
-    seed_status, _ = read(seed)
-    if seed_status not in READY:
-        return "none", EXIT_BLOCKED, f"seed graph is {seed_status}; the seed must be ok to clone"
+def clone(root: Path, source: Path, status: str, deadline: float,
+          bootstrap: bool = False) -> tuple[str, int, str]:
+    """(action, forced exit code or -1, note) for one clone from the validated *source*.
+
+    *bootstrap* means the seed itself is being created, so *source* is the main checkout.
+    """
+    source_status, _ = read(source)
+    if source_status not in READY:
+        return "none", EXIT_BLOCKED, ("main checkout is not ok: heal it first" if bootstrap
+                                      else f"seed graph is {source_status}; "
+                                           "the seed must be ok to clone")
     with locked(state_dir() / "clone.lock", deadline):
         seconds = deadline - time.monotonic() - gb.STATUS_SECONDS
         if seconds < 30:
             raise BusyError("too little budget left for a clone; retry later")
         try:
-            result = gb.bootstrap(root, seed, 0, seconds, force=status == "rebuild_required",
+            result = gb.bootstrap(root, source, 0, seconds, force=status == "rebuild_required",
                                   lock_wait=LOCK_WAIT_SECONDS)
         except gb.StageError as error:
             code = EXIT_BUSY if "timed out" in str(error) else EXIT_BLOCKED
@@ -237,12 +260,14 @@ def blocked_next(root: Path, family: str, seed: Path, status: str, no_clone: boo
     if family != "pms":
         return "no seed graph for sp_api_library: nightly crg-postprocess-all"
     if root == seed:
-        return ("nightly crg-postprocess-all" if status == "rebuild_required"
-                else "the seed has no graph: the owner builds it once; agents never build")
+        if status == "rebuild_required":
+            return "nightly crg-postprocess-all"
+        if root == real(PMS_ROOT):
+            return "the seed has no graph: the owner builds it once; agents never build"
     return "clone disabled by --no-clone" if no_clone else ""
 
 
-def heal(repo: str, budget: float, no_clone: bool) -> tuple[dict, int]:
+def heal(repo: str, budget: float, no_clone: bool, clone_only: bool = False) -> tuple[dict, int]:
     started = time.monotonic()
     deadline = started + budget
     root = real(repo)
@@ -255,7 +280,7 @@ def heal(repo: str, budget: float, no_clone: bool) -> tuple[dict, int]:
         return report, EXIT_BLOCKED
     try:
         with locked(state_dir() / f"{sha12(root)}.lock", deadline):
-            code = _heal_locked(root, family, seed, report, deadline, no_clone)
+            code = _heal_locked(root, family, seed, report, deadline, no_clone, clone_only)
     except BusyError as busy:
         report.update(action="busy", next=str(busy))
         return _finish(report, started), EXIT_BUSY
@@ -263,15 +288,28 @@ def heal(repo: str, budget: float, no_clone: bool) -> tuple[dict, int]:
 
 
 def _heal_locked(root: Path, family: str, seed: Path, report: dict, deadline: float,
-                 no_clone: bool) -> int:
+                 no_clone: bool, clone_only: bool) -> int:
     before, doc = read(root)
     report["before"] = before
     after, forced, note, action = before, -1, "", "none"
-    if before == "stale_graph":
+    if before in ("missing_graph", "rebuild_required"):
+        note = blocked_next(root, family, seed, before, no_clone)
+        if not note:
+            bootstrap = root == seed and root != real(PMS_ROOT)
+            action, forced, note = clone(root, real(PMS_ROOT) if bootstrap else seed, before,
+                                         deadline, bootstrap)
+            after, doc = read(root)
+            if bootstrap and forced < 0 and after == "stale_graph":
+                note = _catch_up(root, deadline)
+                after, doc = read(root)
+    elif clone_only:
+        note = "--clone-only: status is not missing_graph or rebuild_required; nothing to clone"
+    elif before == "stale_graph":
         action, note = "update", update(root, deadline - time.monotonic())
         after, doc = read(root)
     elif before == "stale_worktree":
-        report["fingerprint"] = fp = fingerprint(root)
+        tool_id = f"{tool_version()}|{doc.get('contract_version') or 'unknown'}"
+        report["fingerprint"] = fp = fingerprint(root, tool_id)
         if attempted(root, before, fp):
             note = "update already attempted at this fingerprint (HEAD and worktree unchanged)"
         else:
@@ -286,11 +324,6 @@ def _heal_locked(root: Path, family: str, seed: Path, report: dict, deadline: fl
         after, doc = poll(root, deadline)
         if after == "building":
             forced, note = EXIT_BUSY, "a build is still running; retry later"
-    elif before in ("missing_graph", "rebuild_required"):
-        note = blocked_next(root, family, seed, before, no_clone)
-        if not note:
-            action, forced, note = clone(root, seed, before, deadline)
-            after, doc = read(root)
     elif before not in READY | DEGRADED:
         note = f"graph status is {before}: heal never updates or clones it"
     report.update(
@@ -301,6 +334,14 @@ def _heal_locked(root: Path, family: str, seed: Path, report: dict, deadline: fl
     )
     report["gaps"], report["gaps_total"] = gaps(doc)
     return forced if forced >= 0 else exit_for(after)
+
+
+def _catch_up(root: Path, deadline: float) -> str:
+    """One update after the seed clone, so the seed lands on its own HEAD."""
+    remaining = deadline - time.monotonic()
+    if remaining < MIN_CATCH_UP_SECONDS:
+        return "budget left too small for the post-clone update; run crg-heal again"
+    return update(root, remaining)
 
 
 def _finish(report: dict, started: float) -> dict:
@@ -317,9 +358,12 @@ def main() -> int:
                         help="seconds for locks, polling and the clone (default 240)")
     parser.add_argument("--no-clone", action="store_true",
                         help="never clone from the seed; report instead")
+    parser.add_argument("--clone-only", action="store_true",
+                        help="skip update/poll healing: only clone a missing_graph or "
+                             "rebuild_required root from the validated seed")
     args = parser.parse_args()
     try:
-        report, code = heal(args.repo, args.budget, args.no_clone)
+        report, code = heal(args.repo, args.budget, args.no_clone, args.clone_only)
     except OSError as error:
         report = {"repo_root": args.repo, "before": None, "after": None, "action": "none",
                   "usable": False, "claim_scope": "none", "healed": False, "seconds": 0.0,

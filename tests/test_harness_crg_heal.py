@@ -55,6 +55,9 @@ def with_cfg(mutator):
 
 log("calls", " ".join(argv))
 command = argv[0]
+if command == "--version":
+    print("code-review-graph " + with_cfg(lambda c: c).get("version", "2.3.8+fs.8"))
+    sys.exit(0)
 if command == "status":
     repo = value("--repo")
 
@@ -72,8 +75,13 @@ if command == "status":
     print(json.dumps({{
         "nodes": 10, "files": 2, "repo_root": repo, "built_at_commit": "a" * 40,
         "current_sha": "b" * 40, "failed_files": cfg.get("failed_files", {{}}).get(repo, 0),
+        "contract_version": cfg.get("contract_version", "1.0.0-rc1"),
         "readiness": {{"status": status, "embeddings": "off", "reasons": []}},
-        "source_identity": {{"missing_indexed_paths": cfg.get("gaps", {{}}).get(repo, [])}},
+        "source_identity": {{
+            "missing_indexed_paths": cfg.get("gaps", {{}}).get(repo, []),
+            "deleted_indexed_paths": cfg.get("deleted", {{}}).get(repo, []),
+            "skipped_oversize_paths": cfg.get("oversize", {{}}).get(repo, []),
+        }},
     }}))
 elif command == "update":
     repo = value("--repo")
@@ -199,10 +207,14 @@ def test_stale_graph_that_stays_stale_is_degraded_usable(rig: Rig):
     assert report["claim_scope"] == "degraded" and report["after"] == "stale_graph"
 
 
-def _shell_fingerprint(repo: Path) -> str:
-    """crg-reconcile's fingerprint(), verbatim."""
+STUB_TOOL_ID = "code-review-graph 2.3.8+fs.8|1.0.0-rc1"
+
+
+def _shell_fingerprint(repo: Path, tool_id: str = STUB_TOOL_ID) -> str:
+    """crg-reconcile's fingerprint(): git state plus '<--version output>|<contract version>'."""
     script = (f'{{ git -C "{repo}" rev-parse HEAD; git -C "{repo}" status --porcelain; '
-              f'git -C "{repo}" diff HEAD; }} 2>/dev/null | shasum | cut -c1-16')
+              f'git -C "{repo}" diff HEAD; echo "{tool_id}"; }} 2>/dev/null '
+              f'| shasum | cut -c1-16')
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           check=True, timeout=30).stdout.strip()
 
@@ -224,6 +236,63 @@ def test_stale_worktree_updates_once_per_fingerprint(rig: Rig):
     rc, third = rig.run(rig.pms)
     assert third["action"] == "update" and third["fingerprint"] != first["fingerprint"]
     assert len([c for c in rig.calls() if c.startswith("update")]) == 2
+
+
+@pytest.mark.parametrize(("field", "upgraded", "tool_id"), [
+    ("version", "2.3.9+fs.9", "code-review-graph 2.3.9+fs.9|1.0.0-rc1"),
+    ("contract_version", "1.1.0", "code-review-graph 2.3.8+fs.8|1.1.0"),
+])
+def test_tool_upgrade_rearms_the_stale_worktree_update(rig: Rig, field: str, upgraded: str,
+                                                       tool_id: str):
+    rig.configure(status={rig.pms: "stale_worktree"})
+    rc, first = rig.run(rig.pms)
+    assert first["action"] == "update" and first["fingerprint"] == _shell_fingerprint(rig.pms)
+    rc, again = rig.run(rig.pms)
+    assert again["action"] == "none" and again["fingerprint"] == first["fingerprint"]
+
+    rig.configure(**{field: upgraded})
+    rc, rearmed = rig.run(rig.pms)
+    assert rearmed["action"] == "update"
+    assert rearmed["fingerprint"] == _shell_fingerprint(rig.pms, tool_id)
+    assert rearmed["fingerprint"] != first["fingerprint"]
+    assert len([c for c in rig.calls() if c.startswith("update")]) == 2
+
+
+def test_unreadable_tool_version_still_dedupes(rig: Rig):
+    """A tool whose --version prints nothing keys the attempt on 'unknown', not on a crash."""
+    rig.stub.write_text(rig.stub.read_text(encoding="utf-8").replace(
+        'print("code-review-graph " + with_cfg(lambda c: c).get("version", "2.3.8+fs.8"))', "pass"),
+        encoding="utf-8")
+    rig.configure(status={rig.pms: "stale_worktree"})
+    rc, first = rig.run(rig.pms)
+    assert first["action"] == "update"
+    assert first["fingerprint"] == _shell_fingerprint(rig.pms, "unknown|1.0.0-rc1")
+    rc, second = rig.run(rig.pms)
+    assert second["action"] == "none"
+
+
+def test_deleted_only_stale_worktree_is_healed_once_per_fingerprint(rig: Rig):
+    """No missing file, only a vanished indexed one: still one update, never a loop."""
+    rig.configure(status={rig.pms: "stale_worktree"}, deleted={rig.pms: ["web/gone.jsp"]})
+    rc, first = rig.run(rig.pms)
+    assert rc == 3 and first["action"] == "update" and first["usable"] is True
+    assert first["gaps"] == [{"path": "web/gone.jsp", "kind": "deleted"}]
+    rc, second = rig.run(rig.pms)
+    assert second["action"] == "none" and "fingerprint" in second["next"]
+    assert len([c for c in rig.calls() if c.startswith("update")]) == 1
+
+    rig.configure(after_update={rig.pms: "ok"}, deleted={rig.pms: []})
+    (rig.pms / "touch.txt").write_text("x\n", encoding="utf-8")
+    rc, healed = rig.run(rig.pms)
+    assert rc == 0 and healed["healed"] is True and healed["gaps"] == []
+
+
+def test_oversize_files_are_reported_as_skipped_gaps(rig: Rig):
+    rig.configure(status={rig.pms: "ok"}, oversize={rig.pms: ["gen/Big.java"]})
+    rc, report = rig.run(rig.pms)
+    assert rc == 0 and report["claim_scope"] == "full" and report["action"] == "none"
+    assert report["gaps"] == [{"path": "gen/Big.java", "kind": "skipped_oversize"}]
+    assert [c.split()[0] for c in rig.calls()] == ["status"]
 
 
 def test_stale_worktree_healed_forgets_the_attempt(rig: Rig):
@@ -272,6 +341,96 @@ def test_seed_directory_wins_when_it_exists(rig: Rig):
     rig.configure(status={seed: "ok", rig.pms: "partial_index"})
     rc, report = rig.run(wt)
     assert rc == 0 and f"--from {seed}" in rig.clone_calls()[0]
+
+
+def test_seed_without_a_graph_is_cloned_from_the_ok_main_checkout(rig: Rig):
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={rig.pms: "ok"})
+    rc, report = rig.run(seed)
+    assert rc == 0 and report["action"] == "clone" and report["healed"] is True
+    assert (report["before"], report["after"]) == ("missing_graph", "ok")
+    assert rig.clone_calls() == [f"clone-graph --from {rig.pms} --to {seed} --json --lock-wait 30"]
+    assert [c.split()[0] for c in rig.calls() if not c.startswith("status")] == ["clone-graph"]
+
+
+def test_seed_bootstrap_catches_up_when_the_clone_lands_stale(rig: Rig):
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={rig.pms: "ok"}, after_clone={seed: "stale_graph"},
+                  after_update={seed: "ok"})
+    rc, report = rig.run(seed)
+    assert rc == 0 and report["after"] == "ok" and report["healed"] is True
+    assert [c.split()[0] for c in rig.calls() if not c.startswith("status")] == [
+        "clone-graph", "update"]
+    (update,) = [c for c in rig.calls() if c.startswith("update")]
+    assert update == f"update --skip-flows --if-locked=wait --lock-wait 60 --repo {seed}"
+
+
+@pytest.mark.parametrize("main_status", ["partial_index", "stale_graph", "stale_worktree",
+                                         "rebuild_required", "missing_graph"])
+def test_seed_bootstrap_needs_an_ok_main_checkout(rig: Rig, main_status: str):
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={rig.pms: main_status})
+    rc, report = rig.run(seed)
+    assert rc == 4 and report["usable"] is False and report["action"] == "none"
+    assert report["next"] == "main checkout is not ok: heal it first"
+    assert rig.clone_calls() == []
+
+
+def test_seed_bootstrap_respects_no_clone(rig: Rig):
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={rig.pms: "ok"})
+    rc, report = rig.run(seed, "--no-clone")
+    assert rc == 4 and "--no-clone" in report["next"] and rig.clone_calls() == []
+
+
+def test_seed_bootstrap_is_capped_by_the_clone_lock(rig: Rig):
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={rig.pms: "ok"})
+    rig.state.mkdir(parents=True)
+    with open(rig.state / "clone.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        rc, report = rig.run(seed, "--budget", "1")
+    assert rc == 75 and rig.clone_calls() == []
+
+
+def test_seed_with_rebuild_required_still_waits_for_the_nightly_build(rig: Rig):
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={rig.pms: "ok", seed: "rebuild_required"})
+    rc, report = rig.run(seed)
+    assert rc == 4 and "crg-postprocess-all" in report["next"] and rig.clone_calls() == []
+
+
+def test_clone_only_clones_a_missing_graph_and_forces_a_rebuild_required_one(rig: Rig):
+    fresh, rebuilt = rig.worktree("fresh"), rig.worktree("rebuilt")
+    rig.configure(status={rig.pms: "ok", rebuilt: "rebuild_required"})
+    for wt in (fresh, rebuilt):
+        rc, report = rig.run(wt, "--clone-only")
+        assert rc == 0 and report["action"] == "clone" and report["after"] == "ok"
+    first, second = rig.clone_calls()
+    assert f"--to {fresh}" in first and "--force" not in first
+    assert f"--to {rebuilt}" in second and "--force" in second
+
+
+@pytest.mark.parametrize(("status", "rc"), [("ok", 0), ("stale_graph", 3), ("stale_worktree", 3),
+                                            ("partial_index", 3), ("building", 4)])
+def test_clone_only_leaves_every_other_status_alone(rig: Rig, status: str, rc: int):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "ok", wt: status})
+    code, report = rig.run(wt, "--clone-only")
+    assert code == rc and report["action"] == "none" and report["after"] == status
+    assert {c.split()[0] for c in rig.calls()} == {"status"}
+    assert "--clone-only" in report["next"] or status == "ok"
+
+
+def test_clone_only_still_validates_the_seed_and_scope(rig: Rig):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "partial_index"})
+    rc, report = rig.run(wt, "--clone-only")
+    assert rc == 4 and "partial_index" in report["next"] and rig.clone_calls() == []
+    rc, report = rig.run(rig.spapi, "--clone-only")
+    assert rc == 4 and "crg-postprocess-all" in report["next"]
+    rc, report = rig.run(rig.pms.parent / "elsewhere", "--clone-only")
+    assert rc == 4 and report["action"] == "out_of_scope"
 
 
 @pytest.mark.parametrize("seed_status", ["partial_index", "stale_graph", "rebuild_required",
@@ -377,6 +536,7 @@ def test_help_and_usage(rig: Rig):
     done = subprocess.run([sys.executable, str(rig.script), "--help"], capture_output=True,
                           text=True, timeout=30, env=rig.env(), check=False)
     assert done.returncode == 0 and "--budget" in done.stdout and "--no-clone" in done.stdout
+    assert "--clone-only" in done.stdout
     missing = subprocess.run([sys.executable, str(rig.script)], capture_output=True, text=True,
                              timeout=30, env=rig.env(), check=False)
     assert missing.returncode == 2
