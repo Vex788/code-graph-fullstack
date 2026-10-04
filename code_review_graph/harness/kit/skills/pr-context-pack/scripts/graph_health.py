@@ -3,8 +3,10 @@
 
 Reads only the code-review-graph CLI JSON (``status --json``, optionally
 ``coverage --json``); never opens the graph database. Exit 0 when the graph is
-ready or degraded (``partial_index``), 2 when a graph-dependent step must stop
-with GRAPH_PREP_REQUIRED or the graph lane is unavailable.
+ready or degraded with data (``partial_index``, ``stale_graph``, ``stale_worktree``:
+usable, gaps named), 2 when the status is blocking (``missing_graph``, ``building``,
+``rebuild_required``, error): GRAPH_PREP_REQUIRED now means run ``crg-heal`` once,
+then probe again; or the graph lane is unavailable.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from pathlib import Path
 
 PREP_MARKER = "GRAPH_PREP_REQUIRED"
 READY = {"ok"}
-DEGRADED = {"partial_index"}
+DEGRADED = {"partial_index", "stale_graph", "stale_worktree"}
 STATUS_TIMEOUT_SECONDS = 60
 COVERAGE_TIMEOUT_SECONDS = 180
 RULES_FILE = Path(__file__).resolve().parents[3] / "hooks" / "crg_rules.json"
@@ -125,9 +127,12 @@ def probe(
         reasons.append(diagnostic)
     head_sha = git_commit(repo, head) if head else ""
     if head_sha and verdict in {"ready", "degraded"}:
-        if doc.get("built_at_commit") != head_sha or doc.get("current_sha") != head_sha:
+        if doc.get("current_sha") != head_sha:
             verdict = "prep_required"
-            reasons.append("built_at_commit/current_sha differ from the review head")
+            reasons.append("the checkout is not at the review head")
+        elif doc.get("built_at_commit") != head_sha:
+            verdict = "degraded"
+            reasons.append("the graph was built at another commit than the review head")
     identity = doc.get("source_identity") if isinstance(doc.get("source_identity"), dict) else {}
     report: dict = {
         "repo": str(repo),
@@ -157,8 +162,7 @@ def probe(
                             "excluded_total")
             }
             if cov.get("missing_from_graph_total"):
-                report["verdict"] = "prep_required"
-                report["marker"] = PREP_MARKER
+                report["verdict"] = "degraded"
                 reasons.append(f"{cov['missing_from_graph_total']} files missing from the graph")
     usable = report["verdict"] in {"ready", "degraded"}
     report["changed_files"] = changed_dispositions(changed or [], usable, status, identity,

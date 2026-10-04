@@ -13,7 +13,7 @@ The fork ships everything a coding harness needs to use the graph, in
 | `skills/code-search-routing` | When to use Grep, the graph, or RTK; cross-stack query patterns. |
 | `skills/context-efficient-code-research` | Bounded research loop over the graph. |
 | `skills/pr-context-pack` | Immutable PR context packets with graph receipt and coverage. |
-| `skills/graph-bootstrap` | First build and health check for a repository. |
+| `skills/graph-bootstrap` | `crg-heal` (heal a blocking graph, then continue) and the seed-from-clone bootstrap for a worktree. |
 | `blocks/graph-routing.md`, `graph-search.md`, `impact-claim.md` | Text blocks for marker regions in hand-maintained files. |
 | `data/crg_rules.json` | Tool names, statuses, exit codes and cross-stack kinds, generated from [contract.json](contract.json). |
 

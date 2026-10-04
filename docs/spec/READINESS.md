@@ -89,5 +89,6 @@ agents act on:
 | `source_identity.edited_indexed_count` | Indexed files edited since the build. |
 | `etag` | Changes whenever the graph or git state changes; the receipt is reused for `CRG_RECEIPT_TTL` seconds otherwise. |
 
-Rule for agents: act on `ok`; treat `partial_index` as degraded and say so;
-anything else means prepare the graph first (`GRAPH_PREP_REQUIRED` in the kit).
+Rule for agents: act on `ok`; treat `partial_index`, `stale_graph` and `stale_worktree`
+as degraded with data (usable: say so and cite the gaps); for anything else heal once
+and continue (`GRAPH_PREP_REQUIRED` in the kit now means "run `crg-heal`, then continue").

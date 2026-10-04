@@ -13,7 +13,8 @@ graph needs a full rebuild, which is logged and never started from here.
 Anything else is a failure, retried up to RETRY_LIMIT times before the queue
 is poisoned (logged once; the next successful update clears it).
 
-A repository without a graph is skipped: hooks never build.
+A repository without a graph is skipped: hooks never build. An agent that meets a
+blocking status runs ``crg-heal`` once instead.
 
     crg-update.py --status      state of the worker for the repository at cwd
     crg-update.py --selftest    self-test against a stub binary (CRG_BIN or generated)

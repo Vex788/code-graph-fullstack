@@ -27,9 +27,11 @@ RULES_FILE = KIT_DIR / "data" / "crg_rules.json"
 TARGETS = ("claude", "zcode", "bug-hunter")
 MCP_SERVER = "code-review-graph"
 TOOL_PREFIXES = ["mcp__code-review-graph__", "mcp__plugin_bug-hunter_code-review-graph__"]
-# Receipt statuses an agent may act on; everything else means GRAPH_PREP_REQUIRED.
+# Receipt statuses an agent may act on (degraded ones with data and a named gap); the rest
+# are blocking: run crg-heal once, then continue. The marker keeps its old name.
 READY = ["ok"]
-DEGRADED = ["partial_index"]
+DEGRADED = ["partial_index", "stale_graph", "stale_worktree"]
+RECEIPT_ERRORS = ["schema_too_new", "error"]
 PREP_MARKER = "GRAPH_PREP_REQUIRED"
 # CLI subcommands the kit names before their wave lands: command -> wave.
 PENDING_CLI = {"embeddings": "W4a"}
@@ -49,12 +51,12 @@ def indexed_extensions() -> list[str]:
 def expected_rules() -> dict:
     doc = contract()
     tools = sorted(t["name"] for t in doc["tools"])
-    blocking = [s for s in doc["statuses"] if s not in READY + DEGRADED]
+    blocking = [s for s in doc["statuses"] if s not in READY + DEGRADED] + RECEIPT_ERRORS
     cross_stack = [
         {"name": k["name"], "since": k["since"]}
         for k in doc["kinds"]["edge_kinds"] if k["cross_stack"]
     ]
-    alternation = "|".join(blocking + ["error"])
+    alternation = "|".join(blocking)
     return {
         "version": 1,
         "generated_from": "docs/spec/contract.json",
@@ -110,6 +112,7 @@ EXPECTED_FILES = {
     "skills/code-search-routing/SKILL.md",
     "skills/context-efficient-code-research/SKILL.md",
     "skills/graph-bootstrap/SKILL.md",
+    "skills/graph-bootstrap/scripts/crg_heal.py",
     "skills/graph-bootstrap/scripts/graph_bootstrap.py",
     "skills/pr-context-pack/SKILL.md",
     "skills/pr-context-pack/references/context-pack.schema.json",
@@ -319,13 +322,16 @@ def test_crg_rules_match_contract():
         )
         assert set(rules["read_only_tools"]).isdisjoint(rules["write_tools"])
         assert "build_or_update_graph_tool" in rules["write_tools"]
+        assert rules["ready_statuses"] == ["ok"]
+        assert rules["degraded_statuses"] == ["partial_index", "stale_graph", "stale_worktree"]
         assert rules["blocking_statuses"] == [
-            "missing_graph", "building", "rebuild_required", "stale_graph", "stale_worktree",
+            "missing_graph", "building", "rebuild_required", "schema_too_new", "error",
         ]
         rx = re.compile(rules["blocking_response_regex"])
-        assert rx.search(json.dumps(json.dumps({"_graph": {"status": "stale_graph"}})))
+        assert rx.search(json.dumps(json.dumps({"_graph": {"status": "rebuild_required"}})))
         assert rx.search('{"status": "error", "error_code": "x"}')
-        assert not rx.search('{"_graph": {"status": "partial_index"}}')
+        for usable in ("partial_index", "stale_graph", "stale_worktree", "ok"):
+            assert not rx.search(json.dumps({"_graph": {"status": usable}}))
         assert rules["tool_prefixes"][1] == "mcp__plugin_bug-hunter_code-review-graph__"
 
 
@@ -580,7 +586,8 @@ def _status(repo: Path, head: str, readiness: str = "ok") -> dict:
 
 @skip_windows
 @pytest.mark.parametrize(("readiness", "rc", "verdict"), [
-    ("ok", 0, "ready"), ("partial_index", 0, "degraded"), ("stale_graph", 2, "prep_required"),
+    ("ok", 0, "ready"), ("partial_index", 0, "degraded"), ("stale_graph", 0, "degraded"),
+    ("stale_worktree", 0, "degraded"), ("rebuild_required", 2, "prep_required"),
 ])
 def test_graph_health_reads_only_cli_json(tmp_path: Path, readiness, rc, verdict):
     repo = _git_repo(tmp_path / "repo")
@@ -686,24 +693,58 @@ def test_build_context_pack_uses_cli_receipt(tmp_path: Path, target: str):
     assert json.loads(summary.stdout)["schema"] == f"{prefix}/pr-context-summary/1"
 
 
+def _build_pack(tmp_path: Path, repo: Path, base: str, head: str, receipt_doc: dict):
+    stub, _ = _graph_stub(tmp_path, receipt_doc)
+    script = _script(tmp_path, "zcode", "skills/pr-context-pack/scripts/build_context_pack.py")
+    receipt = tmp_path / "status.json"
+    receipt.write_text(json.dumps(receipt_doc), encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(script), "--repo", str(repo), "--base", base, "--head", head,
+         "--pr", "7", "--graph-receipt", str(receipt), "--output-root", str(tmp_path / "out")],
+        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+
+
 @skip_windows
-def test_build_context_pack_rejects_stale_receipt(tmp_path: Path):
+def test_build_context_pack_rejects_blocking_receipt(tmp_path: Path):
     pytest.importorskip("jsonschema")
     repo = _git_repo(tmp_path / "repo")
     base = _commit(repo, "base")
     (repo / "page.jsp").write_text("<p>changed</p>\n", encoding="utf-8")
     head = _commit(repo, "head")
-    stub, _ = _graph_stub(tmp_path, _status(repo, head, "stale_graph"))
-    script = _script(tmp_path, "zcode", "skills/pr-context-pack/scripts/build_context_pack.py")
-    receipt = tmp_path / "status.json"
-    receipt.write_text(json.dumps(_status(repo, head, "stale_graph")), encoding="utf-8")
-    result = subprocess.run(
-        [sys.executable, str(script), "--repo", str(repo), "--base", base, "--head", head,
-         "--pr", "7", "--graph-receipt", str(receipt), "--output-root", str(tmp_path / "out")],
-        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
-    )
+    result = _build_pack(tmp_path, repo, base, head, _status(repo, head, "rebuild_required"))
     assert result.returncode == 2
-    assert PREP_MARKER in result.stderr
+    assert PREP_MARKER in result.stderr and "crg-heal" in result.stderr
+
+
+@skip_windows
+@pytest.mark.parametrize("readiness", ["stale_graph", "stale_worktree", "partial_index"])
+def test_build_context_pack_takes_a_degraded_receipt(tmp_path: Path, readiness: str):
+    pytest.importorskip("jsonschema")
+    repo = _git_repo(tmp_path / "repo")
+    base = _commit(repo, "base")
+    (repo / "page.jsp").write_text("<p>changed</p>\n", encoding="utf-8")
+    head = _commit(repo, "head")
+    receipt = _status(repo, head, readiness)
+    receipt["built_at_commit"] = base
+    receipt["source_identity"]["source_matches_build"] = False
+    result = _build_pack(tmp_path, repo, base, head, receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
+    pack = json.loads((Path(result.stdout.strip()) / "context-pack.json").read_text("utf-8"))
+    assert pack["graph"]["status"] == "receipt" and pack["graph"]["degraded"] is True
+
+
+@skip_windows
+def test_build_context_pack_rejects_a_receipt_for_another_checkout(tmp_path: Path):
+    pytest.importorskip("jsonschema")
+    repo = _git_repo(tmp_path / "repo")
+    base = _commit(repo, "base")
+    (repo / "page.jsp").write_text("<p>changed</p>\n", encoding="utf-8")
+    head = _commit(repo, "head")
+    receipt = _status(repo, head)
+    receipt["current_sha"] = base
+    result = _build_pack(tmp_path, repo, base, head, receipt)
+    assert result.returncode == 2 and PREP_MARKER in result.stderr
 
 
 def _bootstrap_stub(tmp_path: Path, readiness: str, clone_rc: int = 0, sleep: int = 0) -> Path:
@@ -725,7 +766,7 @@ def _bootstrap_stub(tmp_path: Path, readiness: str, clone_rc: int = 0, sleep: in
 
 @skip_windows
 @pytest.mark.parametrize(("readiness", "rc", "status"), [
-    ("ok", 0, "ok"), ("partial_index", 2, "degraded"), ("stale_graph", 2, "degraded"),
+    ("ok", 0, "ok"), ("stale_graph", 2, "degraded"), ("stale_worktree", 2, "degraded"),
 ])
 def test_graph_bootstrap_clones_then_checks_readiness(tmp_path, readiness, rc, status):
     seed = _git_repo(tmp_path / "seed")
@@ -746,6 +787,23 @@ def test_graph_bootstrap_clones_then_checks_readiness(tmp_path, readiness, rc, s
     assert f"clone-graph --from {seed} --to {worktree} --json" in calls
     assert "CRG_EMBEDDINGS=off" in calls
     assert "sqlite" not in script.read_text(encoding="utf-8")
+
+
+@skip_windows
+def test_graph_bootstrap_never_seeds_from_a_partial_index(tmp_path: Path):
+    seed = _git_repo(tmp_path / "seed")
+    _commit(seed, "seed")
+    worktree = _git_repo(tmp_path / "wt")
+    _commit(worktree, "wt")
+    stub = _bootstrap_stub(tmp_path, "partial_index")
+    script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed)],
+        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    report = json.loads(result.stdout)
+    assert (report["status"], report["seed_readiness"]) == ("skip", "partial_index")
+    assert "clone-graph" not in (tmp_path / "boot-calls.log").read_text(encoding="utf-8")
 
 
 @skip_windows

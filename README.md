@@ -125,7 +125,7 @@ in the response before trusting it.
 
 | `_graph` field | Use |
 |---|---|
-| `status`, `reasons` | Act only on `ok`. Treat `partial_index` as degraded. Anything else means prepare the graph first. |
+| `status`, `reasons` | Act on `ok`. Treat `partial_index`, `stale_graph` and `stale_worktree` as degraded with data (usable, cite the gaps). Anything else means heal once (`crg-heal` in the kit), then continue. |
 | `built_at_commit`, `current_sha`, `head_matches_build` | Is the graph at HEAD? |
 | `source_identity.runtime_matches_source` | Is the running server the installed version? |
 | `source_identity.index_matches_runtime` | Are the schema and index generation current? |

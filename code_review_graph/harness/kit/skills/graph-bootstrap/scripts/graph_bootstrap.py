@@ -30,7 +30,8 @@ TOTAL_BUDGET_SECONDS = 840
 assert SEED_REFRESH_SECONDS + CLONE_SECONDS + 2 * STATUS_SECONDS <= TOTAL_BUDGET_SECONDS
 
 LOCK_BUSY = 75
-USABLE_SEED = {"ok", "partial_index", "stale_graph", "stale_worktree"}
+# partial_index is not a seed: its gaps would be copied into every clone.
+USABLE_SEED = {"ok", "stale_graph", "stale_worktree"}
 STALE = {"stale_graph", "stale_worktree"}
 
 
@@ -81,7 +82,8 @@ def git_head(root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds: float) -> dict:
+def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds: float,
+              force: bool = True, lock_wait: float | None = None) -> dict:
     head = git_head(worktree)
     if not head:
         return {"status": "skip", "reason": "worktree is not a git checkout"}
@@ -100,8 +102,12 @@ def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds:
                 refresh.stderr.strip()[-200:]
             )
     started = time.time()
-    clone = run("clone-graph", ["clone-graph", "--from", str(seed), "--to", str(worktree),
-                                "--json", "--force"], clone_seconds)
+    clone_args = ["clone-graph", "--from", str(seed), "--to", str(worktree), "--json"]
+    if force:
+        clone_args.append("--force")
+    if lock_wait is not None:
+        clone_args += ["--lock-wait", f"{lock_wait:g}"]
+    clone = run("clone-graph", clone_args, clone_seconds)
     if clone.returncode != 0:
         raise StageError("clone-graph", f"exit {clone.returncode}: "
                          + (clone.stderr or clone.stdout).strip()[-300:])

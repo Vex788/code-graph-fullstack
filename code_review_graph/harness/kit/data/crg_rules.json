@@ -97,17 +97,19 @@
     "ok"
   ],
   "degraded_statuses": [
-    "partial_index"
+    "partial_index",
+    "stale_graph",
+    "stale_worktree"
   ],
   "blocking_statuses": [
     "missing_graph",
     "building",
     "rebuild_required",
-    "stale_graph",
-    "stale_worktree"
+    "schema_too_new",
+    "error"
   ],
   "prep_required_marker": "GRAPH_PREP_REQUIRED",
-  "blocking_response_regex": "\\\\?\"status\\\\?\"\\s*:\\s*\\\\?\"(missing_graph|building|rebuild_required|stale_graph|stale_worktree|error)\\\\?\"|GRAPH_PREP_REQUIRED",
+  "blocking_response_regex": "\\\\?\"status\\\\?\"\\s*:\\s*\\\\?\"(missing_graph|building|rebuild_required|schema_too_new|error)\\\\?\"|GRAPH_PREP_REQUIRED",
   "exit_codes": {
     "ok": 0,
     "error": 1,

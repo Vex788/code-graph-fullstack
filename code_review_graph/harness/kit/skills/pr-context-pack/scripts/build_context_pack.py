@@ -26,7 +26,14 @@ from pathlib import Path
 import jsonschema
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from graph_health import PREP_MARKER, changed_dispositions, probe, run_json  # noqa: E402
+from graph_health import (  # noqa: E402
+    DEGRADED,
+    PREP_MARKER,
+    READY,
+    changed_dispositions,
+    probe,
+    run_json,
+)
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 CLASS_RE = re.compile(r"\b(class|interface|enum|record)\s+([A-Za-z_$][\w$]*)")
@@ -41,7 +48,7 @@ DEFAULT_MAX_GRAPH_NODES = 80
 DEFAULT_MAX_GRAPH_CALLERS = 80
 DEFAULT_MAX_GRAPH_CALLEES = 80
 IMPACT_TIMEOUT_SECONDS = 180
-READY_STATUSES = {"ok", "partial_index"}
+READY_STATUSES = READY | DEGRADED
 DOMAIN_ROUTER = "{{domain_router}}"
 DEFAULT_DOMAIN_ROUTER = Path(DOMAIN_ROUTER).expanduser() if DOMAIN_ROUTER else None
 
@@ -273,14 +280,10 @@ def graph_context(
         status = str((receipt.get("readiness") or {}).get("status") or "unavailable")
         identity = receipt.get("source_identity") or {}
         if status not in READY_STATUSES:
-            raise PackError(f"{PREP_MARKER}: graph receipt status is {status}")
-        if (
-            receipt.get("repo_root") != str(repo)
-            or receipt.get("built_at_commit") != head
-            or receipt.get("current_sha") != head
-            or identity.get("source_matches_build") is not True
-        ):
-            raise PackError(f"{PREP_MARKER}: graph receipt does not match the review head/source")
+            raise PackError(f"{PREP_MARKER}: graph receipt status is {status}; "
+                            "run crg-heal once and re-read the status")
+        if receipt.get("repo_root") != str(repo) or receipt.get("current_sha") != head:
+            raise PackError(f"{PREP_MARKER}: graph receipt is not for this checkout at the head")
     elif live_probe:
         report = probe(repo, changed_files, head)
         if report["verdict"] not in {"ready", "degraded"}:

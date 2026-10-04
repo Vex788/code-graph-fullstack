@@ -10,9 +10,9 @@ Build one immutable, deterministic packet before dispatching a PR reviewer. The 
 ## Workflow
 
 1. Confirm base and head are exact commit objects available in the local repository.
-2. Require the root controller's graph receipt before reviewer dispatch: `code-review-graph status --repo REPO --json` for the review head. Its `readiness.status` must be `ok`, or `partial_index` (degraded: the pack records `graph.degraded=true`); `built_at_commit` and `current_sha` must equal the head and `source_identity.source_matches_build` must be true. Anything else is `GRAPH_PREP_REQUIRED`: this lane never builds or updates the graph itself (see `context-efficient-code-research`).
-3. Probe once with `scripts/graph_health.py --repo REPO --head HEAD_SHA --coverage`. It reads only the CLI JSON (`status --json`, `coverage --json`) and exits 2 with `"marker": "GRAPH_PREP_REQUIRED"` naming the gap (not ready, head mismatch, or `missing_from_graph_total > 0`).
-4. Build the packet with `scripts/build_context_pack.py`, passing the status JSON as `--graph-receipt`. It adds changed nodes and one-hop callers/callees from a single `code-review-graph impact` call (JSON), never from the database. When the graph lane was unavailable after a recorded preparation attempt, omit the receipt: the pack records `graph.status=fallback`.
+2. Require a graph receipt before reviewer dispatch: `code-review-graph status --repo REPO --json` for the review head. Its `readiness.status` must be `ok` or degraded with data (`partial_index`, `stale_graph`, `stale_worktree`: the pack records `graph.degraded=true`), and `current_sha` must equal the head (the checkout is at the review head). A blocking status (`missing_graph`, `building`, `rebuild_required`, error) is `GRAPH_PREP_REQUIRED`, which now means: run `crg-heal --repo REPO --json` once, re-read the status, continue (see `context-efficient-code-research`). `source_matches_build` is not required; gaps stay visible per file.
+3. Probe once with `scripts/graph_health.py --repo REPO --head HEAD_SHA --coverage`. It reads only the CLI JSON (`status --json`, `coverage --json`) and exits 2 with `"marker": "GRAPH_PREP_REQUIRED"` only for a blocking status or a checkout that is not at the head; a graph built at another commit, or `missing_from_graph_total > 0`, stays exit 0 `degraded` and the missing files get a `fallback` disposition.
+4. Build the packet with `scripts/build_context_pack.py`, passing the status JSON as `--graph-receipt`. It adds changed nodes and one-hop callers/callees from a single `code-review-graph impact` call (JSON), never from the database. When `crg-heal` exited 4, omit the receipt: the pack records `graph.status=fallback`.
 5. Attach the risk panel: run `code-review-graph detect-changes --brief --base BASE --repo REPO` into the pack output root as `risk-panel.txt`. The reviewer reads it as the risk orientation for the whole diff (advisory; not hash-bound into `context-pack.json`). JSP, JS and CSS changes carry risk too.
 6. Pass only the absolute `context-pack.json` path. The reviewer starts with `read_context_pack.py summary` and reads individual hunk artifacts on demand.
 7. Treat every changed source file as covered only when its graph disposition is `indexed` or an explicit `fallback` is recorded.
@@ -42,10 +42,11 @@ The builder uses `base...head`, records the merge base and SHA-256 of `diff.patc
 | Condition | Result |
 |---|---|
 | Base/head is not a commit | Stop before review |
-| Receipt missing, or `readiness.status` not `ok`/`partial_index` | Return `GRAPH_PREP_REQUIRED` before reviewer dispatch |
-| Coverage gate: `missing_from_graph_total > 0`, or `built_at_commit`/`current_sha` differ from the head | Return `GRAPH_PREP_REQUIRED` naming the gap |
-| `partial_index` receipt | Build the pack; `graph.degraded=true`, and reviewers name the degradation in graph-backed claims |
-| Graph unavailable after a recorded preparation attempt | Omit the receipt; `graph.status=fallback` records the semantic degradation |
+| Receipt missing, or `readiness.status` blocking (`missing_graph`, `building`, `rebuild_required`, error) | Run `crg-heal` once and re-read; still blocking: omit the receipt (`graph.status=fallback`) |
+| `current_sha` differs from the head (wrong checkout) | Stop; check out the review head first |
+| Coverage gate: `missing_from_graph_total > 0`, or `built_at_commit` differs from the head | Build the pack; the missing files get `fallback` dispositions and the reasons name the gap |
+| `partial_index`, `stale_graph` or `stale_worktree` receipt | Build the pack; `graph.degraded=true`, and reviewers name the degradation in graph-backed claims |
+| `crg-heal` exited 4 | Omit the receipt; `graph.status=fallback` records the semantic degradation |
 | Same output path contains a different pack | Stop; never overwrite |
 | Consumer sees a mismatched pack id or SHA | Reject the review |
 | Diff/hunk exceeds its review budget | Do not dispatch; split or ESCALATE |
@@ -58,8 +59,8 @@ The legacy `--graph-db` flag is accepted for old callers, but its path is ignore
 ## Common mistakes
 
 - Using `git diff base head`: branch drift enters the review. Use the builder.
-- Building or updating the graph inside a reviewer: return `GRAPH_PREP_REQUIRED`; the root controller prepares once per worktree.
-- Treating an unprepared graph as fallback: fallback requires a recorded preparation failure or unavailable graph lane.
+- Building, updating or cloning the graph by hand inside a reviewer: one `crg-heal` call is the only heal.
+- Treating a blocking graph as fallback before `crg-heal`: fallback requires a heal that exited 4 or an unavailable graph lane.
 - Treating a graph miss as absence: record the fallback and use focused text inspection.
 - Skipping the graph because RTK is faster: the graph receipt and orientation come first; RTK is the bounded fallback and text surface.
 - Reading `diff.patch` wholesale: use the summary, file slice, and exact hunk artifacts.
