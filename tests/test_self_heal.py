@@ -38,6 +38,49 @@ def test_eligibility_lets_only_incremental_staleness_heal():
     assert not common._self_heal_eligible(None)
 
 
+def test_eligibility_lets_untracked_missing_files_heal_a_stale_worktree():
+    def worktree(**identity):
+        return _receipt(
+            "stale_worktree", ["worktree_changed"], built_at_commit="abc",
+            source_identity={"check": "full", **identity},
+        )
+
+    assert common._self_heal_eligible(worktree(missing_indexed_count=1))
+    assert not common._self_heal_eligible(worktree(missing_indexed_count=0))
+    assert not common._self_heal_eligible(worktree())
+    assert not common._self_heal_eligible(
+        worktree(missing_indexed_count=1, check="unavailable"))
+    assert not common._self_heal_eligible(
+        _receipt("stale_worktree", ["worktree_changed"],
+                 source_identity={"check": "full", "missing_indexed_count": 1}))
+
+
+def test_graph_receipt_heals_an_untracked_file(tmp_path: Path, monkeypatch):
+    """A new untracked source file is indexed by the query-time catch-up."""
+    monkeypatch.setenv("CRG_RECEIPT_TTL", "0")
+    common._self_heal_last.clear()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "core.hooksPath", str(repo / ".no-hooks"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+    from code_review_graph.tools.build import build_or_update_graph
+
+    build_or_update_graph(repo_root=str(repo), postprocess="none")
+    (repo / "fresh.py").write_text("def fresh():\n    return 2\n", encoding="utf-8")
+
+    monkeypatch.setenv("CRG_SELF_HEAL_BUDGET", "0")
+    stale = common.graph_receipt(str(repo))
+    assert stale["status"] == "stale_worktree", stale
+    assert stale["source_identity"]["missing_indexed_count"] == 1
+
+    monkeypatch.setenv("CRG_SELF_HEAL_BUDGET", "120")
+    healed = common.graph_receipt(str(repo))
+    assert healed["status"] == "ok", healed
+
+
 class _Rc0:
     returncode = 0
     stdout = b""

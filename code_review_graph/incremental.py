@@ -1235,6 +1235,25 @@ def get_changed_files_strict(repo_root: Path, base: str = "HEAD~1") -> Optional[
     return _decode_name_status_paths(output)
 
 
+def _unindexed_untracked_files(repo_root: Path, store: GraphStore) -> list[str]:
+    """Untracked, indexable, not-ignored files without a File node.
+
+    ``git diff`` never lists untracked paths, so no update could clear the
+    ``stale_worktree`` readiness they cause. The filter is the one readiness
+    itself uses, so discovery and the drift check cannot disagree.
+    """
+    if detect_vcs(repo_root) != "git":
+        return []
+    output = _git_diff_output(repo_root, ["ls-files", "--others", "--exclude-standard", "-z"])
+    if not output:
+        return []
+    from .tools._common import working_tree_drift_conn
+
+    untracked = [os.fsdecode(raw) for raw in output.split(b"\0") if raw]
+    missing = set(working_tree_drift_conn(repo_root, store._conn, untracked)["missing"])
+    return [rel for rel in untracked if normalize_file_path(repo_root / rel) in missing]
+
+
 def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     """Get list of changed files via git diff or svn status.
 
@@ -2099,6 +2118,8 @@ def _incremental_update_journaled(
             ),
         }
     changed: list[str] = discovered
+    if auto_discovery:
+        changed = list(dict.fromkeys(changed + _unindexed_untracked_files(repo_root, store)))
     # A changed ignore policy is invisible to a diff: files it newly admits were
     # never in the graph and never appear in `git diff`, so without this they
     # stay missing until a full rebuild. Comparison happens before any inventory

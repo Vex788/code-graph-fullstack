@@ -2115,6 +2115,10 @@
               "type": "integer",
               "minimum": 0
             },
+            "missing_indexed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
             "check": {
               "enum": [
                 "full",
@@ -2295,6 +2299,10 @@
               }
             },
             "edited_indexed_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "missing_indexed_count": {
               "type": "integer",
               "minimum": 0
             },

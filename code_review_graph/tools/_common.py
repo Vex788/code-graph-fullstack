@@ -383,6 +383,10 @@ def _compute_graph_receipt(root: Path, db_path: Path) -> dict[str, Any] | None:
             "edited_indexed_count": len((report.drift or {}).get("mismatched", [])),
         },
     })
+    if facts.source_matches is not True:
+        drift = report.drift or {}
+        receipt["source_identity"]["missing_indexed_count"] = len(drift.get("missing", []))
+        receipt["source_identity"]["check"] = drift.get("check", "unavailable")
     if git_ok and facts.built_at_commit:
         receipt["head_matches_build"] = head_matches(facts)
     receipt["etag"] = _receipt_etag([
@@ -422,16 +426,23 @@ _self_heal_last: dict[str, float] = {}
 def _self_heal_eligible(receipt: dict[str, Any] | None) -> bool:
     """Only staleness an incremental update can fix, and only with an anchor.
 
+    ``stale_worktree`` qualifies only for untracked/missing files.
     ``git_unavailable`` means git itself failed (an update would too), and a
     missing anchor would full-rebuild inside the budget, which stays the root
     controller's call. ``rebuild_required``/``missing_graph`` never heal.
     """
-    if not receipt or receipt.get("status") != "stale_graph":
+    if not receipt or not receipt.get("built_at_commit"):
+        return False
+    if receipt.get("status") == "stale_worktree":
+        # Untracked files an update now indexes; mismatched or unavailable
+        # checks are not something an update can clear.
+        identity = receipt.get("source_identity") or {}
+        missing = identity.get("missing_indexed_count", 0)
+        return identity.get("check") != "unavailable" and missing > 0
+    if receipt.get("status") != "stale_graph":
         return False
     reasons = set(receipt.get("reasons") or [])
-    if not reasons & {"head_moved", "git_capture_failed"}:
-        return False
-    return bool(receipt.get("built_at_commit"))
+    return bool(reasons & {"head_moved", "git_capture_failed"})
 
 
 def _run_self_heal(root: Path, db_path: Path) -> dict[str, Any] | None:

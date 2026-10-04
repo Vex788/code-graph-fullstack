@@ -72,6 +72,8 @@ _SOURCE_IDENTITY_SCHEMA: dict[str, Any] = {
         "mismatched_indexed_paths": {"type": "array", "items": {"type": "string"}},
         # Edited indexed files: reported, never part of source_matches_build.
         "edited_indexed_count": {"type": "integer", "minimum": 0},
+        # Receipt only, and only when the source does not match the build.
+        "missing_indexed_count": {"type": "integer", "minimum": 0},
         "check": {"enum": ["full", "partial", "unavailable"]},
     },
 }

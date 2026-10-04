@@ -2229,3 +2229,68 @@ class TestAnchorAdvancesOnFullyHashSkippedUpdate:
             assert store.get_metadata("git_head_sha") == second_head
         finally:
             store.close()
+
+
+class TestUntrackedDiscovery:
+    """`git diff` never lists untracked files, so update must add them itself."""
+
+    def _git(self, cwd, *args):
+        subprocess.run(
+            [
+                "git", "-c", "core.hookspath=",
+                "-c", "user.email=t@test", "-c", "user.name=t", *args,
+            ],
+            cwd=str(cwd), check=True, capture_output=True,
+        )
+
+    def _built(self, tmp_path, files):
+        root = tmp_path / "repo"
+        root.mkdir()
+        for name, text in files.items():
+            (root / name).write_text(text)
+        self._git(root, "init", "-q")
+        self._git(root, "add", ".")
+        self._git(root, "commit", "-qm", "init")
+        store = GraphStore(tmp_path / "g.db")
+        full_build(root, store)
+        return root, store
+
+    def _status(self, root, tmp_path):
+        from code_review_graph.readiness_facts import gather_report
+
+        return gather_report(root, tmp_path / "g.db").readiness.status.value
+
+    def test_update_indexes_an_untracked_source_file(self, tmp_path):
+        root, store = self._built(tmp_path, {"a.py": "def one():\n    return 1\n"})
+        try:
+            (root / "new.py").write_text("def fresh():\n    return 2\n")
+            assert self._status(root, tmp_path) == "stale_worktree"
+
+            result = incremental_update(
+                root, store, base=resolve_incremental_base(root, store),
+            )
+
+            assert "new.py" in result["changed_files"]
+            assert store.get_file_hash(str(root / "new.py"))
+            assert self._status(root, tmp_path) == "ok"
+        finally:
+            store.close()
+
+    def test_ignored_and_unsupported_untracked_files_stay_out(self, tmp_path):
+        root, store = self._built(
+            tmp_path, {"a.py": "def one():\n    return 1\n", ".gitignore": "skip.py\n"},
+        )
+        try:
+            (root / "skip.py").write_text("def hidden():\n    return 3\n")
+            (root / "notes.txt").write_text("plain text\n")
+
+            result = incremental_update(
+                root, store, base=resolve_incremental_base(root, store),
+            )
+
+            assert result["changed_files"] == []
+            assert store.get_file_hash(str(root / "skip.py")) is None
+            assert store.get_file_hash(str(root / "notes.txt")) is None
+            assert self._status(root, tmp_path) == "ok"
+        finally:
+            store.close()
