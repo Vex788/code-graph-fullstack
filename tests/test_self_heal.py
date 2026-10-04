@@ -81,6 +81,34 @@ def test_graph_receipt_heals_an_untracked_file(tmp_path: Path, monkeypatch):
     assert healed["status"] == "ok", healed
 
 
+def test_oversize_untracked_file_never_triggers_a_catch_up(tmp_path: Path, monkeypatch):
+    """The loop: an unindexable big file read as 'missing' forever and re-ran every update."""
+    monkeypatch.setenv("CRG_RECEIPT_TTL", "0")
+    monkeypatch.setenv("CRG_MAX_FILE_BYTES", "400")
+    common._self_heal_last.clear()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def handle():\n    return 1\n", encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "core.hooksPath", str(repo / ".no-hooks"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+    from code_review_graph.tools.build import build_or_update_graph
+
+    build_or_update_graph(repo_root=str(repo), postprocess="none")
+    (repo / "big.py").write_text("def big():\n" + "    x = 1\n" * 200, encoding="utf-8")
+
+    def _must_not_run(*args, **kwargs):
+        pytest.fail("an oversize untracked file must not start a catch-up update")
+
+    monkeypatch.setattr(common, "_run_self_heal", _must_not_run)
+    monkeypatch.setenv("CRG_SELF_HEAL_BUDGET", "120")
+    receipt = common.graph_receipt(str(repo))
+    assert receipt["status"] == "ok", receipt
+    assert receipt["source_identity"]["skipped_oversize_count"] == 1
+    assert "missing_indexed_count" not in receipt["source_identity"]
+
+
 class _Rc0:
     returncode = 0
     stdout = b""

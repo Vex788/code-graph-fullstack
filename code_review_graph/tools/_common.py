@@ -383,10 +383,12 @@ def _compute_graph_receipt(root: Path, db_path: Path) -> dict[str, Any] | None:
             "edited_indexed_count": len((report.drift or {}).get("mismatched", [])),
         },
     })
+    drift = report.drift or {}
     if facts.source_matches is not True:
-        drift = report.drift or {}
         receipt["source_identity"]["missing_indexed_count"] = len(drift.get("missing", []))
         receipt["source_identity"]["check"] = drift.get("check", "unavailable")
+    if drift.get("skipped_oversize"):
+        receipt["source_identity"]["skipped_oversize_count"] = len(drift["skipped_oversize"])
     if git_ok and facts.built_at_commit:
         receipt["head_matches_build"] = head_matches(facts)
     receipt["etag"] = _receipt_etag([
@@ -742,11 +744,18 @@ def working_tree_drift_conn(
     import hashlib
     import json as _json
 
-    from ..incremental import _is_binary, _load_ignore_patterns, _should_ignore
+    from ..incremental import (
+        _is_binary,
+        _load_ignore_patterns,
+        _max_file_bytes,
+        _oversized_bytes,
+        _should_ignore,
+    )
     from ..parser import CodeParser, normalize_file_path
 
     result: dict[str, Any] = {
-        "missing": [], "mismatched": [], "deleted": [], "check": "full",
+        "missing": [], "mismatched": [], "deleted": [], "skipped_oversize": [],
+        "check": "full",
     }
     try:
         live = list(dirty) if dirty is not None else read_dirty_paths(root)
@@ -775,7 +784,9 @@ def working_tree_drift_conn(
 
     patterns = _load_ignore_patterns(root)
     parser = CodeParser()
+    size_limit = _max_file_bytes()
     on_disk: dict[str, Path] = {}
+    oversize: set[str] = set()
     gone: list[str] = []
     for relative in sorted(candidates):
         path = root / relative
@@ -786,7 +797,10 @@ def working_tree_drift_conn(
             continue
         if _is_binary(path) or parser.detect_language(path) is None:
             continue
-        on_disk[normalize_file_path(path)] = path
+        key = normalize_file_path(path)
+        on_disk[key] = path
+        if _oversized_bytes(path, size_limit) is not None:
+            oversize.add(key)
 
     lookup = sorted(set(on_disk) | set(gone))
     if not lookup:
@@ -803,7 +817,9 @@ def working_tree_drift_conn(
     for absolute, path in sorted(on_disk.items()):
         stored = indexed.get(absolute)
         if stored is None:
-            result["missing"].append(absolute)
+            # The parser never reads a file over the size limit, so it can
+            # never gain a node: reported, not drift.
+            result["skipped_oversize" if absolute in oversize else "missing"].append(absolute)
             continue
         if hashed >= _DRIFT_HASH_CAP:
             result["check"] = "partial"

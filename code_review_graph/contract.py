@@ -70,6 +70,9 @@ _SOURCE_IDENTITY_SCHEMA: dict[str, Any] = {
         "missing_indexed_paths": {"type": "array", "items": {"type": "string"}},
         "deleted_indexed_paths": {"type": "array", "items": {"type": "string"}},
         "mismatched_indexed_paths": {"type": "array", "items": {"type": "string"}},
+        # Over CRG_MAX_FILE_BYTES: never parsed, so reported and never drift.
+        "skipped_oversize_paths": {"type": "array", "items": {"type": "string"}},
+        "skipped_oversize_count": {"type": "integer", "minimum": 0},
         # Edited indexed files: reported, never part of source_matches_build.
         "edited_indexed_count": {"type": "integer", "minimum": 0},
         # Receipt only, and only when the source does not match the build.

@@ -152,6 +152,47 @@ def test_new_untracked_java_file_is_stale_worktree(tmp_path):
     assert report.source_identity["missing_indexed_paths"] == [str(repo / "Fresh.java")]
 
 
+def test_oversize_untracked_file_is_skipped_not_missing(tmp_path, monkeypatch):
+    """A file the parser never reads cannot be indexed: reported, never permanent drift."""
+    from code_review_graph.readiness_facts import gather_report
+
+    monkeypatch.setenv("CRG_MAX_FILE_BYTES", "200")
+    repo, db = _repo(tmp_path)
+    big = repo / "Big.java"
+    big.write_text("class Big {}\n" + "// pad\n" * 100, encoding="utf-8")
+    report = gather_report(repo, db)
+    assert report.readiness.status.value == "ok"
+    identity = report.source_identity
+    assert identity["source_matches_build"] is True
+    assert identity["missing_indexed_paths"] == []
+    assert identity["skipped_oversize_paths"] == [str(big)]
+
+
+def test_oversize_file_does_not_hide_a_small_untracked_one(tmp_path, monkeypatch):
+    from code_review_graph.readiness_facts import gather_report
+
+    monkeypatch.setenv("CRG_MAX_FILE_BYTES", "200")
+    repo, db = _repo(tmp_path)
+    big, small = repo / "Big.java", repo / "Small.java"
+    big.write_text("class Big {}\n" + "// pad\n" * 100, encoding="utf-8")
+    small.write_text("class Small {}\n", encoding="utf-8")
+    report = gather_report(repo, db)
+    assert report.readiness.status.value == "stale_worktree"
+    assert report.source_identity["missing_indexed_paths"] == [str(small)]
+    assert report.source_identity["skipped_oversize_paths"] == [str(big)]
+
+
+def test_file_under_the_limit_is_still_missing(tmp_path, monkeypatch):
+    from code_review_graph.readiness_facts import gather_report
+
+    monkeypatch.setenv("CRG_MAX_FILE_BYTES", "4096")
+    repo, db = _repo(tmp_path)
+    (repo / "Fresh.java").write_text("class Fresh {}\n", encoding="utf-8")
+    report = gather_report(repo, db)
+    assert report.readiness.status.value == "stale_worktree"
+    assert report.source_identity["skipped_oversize_paths"] == []
+
+
 def test_deleted_indexed_file_is_stale_worktree(tmp_path):
     from code_review_graph.readiness_facts import gather_report
 

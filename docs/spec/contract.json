@@ -2111,6 +2111,16 @@
                 "type": "string"
               }
             },
+            "skipped_oversize_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "skipped_oversize_count": {
+              "type": "integer",
+              "minimum": 0
+            },
             "edited_indexed_count": {
               "type": "integer",
               "minimum": 0
@@ -2297,6 +2307,16 @@
               "items": {
                 "type": "string"
               }
+            },
+            "skipped_oversize_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "skipped_oversize_count": {
+              "type": "integer",
+              "minimum": 0
             },
             "edited_indexed_count": {
               "type": "integer",

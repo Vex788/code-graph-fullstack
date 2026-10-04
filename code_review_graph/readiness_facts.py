@@ -67,6 +67,7 @@ class ReadinessReport:
             "missing_indexed_paths": list(drift.get("missing", [])),
             "deleted_indexed_paths": list(drift.get("deleted", [])),
             "mismatched_indexed_paths": list(drift.get("mismatched", [])),
+            "skipped_oversize_paths": list(drift.get("skipped_oversize", [])),
             "edited_indexed_count": len(drift.get("mismatched", [])),
             "check": drift.get("check", "unavailable"),
         }

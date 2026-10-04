@@ -24,6 +24,10 @@ returns one status plus every failed reason. The most severe status wins:
 
 Edited indexed files alone do not make a graph `stale_worktree`: they are
 counted in `source_identity.edited_indexed_count` and the hook updates them.
+Likewise an indexable file over `CRG_MAX_FILE_BYTES` that has no node is never
+parsed, so it is listed in `source_identity.skipped_oversize_paths` (`skipped_oversize_count`
+in the `_graph` receipt) instead of counting as drift; it can never be indexed, so
+treating it as `stale_worktree` would re-run every update forever.
 
 Embeddings have their own sub-state, independent of the status above:
 
