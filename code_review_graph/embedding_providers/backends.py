@@ -30,6 +30,8 @@ QWEN_QUERY = (
     "Query:{text}"
 )
 MAX_TOKENS = 512
+MLX_CACHE_BYTES = 512 * 1024 * 1024  # Metal buffer cache cap for the MLX embedder
+MLX_PAD_MULTIPLE = 32  # few distinct batch shapes keep the cache small
 
 
 def truncate_normalize(matrix: Any, dim: int) -> Any:
@@ -132,12 +134,17 @@ class LocalModelProvider(EmbeddingProvider):
                 self._model = self._load()
                 self.load_seconds = time.perf_counter() - started
                 logger.info("Loaded embedding model %s in %.1fs", self.name, self.load_seconds)
-            for i in range(0, len(prompted), self._batch_size):
-                batch = prompted[i:i + self._batch_size]
+            # Length-sorted batches keep padding small; the rows are restored below.
+            order = sorted(range(len(prompted)), key=lambda i: len(prompted[i]))
+            for i in range(0, len(order), self._batch_size):
+                batch = [prompted[j] for j in order[i:i + self._batch_size]]
                 chunks.append(np.asarray(self._encode(self._model, batch, query),
                                          dtype=np.float32))
             self._arm_idle_timer()
-        return truncate_normalize(np.vstack(chunks), self._dim)
+        matrix = np.vstack(chunks)
+        restored = np.empty_like(matrix)
+        restored[order] = matrix
+        return truncate_normalize(restored, self._dim)
 
     def embed_documents_array(self, texts: Sequence[str]) -> Any:
         return self._vectors(list(texts), query=False)
@@ -204,8 +211,15 @@ class MlxEmbeddingsProvider(LocalModelProvider):
     document_template = GEMMA_DOCUMENT
 
     def _load(self) -> Any:
+        import mlx.core as mx
         from mlx_embeddings import load
 
+        # Batch shapes vary with text length; an unbounded Metal buffer cache grows
+        # by gigabytes during a full index.
+        limit = getattr(mx, "set_cache_limit", None) or getattr(
+            getattr(mx, "metal", None), "set_cache_limit", None)
+        if limit is not None:
+            limit(MLX_CACHE_BYTES)
         return load(self.model_name)
 
     def _encode(self, model: Any, texts: list[str], query: bool) -> Any:
@@ -218,7 +232,7 @@ class MlxEmbeddingsProvider(LocalModelProvider):
         # on every batch; tokenize here and call the net positionally.
         batch = tokenizer(
             texts, return_tensors="mlx", padding=True,
-            truncation=True, max_length=MAX_TOKENS,
+            truncation=True, max_length=MAX_TOKENS, pad_to_multiple_of=MLX_PAD_MULTIPLE,
         )
         outputs = net(batch["input_ids"], batch.get("attention_mask"))
         return np.array(outputs.text_embeds.astype(mx.float32))

@@ -7,8 +7,8 @@ optional backends are importable, so every branch is testable without a model.
 profile    backend (first importable wins)              dim     extra
 =========  ===========================================  ======  ====================
 fast       model2vec ``minishlab/potion-code-16M-v2``   256     embeddings-fast
-balanced   MLX ``mlx-embeddings`` (darwin-arm64, only   256     embeddings-mlx
-           after the ONNX parity check passed), else            embeddings-onnx
+balanced   MLX ``mlx-embeddings`` (darwin-arm64, a      256     embeddings-mlx
+           dependency there, so it just works), else            embeddings-onnx
            fastembed ONNX ``google/embeddinggemma-300m``
 accurate   mlx-lm ``Qwen3-Embedding-0.6B-4bit-DWQ``     512     embeddings-mlx
            (darwin-arm64 only; elsewhere -> balanced)
@@ -58,7 +58,7 @@ FAST = BackendSpec(
     256, 256, True, "embeddings-fast",
 )
 BALANCED_MLX = BackendSpec(
-    "mlx", "mlx_embeddings", "mlx-community/embeddinggemma-300m-4bit", "q4",
+    "mlx", "mlx_embeddings", "mlx-community/embeddinggemma-300m-bf16", "bf16",
     768, 256, True, "embeddings-mlx", (MAC_ARM,),
 )
 BALANCED_ONNX = BackendSpec(
@@ -167,7 +167,7 @@ def resolve_profile(
         has_module: import probe; defaults to :func:`module_available`.
         mlx_parity: result of the MLX-vs-ONNX parity check recorded at
             ``embeddings enable`` (None: never checked). MLX serves
-            ``balanced`` only when it is True.
+            ``balanced`` unless it is False.
     """
     platform = platform or platform_key()
     probe = has_module or module_available
@@ -189,15 +189,11 @@ def resolve_profile(
     for spec in PROFILE_BACKENDS[profile]:
         if not spec.supports(platform) or not probe(spec.module):
             continue
-        if spec is BALANCED_MLX and mlx_parity is not True:
-            if mlx_parity is False:
-                notes.append("MLX failed the parity check against ONNX; using ONNX")
-            elif not probe(BALANCED_ONNX.module):
-                notes.append(
-                    "MLX is used for 'balanced' only after its parity check against the "
-                    "ONNX reference; install embeddings-onnx and run "
-                    "`code-review-graph embeddings enable`"
-                )
+        # MLX serves 'balanced' unless a recorded parity check against ONNX failed and
+        # ONNX is installed to take over. The default bf16 build agrees with fp32
+        # (min cosine 0.989 on pms code); the 8/4-bit builds do not (0.86).
+        if spec is BALANCED_MLX and mlx_parity is False and probe(BALANCED_ONNX.module):
+            notes.append("MLX failed the parity check against ONNX; using ONNX")
             continue
         chosen = spec
         break

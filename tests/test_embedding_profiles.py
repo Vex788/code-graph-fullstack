@@ -40,11 +40,11 @@ def _has(*modules):
     ("fast", LINUX, ("model2vec",), None, "model2vec", "fast", None),
     ("fast", MAC, ("model2vec",), None, "model2vec", "fast", None),
     ("fast", LINUX, (), None, None, "fast", "embeddings-fast"),
-    # balanced: MLX only on Apple Silicon and only after a passed parity check
+    # balanced: MLX on Apple Silicon unless a recorded parity check against ONNX failed
     ("balanced", MAC, ("mlx_embeddings", "fastembed"), True, "mlx", "balanced", None),
-    ("balanced", MAC, ("mlx_embeddings", "fastembed"), None, "onnx", "balanced", None),
+    ("balanced", MAC, ("mlx_embeddings", "fastembed"), None, "mlx", "balanced", None),
     ("balanced", MAC, ("mlx_embeddings", "fastembed"), False, "onnx", "balanced", "parity"),
-    ("balanced", MAC, ("mlx_embeddings",), None, None, "balanced", "parity check"),
+    ("balanced", MAC, ("mlx_embeddings",), None, "mlx", "balanced", None),
     ("balanced", MAC, ("mlx_embeddings",), True, "mlx", "balanced", None),
     ("balanced", MAC, ("fastembed",), None, "onnx", "balanced", None),
     ("balanced", LINUX, ("mlx_embeddings", "fastembed"), True, "onnx", "balanced", None),
@@ -94,7 +94,7 @@ def test_mlx_balanced_provider_id_differs_from_onnx():
                                    has_module=_has("mlx_embeddings", "fastembed"))
     onnx = profiles.resolve_profile(settings, platform=LINUX,
                                     has_module=_has("mlx_embeddings", "fastembed"))
-    assert mlx.provider_id == "mlx:mlx-community/embeddinggemma-300m-4bit:q4:d256"
+    assert mlx.provider_id == "mlx:mlx-community/embeddinggemma-300m-bf16:bf16:d256"
     assert mlx.provider_id != onnx.provider_id
 
 
@@ -204,8 +204,9 @@ def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fak
             out[:, 0], out[:, 1], out[:, 300] = 3.0, 4.0, 100.0  # beyond the 256 prefix
             return SimpleNamespace(text_embeds=_mx_array(out))
 
-    def tokenizer(texts, return_tensors, padding, truncation, max_length):
+    def tokenizer(texts, return_tensors, padding, truncation, max_length, pad_to_multiple_of=None):
         assert return_tensors == "mlx" and padding and truncation
+        assert pad_to_multiple_of == backends.MLX_PAD_MULTIPLE
         calls.append(list(texts))
         n = max(len(t) for t in texts)
         return {"input_ids": np.full((len(texts), n), 1),
@@ -266,9 +267,10 @@ def test_mlx_lm_provider_pools_last_token_with_end_token(monkeypatch, fake_mlx):
     provider = backends.MlxLmProvider(profiles.ACCURATE_MLX, "q", 512, idle_unload_s=0)
     vectors = provider.embed_documents_array(["aa b", "a"])
     batch = net.batches[0]
-    assert batch.tolist() == [[12, 11, 9], [11, 9, 9]]  # right-padded with the end token
+    # Batches run shortest first; the rows come back in input order below.
+    assert batch.tolist() == [[11, 9, 9], [12, 11, 9]]  # right-padded with the end token
     # Pooled rows are the last real token (the end token) of each sequence.
-    raw = np.array([[9.0, 2.0], [9.0, 1.0]])
+    raw = np.array([[9.0, 2.0], [9.0, 1.0]])  # input order: "aa b" then "a"
     expected = raw / np.linalg.norm(raw, axis=1, keepdims=True)
     assert vectors.shape == (2, 512)
     assert vectors[:, :2] == pytest.approx(expected)
@@ -336,6 +338,23 @@ class _CountingProvider(backends.LocalModelProvider):
 
     def _encode(self, model, texts, query):
         return np.ones((len(texts), 4), dtype=np.float32)
+
+
+class _LengthProvider(backends.LocalModelProvider):
+    def _load(self):
+        return object()
+
+    def _encode(self, model, texts, query):
+        return np.array([[float(len(t)), 1.0] for t in texts], dtype=np.float32)
+
+
+@needs_numpy
+def test_sorted_batches_keep_the_input_order():
+    provider = _LengthProvider(profiles.FAST, "m", 2, batch_size=2, idle_unload_s=0)
+    texts = ["x" * n for n in (9, 1, 5, 3, 7)]
+    got = provider.embed_documents_array(texts)
+    expected = backends.truncate_normalize([[float(n), 1.0] for n in (9, 1, 5, 3, 7)], 2)
+    assert got.tolist() == expected.tolist()
 
 
 @needs_numpy
