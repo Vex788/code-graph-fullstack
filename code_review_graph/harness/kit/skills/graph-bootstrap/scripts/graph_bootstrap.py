@@ -30,6 +30,10 @@ TOTAL_BUDGET_SECONDS = 840
 assert SEED_REFRESH_SECONDS + CLONE_SECONDS + 2 * STATUS_SECONDS <= TOTAL_BUDGET_SECONDS
 
 LOCK_BUSY = 75
+UPDATE_LOCK_WAIT_SECONDS = 60
+SEED_BUILD_WAIT_SECONDS = 120
+SEED_POLL_SECONDS = 5
+TEMPORARY_ROOTS = (Path("/tmp"), Path("/private/tmp"))
 # partial_index is not a seed: its gaps would be copied into every clone.
 USABLE_SEED = {"ok", "stale_graph", "stale_worktree"}
 STALE = {"stale_graph", "stale_worktree"}
@@ -82,15 +86,59 @@ def git_head(root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def is_temporary_root(root: Path) -> bool:
+    """A root no graph may be seeded from: scratch tmp or an in-flight worktree."""
+    resolved = root.resolve()
+    return (".orca-preparing" in resolved.parts
+            or any(resolved == tmp or resolved.is_relative_to(tmp) for tmp in TEMPORARY_ROOTS))
+
+
+def wait_out_build(seed: Path, wait_seconds: float) -> str:
+    """Poll a ``building`` seed until it leaves that state or *wait_seconds* run out."""
+    deadline = time.monotonic() + wait_seconds
+    interval = min(SEED_POLL_SECONDS, wait_seconds)
+    while True:
+        time.sleep(max(min(interval, deadline - time.monotonic()), 0))
+        status, _ = readiness("seed-status", seed, STATUS_SECONDS)
+        if status != "building" or time.monotonic() >= deadline:
+            return status
+
+
+def catch_up(worktree: Path, seconds: float) -> str:
+    """One ``update`` after a ``--no-update`` clone; '' when it finished, else why it did not.
+
+    A timeout leaves the re-rooted clone readable: ``stale_graph``, or ``partial_index`` when
+    the killed update had opened its write epoch (the next update recovers it).
+    """
+    if seconds <= 0:
+        return "no budget left for the post-clone update"
+    try:
+        done = run("update", ["update", "--skip-flows", "--if-locked=wait", "--lock-wait",
+                              str(UPDATE_LOCK_WAIT_SECONDS), "--repo", str(worktree)], seconds)
+    except StageError as error:
+        return str(error)
+    return "" if done.returncode in (0, 3) else f"update exited {done.returncode}"
+
+
 def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds: float,
-              force: bool = True, lock_wait: float | None = None) -> dict:
+              force: bool = True, lock_wait: float | None = None,
+              update_seconds: float | None = None,
+              seed_build_wait_seconds: float = SEED_BUILD_WAIT_SECONDS) -> dict:
+    """Clone *seed* into *worktree*. With *update_seconds* the clone runs ``--no-update`` and the
+    catch-up update is its own stage, cut at that timeout or the end of *clone_seconds*."""
+    worktree = Path(worktree).resolve()
+    if is_temporary_root(worktree):
+        return {"status": "skip", "reason": "temporary root"}
     head = git_head(worktree)
     if not head:
         return {"status": "skip", "reason": "worktree is not a git checkout"}
     seed_status, _ = readiness("seed-status", seed, STATUS_SECONDS)
+    if seed_status == "building":
+        seed_status = wait_out_build(seed, seed_build_wait_seconds)
     if seed_status not in USABLE_SEED:
-        return {"status": "skip", "reason": f"seed graph is {seed_status}",
-                "seed_readiness": seed_status}
+        reason = (f"seed graph is still building after {seed_build_wait_seconds:g}s"
+                  if seed_status == "building" else f"seed graph is {seed_status}")
+        return {"status": "skip", "reason": reason, "seed_readiness": seed_status}
     refresh_note = ""
     if seed_status in STALE and refresh_seconds > 0:
         refresh = run("seed-refresh", ["update", "--skip-flows", "--if-locked=skip",
@@ -105,6 +153,8 @@ def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds:
     clone_args = ["clone-graph", "--from", str(seed), "--to", str(worktree), "--json"]
     if force:
         clone_args.append("--force")
+    if update_seconds is not None:
+        clone_args.append("--no-update")
     if lock_wait is not None:
         clone_args += ["--lock-wait", f"{lock_wait:g}"]
     clone = run("clone-graph", clone_args, clone_seconds)
@@ -115,6 +165,10 @@ def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds:
         cloned = json.loads(clone.stdout)
     except ValueError:
         cloned = {}
+    update_note = ""
+    if update_seconds is not None:
+        left = clone_seconds - (time.time() - started)
+        update_note = catch_up(worktree, min(update_seconds, left))
     status, doc = readiness("verify", worktree, STATUS_SECONDS)
     if status == "ok":
         verdict = "ok"
@@ -135,6 +189,7 @@ def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds:
         "worktree_head": head[:12],
         "seed_readiness": seed_status,
         "seed_refresh_note": refresh_note,
+        "update_note": update_note,
     }
 
 
@@ -149,13 +204,17 @@ def main() -> int:
                         help="update a stale seed first, for at most this long (0 skips)")
     parser.add_argument("--clone-seconds", type=float, default=CLONE_SECONDS,
                         help="time allowed for clone-graph including its update")
+    parser.add_argument("--seed-build-wait-seconds", type=float,
+                        default=SEED_BUILD_WAIT_SECONDS,
+                        help="poll a building seed for at most this long before skipping")
     parser.add_argument("--bootstrap-graph", action="store_true",
                         help="accepted from the pipeline's prepare step")
     args = parser.parse_args()
     budget = args.refresh_seed_seconds + args.clone_seconds + 2 * STATUS_SECONDS
     try:
         result = bootstrap(args.worktree.resolve(), args.seed.resolve(),
-                           args.refresh_seed_seconds, args.clone_seconds)
+                           args.refresh_seed_seconds, args.clone_seconds,
+                           seed_build_wait_seconds=args.seed_build_wait_seconds)
     except StageError as error:
         result = {"status": "failed", "stage": error.stage, "error": str(error)}
     result["budget_seconds"] = budget

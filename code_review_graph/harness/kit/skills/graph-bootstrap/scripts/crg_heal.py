@@ -3,14 +3,17 @@
 
 Self-heal covers a graph that exists. This covers what it refuses: a missing graph
 or ``rebuild_required`` on a PMS worktree is cloned from a validated seed graph
-(``clone-graph``), a ``building`` graph is polled, never rebuilt. The seed itself,
-when it has no graph, is cloned once from the main PMS checkout if that is ``ok``
-(then caught up with one ``update``). ``--clone-only`` (crg-reconcile) skips every
+(``clone-graph --no-update``, then ``update`` as its own timed stage: a timeout leaves the
+clone usable, ``stale_graph``, exit 3), a ``building`` graph is polled, never rebuilt, and so
+is a ``building`` seed before a clone. The seed itself, when it has no graph, is cloned
+once from the main PMS checkout if that is ``ok``. ``--clone-only`` (crg-reconcile) skips every
 other heal. Scope is an allowlist (the PMS checkout, ``sp_api_library``, their
 worktrees and the seed); every other path exits 4 with ``out_of_scope``. A per-repo
 lock serialises healers and one machine-wide lock caps clones at one. A
 ``stale_worktree`` update runs once per fingerprint of the worktree and the tool
-(``--version`` and contract version), so a tool upgrade re-arms it.
+(``--version`` and contract version), so a tool upgrade re-arms it. An update that fails
+with "built with a different repository root" (a graph copied raw from another checkout) is
+not retried: the root is force-cloned from the seed instead, under the same locks and budget.
 
 Prints one JSON object with ``--json``. Exit 0 ready, 3 usable but degraded
 (``partial_index``/``stale_graph``/``stale_worktree``), 4 not usable, 75 busy past
@@ -45,9 +48,9 @@ DEGRADED = {"partial_index", "stale_graph", "stale_worktree"}
 EXIT_OK, EXIT_DEGRADED, EXIT_BLOCKED, EXIT_BUSY = 0, 3, 4, gb.LOCK_BUSY
 BUDGET_SECONDS = 240
 UPDATE_SECONDS = 180
-MIN_CATCH_UP_SECONDS = 10
 POLL_SECONDS = 120
 LOCK_WAIT_SECONDS = 30
+WRONG_ROOT = "built with a different repository root"
 MAX_GAPS = 50
 
 
@@ -216,7 +219,25 @@ def update(root: Path, remaining: float) -> str:
                                  "--lock-wait", "60", "--repo", str(root)], seconds)
     except gb.StageError as error:
         return str(error)
-    return "" if done.returncode in (0, 3) else f"update exited {done.returncode}"
+    if done.returncode in (0, 3):
+        return ""
+    if WRONG_ROOT in done.stderr + done.stdout:
+        return WRONG_ROOT
+    return f"update exited {done.returncode}"
+
+
+def refresh(root: Path, family: str, seed: Path, deadline: float,
+            no_clone: bool) -> tuple[str, int, str]:
+    """(action, forced exit code or -1, note): one update, or a forced re-clone from the seed
+    when the update says the graph was built with another repository root (it never heals)."""
+    note = update(root, deadline - time.monotonic())
+    if note != WRONG_ROOT:
+        return "update", -1, note
+    blocked = blocked_next(root, family, seed, "rebuild_required", no_clone)
+    if blocked:
+        return "update", -1, f"{WRONG_ROOT}; {blocked}"
+    action, forced, note = clone(root, seed, "rebuild_required", deadline)
+    return action, forced, note or f"re-cloned from the seed: the graph was {WRONG_ROOT}"
 
 
 def poll(root: Path, deadline: float) -> tuple[str, dict]:
@@ -236,6 +257,8 @@ def clone(root: Path, source: Path, status: str, deadline: float,
     *bootstrap* means the seed itself is being created, so *source* is the main checkout.
     """
     source_status, _ = read(source)
+    if source_status == "building":
+        source_status, _ = poll(source, deadline)
     if source_status not in READY:
         return "none", EXIT_BLOCKED, ("main checkout is not ok: heal it first" if bootstrap
                                       else f"seed graph is {source_status}; "
@@ -245,14 +268,15 @@ def clone(root: Path, source: Path, status: str, deadline: float,
         if seconds < 30:
             raise BusyError("too little budget left for a clone; retry later")
         try:
+            update_seconds = float(os.environ.get("CRG_HEAL_UPDATE_SECONDS") or UPDATE_SECONDS)
             result = gb.bootstrap(root, source, 0, seconds, force=status == "rebuild_required",
-                                  lock_wait=LOCK_WAIT_SECONDS)
+                                  lock_wait=LOCK_WAIT_SECONDS, update_seconds=update_seconds)
         except gb.StageError as error:
             code = EXIT_BUSY if "timed out" in str(error) else EXIT_BLOCKED
             return "clone", code, str(error)
     if result["status"] == "skip":
         return "none", EXIT_BLOCKED, str(result["reason"])
-    return "clone", -1, ""
+    return "clone", -1, str(result.get("update_note") or "")
 
 
 def blocked_next(root: Path, family: str, seed: Path, status: str, no_clone: bool) -> str:
@@ -299,13 +323,10 @@ def _heal_locked(root: Path, family: str, seed: Path, report: dict, deadline: fl
             action, forced, note = clone(root, real(PMS_ROOT) if bootstrap else seed, before,
                                          deadline, bootstrap)
             after, doc = read(root)
-            if bootstrap and forced < 0 and after == "stale_graph":
-                note = _catch_up(root, deadline)
-                after, doc = read(root)
     elif clone_only:
         note = "--clone-only: status is not missing_graph or rebuild_required; nothing to clone"
     elif before == "stale_graph":
-        action, note = "update", update(root, deadline - time.monotonic())
+        action, forced, note = refresh(root, family, seed, deadline, no_clone)
         after, doc = read(root)
     elif before == "stale_worktree":
         tool_id = f"{tool_version()}|{doc.get('contract_version') or 'unknown'}"
@@ -313,7 +334,7 @@ def _heal_locked(root: Path, family: str, seed: Path, report: dict, deadline: fl
         if attempted(root, before, fp):
             note = "update already attempted at this fingerprint (HEAD and worktree unchanged)"
         else:
-            action, note = "update", update(root, deadline - time.monotonic())
+            action, forced, note = refresh(root, family, seed, deadline, no_clone)
             after, doc = read(root)
             if after in READY:
                 forget(root)
@@ -334,14 +355,6 @@ def _heal_locked(root: Path, family: str, seed: Path, report: dict, deadline: fl
     )
     report["gaps"], report["gaps_total"] = gaps(doc)
     return forced if forced >= 0 else exit_for(after)
-
-
-def _catch_up(root: Path, deadline: float) -> str:
-    """One update after the seed clone, so the seed lands on its own HEAD."""
-    remaining = deadline - time.monotonic()
-    if remaining < MIN_CATCH_UP_SECONDS:
-        return "budget left too small for the post-clone update; run crg-heal again"
-    return update(root, remaining)
 
 
 def _finish(report: dict, started: float) -> dict:

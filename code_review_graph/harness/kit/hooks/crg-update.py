@@ -11,7 +11,9 @@ Exit codes follow the graph contract: 0 ok and 3 degraded count as success;
 75 means another writer holds the graph lock (skipped, a no-op); 4 means the
 graph needs a full rebuild, which is logged and never started from here.
 Anything else is a failure, retried up to RETRY_LIMIT times before the queue
-is poisoned (logged once; the next successful update clears it).
+is poisoned (logged once; the next successful update clears it). An update that says
+the graph was built with a different repository root is never counted: it is logged as
+``crg_update_wrong_root`` and left to ``crg-heal``, which re-clones the root.
 
 A repository without a graph is skipped: hooks never build. An agent that meets a
 blocking status runs ``crg-heal`` once instead.
@@ -49,6 +51,7 @@ UPDATE_TIMEOUT_SECONDS = 600
 STATUS_TIMEOUT_SECONDS = 20
 GIT_TIMEOUT_SECONDS = 3
 RETRY_LIMIT = 3
+WRONG_ROOT = "built with a different repository root"
 NOTICE_INTERVAL_SECONDS = 900
 LOG_LIMIT_BYTES = 1_000_000
 HEAD_MOVED = "<head-moved>"
@@ -362,20 +365,25 @@ def graph_status(binary: str, root: Path) -> str:
     return "unavailable"
 
 
-def run_update(binary: str, root: Path) -> int:
+def run_update(binary: str, root: Path) -> tuple[int, bool]:
+    """(exit code, True when the update refused a graph built with another repository root)."""
     command = [binary, "update", "--skip-flows", "--if-locked=skip", "--repo", str(root)]
     print(f"[{time.strftime('%H:%M:%S')}] {' '.join(command)}", flush=True)
     try:
-        return subprocess.run(
-            command, cwd=str(root), stdin=subprocess.DEVNULL,
+        done = subprocess.run(
+            command, cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, errors="replace",
             timeout=UPDATE_TIMEOUT_SECONDS, check=False,
-        ).returncode
+        )
     except subprocess.TimeoutExpired:
         print(f"update timed out after {UPDATE_TIMEOUT_SECONDS}s", file=sys.stderr, flush=True)
-        return -1
+        return -1, False
     except OSError as error:
         print(f"update failed to start: {error}", file=sys.stderr, flush=True)
-        return -1
+        return -1, False
+    print(done.stdout, end="", flush=True)
+    failed = done.returncode not in (EXIT_OK, EXIT_DEGRADED)
+    return done.returncode, failed and WRONG_ROOT in done.stdout
 
 
 def _record(state: State, rc: int | None, outcome: str) -> None:
@@ -421,8 +429,13 @@ def worker(root: Path) -> int:
                     notice(state, f"crg_update_skipped_{status}", marker)
                     continue
             poisoned = state.poisoned.exists()
-            rc = run_update(binary, root)
-            if rc in (EXIT_OK, EXIT_DEGRADED):
+            rc, wrong_root = run_update(binary, root)
+            if wrong_root:
+                # A retry cannot fix it: crg-heal re-clones the root from the seed.
+                ack_inflight(state)
+                _record(state, rc, "wrong_root")
+                notice(state, "crg_update_wrong_root", state.rebuild)
+            elif rc in (EXIT_OK, EXIT_DEGRADED):
                 ack_inflight(state)
                 state.retries.unlink(missing_ok=True)
                 state.poisoned.unlink(missing_ok=True)
@@ -527,7 +540,10 @@ if [ "$1" = "status" ]; then
   printf '%s\\n' '{{"files": 1, "readiness": {{"status": "ok", "reasons": []}}}}'
   exit 0
 fi
-if [ "$1" = "update" ]; then exit "${{CRG_STUB_RC:-0}}"; fi
+if [ "$1" = "update" ]; then
+  [ -n "${{CRG_STUB_MSG:-}}" ] && echo "$CRG_STUB_MSG" >&2
+  exit "${{CRG_STUB_RC:-0}}"
+fi
 exit 0
 """
 
@@ -623,6 +639,25 @@ def selftest() -> dict:
             text = calls.read_text(encoding="utf-8")
             assert text.count("update ") == before + 1, text
             assert "build" not in text, text
+        if rc == EXIT_OK and calls.exists():
+            # A wrong-root refusal is neither retried nor counted toward poisoned.
+            os.environ.update({"CRG_STUB_RC": "1", "CRG_STUB_MSG": f"x; it was {WRONG_ROOT}. y"})
+            try:
+                handle_event(edit)
+            finally:
+                del os.environ["CRG_STUB_RC"], os.environ["CRG_STUB_MSG"]
+            wrong = status(repo)
+            assert wrong["last"]["outcome"] == "wrong_root", wrong
+            assert not wrong["poisoned"] and not wrong["retries"], wrong
+            assert "crg_update_wrong_root" in log_path.read_text(encoding="utf-8")
+            # The successful update after crg-heal re-cloned the root clears an old poison.
+            stale = State(repo)
+            stale.poisoned.write_text("1", encoding="utf-8")
+            stale.retries.write_text(str(RETRY_LIMIT), encoding="utf-8")
+            handle_event(edit)
+            cleared = status(repo)
+            assert cleared["last"]["outcome"] == "ok", cleared
+            assert not cleared["poisoned"] and not cleared["retries"], cleared
         return {"selftest": "ok", "update_rc": rc, "outcome": outcome, "state": str(state.prefix)}
 
 

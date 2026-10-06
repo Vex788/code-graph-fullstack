@@ -99,11 +99,14 @@ def test_clone_rewrites_every_path_and_keeps_fts_consistent(seed: Path, tmp_path
     target_db = get_db_path(worktree)
 
     assert result["target_db"] == str(target_db)
+    assert result["status"] == "ok" and result["temp_replaced"] is True
     assert _text_hits(target_db, str(seed) + "/") == {}
     assert _fts_integrity_error(target_db) is None
 
     conn = sqlite3.connect(target_db)
     try:
+        # The private copy runs journal_mode=OFF; the published graph must not.
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] != "off"
         def fts_hits(token: str) -> int:
             return conn.execute(
                 "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH ?",
@@ -175,6 +178,30 @@ def test_existing_target_needs_force(seed: Path, tmp_path: Path):
     assert clone_graph(seed, worktree, update=False, force=True)["status"] == "ok"
 
 
+@pytest.mark.parametrize("failing", ["rewrite_root", "rebuild_fts"])
+def test_failure_mid_rewrite_publishes_no_graph(seed: Path, tmp_path: Path, monkeypatch, failing):
+    def killed(*_args, **_kwargs):
+        raise RuntimeError("killed mid-rewrite")
+
+    worktree = _worktree(tmp_path)
+    target_db = get_db_path(worktree)
+    monkeypatch.setattr(f"code_review_graph.clone_graph.{failing}", killed)
+    with pytest.raises(RuntimeError, match="killed"):
+        clone_graph(seed, worktree, update=False)
+    assert [p.name for p in target_db.parent.glob("graph.db*")] == ["graph.db.lock"]
+
+    monkeypatch.undo()
+    clone_graph(seed, worktree, update=False)
+    published = target_db.read_bytes()
+    monkeypatch.setattr(f"code_review_graph.clone_graph.{failing}", killed)
+    with pytest.raises(RuntimeError, match="killed"):
+        clone_graph(seed, worktree, update=False, force=True)
+    assert target_db.read_bytes() == published
+    assert sorted(p.name for p in target_db.parent.glob("graph.db*")) == [
+        "graph.db", "graph.db.lock",
+    ]
+
+
 def test_seed_db_path_and_seed_root(seed: Path, tmp_path: Path):
     root, db = resolve_seed(get_db_path(seed))
     assert (root, db) == (seed, get_db_path(seed))
@@ -200,6 +227,56 @@ def test_nested_target_does_not_collide(tmp_path: Path):
     assert sorted(r[0] for r in conn.execute("SELECT qualified_name FROM nodes")) == [
         "/r/w/x/a.py::f", "/r/w/x/w/x/a.py::f",
     ]
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "updates"),
+    [("/r", "/w", 1), ("/r", "/r/w/x", 2), ("/r/w/x", "/r", 2)],
+)
+def test_rewrite_passes_depend_on_root_nesting(old: str, new: str, updates: int):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE risk_index (qualified_name TEXT UNIQUE)")
+    conn.execute("INSERT INTO risk_index VALUES (?)", (old + "/a.py::f",))
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    rewrite_root(conn, old, new)
+    assert sum(s.startswith("UPDATE") for s in seen) == updates
+    assert conn.execute("SELECT qualified_name FROM risk_index").fetchone()[0] == new + "/a.py::f"
+
+
+@pytest.mark.parametrize("new", ["/w", "/r/w/x"])
+def test_edges_are_copied_with_indexes_and_sequence(new: str):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, "
+        "source_qualified TEXT NOT NULL, target_qualified TEXT NOT NULL, "
+        "file_path TEXT NOT NULL, line INTEGER DEFAULT 0, extra TEXT DEFAULT '{}')"
+    )
+    conn.execute("CREATE INDEX idx_edges_file ON edges(file_path)")
+    insert = (
+        "INSERT INTO edges (kind, source_qualified, target_qualified, file_path, extra) "
+        "VALUES ('CALLS', ?, ?, ?, ?)"
+    )
+    conn.execute(insert, ("/r/a.py::f", "/r/b.py::g", "/r/a.py", '{"p": "/r/c.py"}'))
+    conn.execute(insert, ("x", "/other/y", "/r/w/x/a.py", None))
+    conn.execute(insert, ("gone", "gone", "gone", "{}"))
+    conn.execute("DELETE FROM edges WHERE id = 3")
+
+    changed = rewrite_root(conn, "/r", new)
+
+    assert changed == {"edges.source_qualified": 1, "edges.target_qualified": 1,
+                       "edges.file_path": 2, "edges.extra": 1}
+    assert conn.execute(
+        "SELECT id, source_qualified, target_qualified, file_path, extra FROM edges ORDER BY id"
+    ).fetchall() == [
+        (1, f"{new}/a.py::f", f"{new}/b.py::g", f"{new}/a.py", f'{{"p": "{new}/c.py"}}'),
+        (2, "x", "/other/y", f"{new}/w/x/a.py", None),
+    ]
+    assert [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges'"
+    )] == ["idx_edges_file"]
+    conn.execute(insert, ("n", "n", "n", "{}"))
+    assert conn.execute("SELECT max(id) FROM edges").fetchone()[0] == 4
 
 
 def test_sibling_prefix_is_not_rewritten():

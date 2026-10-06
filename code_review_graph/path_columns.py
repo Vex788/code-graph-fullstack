@@ -15,6 +15,7 @@ index is rebuilt from ``nodes`` instead of being rewritten.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Literal
@@ -80,7 +81,88 @@ def _rewrite(conn: sqlite3.Connection, tables: set[str], old: str, new: str) -> 
     return changed
 
 
-# Never a real path prefix, so the first pass cannot collide with a UNIQUE row.
+# Updating a big table row by row maintains every index per row; copying it with the
+# transform in the SELECT and building the indexes once is about 2.5x faster. Only for
+# tables with no UNIQUE path column, so one pass is safe even for nested roots.
+_COPY_TABLES = ("edges",)
+
+
+def _copy_rewrite(
+    conn: sqlite3.Connection, table: str, old: str, new: str,
+) -> dict[str, int] | None:
+    """Rebuild *table* with re-rooted values; ``None`` when it must be updated in place."""
+    ddl_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    has_trigger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?", (table,)
+    ).fetchone()
+    scratch = f"{table}_reroot"
+    ddl = re.sub(
+        rf'(?i)^(CREATE\s+TABLE\s+)["`\[]?{table}["`\]]?', rf"\g<1>{scratch}", ddl_row[0], count=1,
+    )
+    if has_trigger or ddl == ddl_row[0]:
+        return None
+    columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]  # noqa: S608
+    select: list[str] = []
+    select_params: list[object] = []
+    counts: list[str] = []
+    counted: list[str] = []
+    count_params: list[object] = []
+    specs = {s.column: s for s in PATH_COLUMNS if s.table == table and s.column in columns}
+    if not specs:
+        return None
+    for column in columns:
+        spec = specs.get(column)
+        if spec is None:
+            select.append(column)
+            continue
+        args: tuple[object, ...]
+        value_args: tuple[object, ...]
+        if spec.mode == "path":
+            test = f"typeof({column}) = 'text' AND substr({column}, 1, ?) = ?"
+            args = (len(old), old)
+            value, value_args = f"? || substr({column}, ?)", (new, len(old) + 1)
+        else:
+            test = f"typeof({column}) = 'text' AND instr({column}, ?) > 0"
+            args = ('"' + old,)
+            value, value_args = f"replace({column}, ?, ?)", ('"' + old, '"' + new)
+        select.append(f"CASE WHEN {test} THEN {value} ELSE {column} END")
+        select_params += [*args, *value_args]
+        counts.append(f"coalesce(sum({test}), 0)")
+        counted.append(column)
+        count_params += args
+    totals = conn.execute(  # nosec B608
+        f"SELECT {', '.join(counts)} FROM {table}", count_params,  # noqa: S608
+    ).fetchone()
+    indexes = [row[0] for row in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL",
+        (table,),
+    )]
+    has_sequence = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'"
+    ).fetchone()
+    sequence = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+    ).fetchone() if has_sequence else None
+    conn.execute(ddl)
+    conn.execute(  # nosec B608
+        f"INSERT INTO {scratch} ({', '.join(columns)}) "  # noqa: S608
+        f"SELECT {', '.join(select)} FROM {table}",
+        select_params,
+    )
+    conn.execute(f"DROP TABLE {table}")  # noqa: S608
+    conn.execute(f"ALTER TABLE {scratch} RENAME TO {table}")  # noqa: S608
+    if sequence is not None:
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = ?", (sequence[0], table),
+        )
+    for sql in indexes:
+        conn.execute(sql)
+    return {f"{table}.{column}": int(total) for column, total in zip(counted, totals)}
+
+
+# Never a real path prefix, so a nested-root first pass cannot collide with a UNIQUE row.
 _PLACEHOLDER = "\x01crg-clone\x01/"
 
 
@@ -89,8 +171,9 @@ def rewrite_root(conn: sqlite3.Connection, old_root: str, new_root: str) -> dict
 
     Runs inside the caller's transaction. Only registered columns are touched,
     and only text values, so vectors and FTS shadow tables stay byte-identical.
-    Two passes through a placeholder keep a target nested inside the seed
-    (``repo/.claude/worktrees/x``) from colliding on ``qualified_name``.
+    Roots that nest in either direction (``repo/.claude/worktrees/x``) go
+    through a placeholder in two passes so rewritten rows cannot collide on
+    ``qualified_name``; disjoint roots rewrite in one pass.
     Returns ``{"table.column": rows_changed}``.
     """
     old = old_root.rstrip("/") + "/"
@@ -98,7 +181,16 @@ def rewrite_root(conn: sqlite3.Connection, old_root: str, new_root: str) -> dict
     tables = {
         row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    changed = _rewrite(conn, tables, old, _PLACEHOLDER)
+    changed: dict[str, int] = {}
+    for table in _COPY_TABLES:
+        copied = _copy_rewrite(conn, table, old, new) if table in tables else None
+        if copied is not None:
+            changed.update(copied)
+            tables.discard(table)
+    if not (new.startswith(old) or old.startswith(new)):
+        changed.update(_rewrite(conn, tables, old, new))
+        return changed
+    changed.update(_rewrite(conn, tables, old, _PLACEHOLDER))
     _rewrite(conn, tables, _PLACEHOLDER, new)
     return changed
 

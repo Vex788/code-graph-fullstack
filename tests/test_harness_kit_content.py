@@ -747,14 +747,27 @@ def test_build_context_pack_rejects_a_receipt_for_another_checkout(tmp_path: Pat
     assert result.returncode == 2 and PREP_MARKER in result.stderr
 
 
-def _bootstrap_stub(tmp_path: Path, readiness: str, clone_rc: int = 0, sleep: int = 0) -> Path:
+def _bootstrap_stub(tmp_path: Path, readiness: str, clone_rc: int = 0, sleep: int = 0,
+                    sequence: list[str] | None = None) -> Path:
     log = tmp_path / "boot-calls.log"
-    status = json.dumps({"files": 3, "nodes": 9, "built_at_commit": "a", "current_sha": "a",
-                         "readiness": {"status": readiness, "embeddings": "off", "reasons": []}})
+
+    def doc(status: str) -> str:
+        return json.dumps({"files": 3, "nodes": 9, "built_at_commit": "a", "current_sha": "a",
+                           "readiness": {"status": status, "embeddings": "off",
+                                         "reasons": []}})
+
+    if sequence is None:
+        status_line = f"printf '%s\\n' '{doc(readiness)}'; exit 0"
+    else:
+        counter = tmp_path / "status-count"
+        cases = "".join(f"{i}) printf '%s\\n' '{doc(status)}';;\n"
+                        for i, status in enumerate(sequence))
+        status_line = (f'n=$(cat "{counter}" 2>/dev/null || echo 0); echo $((n+1)) > "{counter}"; '
+                       f"case $n in {cases}*) printf '%s\\n' '{doc(sequence[-1])}';; esac; exit 0")
     stub = tmp_path / "code-review-graph"
     stub.write_text(
         f'#!/bin/sh\necho "$* CRG_EMBEDDINGS=$CRG_EMBEDDINGS" >> "{log}"\n'
-        f"if [ \"$1\" = status ]; then printf '%s\\n' '{status}'; exit 0; fi\n"
+        f'if [ "$1" = status ]; then {status_line}; fi\n'
         f'if [ "$1" = clone-graph ]; then sleep {sleep}; '
         f"printf '%s\\n' '{{\"status\": \"ok\", \"rows_rewritten\": 5}}'; exit {clone_rc}; fi\n"
         "exit 0\n",
@@ -804,6 +817,81 @@ def test_graph_bootstrap_never_seeds_from_a_partial_index(tmp_path: Path):
     report = json.loads(result.stdout)
     assert (report["status"], report["seed_readiness"]) == ("skip", "partial_index")
     assert "clone-graph" not in (tmp_path / "boot-calls.log").read_text(encoding="utf-8")
+
+
+@skip_windows
+def test_graph_bootstrap_polls_a_building_seed_until_ok(tmp_path: Path):
+    seed = _git_repo(tmp_path / "seed")
+    _commit(seed, "seed")
+    worktree = _git_repo(tmp_path / "wt")
+    _commit(worktree, "wt")
+    stub = _bootstrap_stub(tmp_path, "ok", sequence=["building", "ok"])
+    script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed),
+         "--seed-build-wait-seconds", "1"],
+        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert (report["status"], report["seed_readiness"]) == ("ok", "ok")
+    assert f"clone-graph --from {seed} --to {worktree} --json" in (
+        tmp_path / "boot-calls.log").read_text(encoding="utf-8")
+
+
+@skip_windows
+def test_graph_bootstrap_skips_a_seed_still_building_after_the_wait(tmp_path: Path):
+    seed = _git_repo(tmp_path / "seed")
+    _commit(seed, "seed")
+    worktree = _git_repo(tmp_path / "wt")
+    _commit(worktree, "wt")
+    stub = _bootstrap_stub(tmp_path, "building")
+    script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed),
+         "--seed-build-wait-seconds", "1"],
+        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert (report["status"], report["seed_readiness"]) == ("skip", "building")
+    assert report["reason"] == "seed graph is still building after 1s"
+    assert "clone-graph" not in (tmp_path / "boot-calls.log").read_text(encoding="utf-8")
+
+
+@skip_windows
+@pytest.mark.parametrize("worktree", ["/tmp/crg-bootstrap-scratch",
+                                      "/private/tmp/crg-bootstrap-scratch"])
+def test_graph_bootstrap_refuses_a_temporary_root(tmp_path: Path, worktree: str):
+    seed = _git_repo(tmp_path / "seed")
+    _commit(seed, "seed")
+    stub = _bootstrap_stub(tmp_path, "ok")
+    script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--worktree", worktree, "--seed", str(seed)],
+        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert (report["status"], report["reason"]) == ("skip", "temporary root")
+    assert not (tmp_path / "boot-calls.log").exists()
+
+
+@skip_windows
+def test_graph_bootstrap_refuses_an_orca_preparing_root(tmp_path: Path):
+    seed = _git_repo(tmp_path / "seed")
+    _commit(seed, "seed")
+    worktree = tmp_path / ".orca-preparing" / "wt"
+    stub = _bootstrap_stub(tmp_path, "ok")
+    script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
+    result = subprocess.run(
+        [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed)],
+        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+    )
+    assert result.returncode == 2
+    report = json.loads(result.stdout)
+    assert (report["status"], report["reason"]) == ("skip", "temporary root")
+    assert not (tmp_path / "boot-calls.log").exists()
 
 
 @skip_windows

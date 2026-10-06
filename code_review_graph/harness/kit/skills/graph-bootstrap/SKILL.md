@@ -21,8 +21,8 @@ crg-heal --repo ROOT --json [--budget 240] [--no-clone] [--clone-only]
 | `stale_graph` | one `code-review-graph update --skip-flows --if-locked=wait --lock-wait 60`, at most 180 s |
 | `stale_worktree` | one update per fingerprint (HEAD + `git status --porcelain` + `git diff HEAD` + the tool's `--version` and contract version, the `crg-reconcile` state; a tool upgrade re-arms it), then continue with the gaps |
 | `building` | poll every 5 s for at most 120 s; never starts a build |
-| `missing_graph`, `rebuild_required` on a PMS worktree | `clone-graph` from the validated seed (`--force` only for `rebuild_required`), one clone machine-wide |
-| `missing_graph` on the seed | `clone-graph` from the main PMS checkout when it reads `ok`, then one catch-up `update` if the clone lands `stale_graph`; otherwise exit 4, `next: main checkout is not ok: heal it first` |
+| `missing_graph`, `rebuild_required` on a PMS worktree | `clone-graph --no-update` from the validated seed (`--force` only for `rebuild_required`; a `building` seed is polled up to 120 s first), then `update --skip-flows` as its own stage (timeout 180 s, `CRG_HEAL_UPDATE_SECONDS`); a timed-out update leaves the clone `stale_graph` (or `partial_index` if it was killed mid-write), exit 3, never a failed clone; one clone machine-wide |
+| `missing_graph` on the seed | `clone-graph` from the main PMS checkout when it reads `ok` (same two stages); otherwise exit 4, `next: main checkout is not ok: heal it first` |
 | `rebuild_required` on the seed or `sp_api_library` | none, exit 4, `next: nightly crg-postprocess-all` |
 | `schema_too_new`, `error` | none, exit 4 |
 

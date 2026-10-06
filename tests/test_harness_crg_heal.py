@@ -85,6 +85,13 @@ if command == "status":
     }}))
 elif command == "update":
     repo = value("--repo")
+    time.sleep(with_cfg(lambda c: c).get("update_sleep", 0))
+    once = with_cfg(lambda c: c.pop("update_once", None))
+    if once:
+        print(once["stderr"], file=sys.stderr)
+        sys.exit(once["rc"])
+    if with_cfg(lambda c: c).get("update_stderr"):
+        print(with_cfg(lambda c: c)["update_stderr"], file=sys.stderr)
     with_cfg(lambda cfg: cfg["status"].__setitem__(
         repo, cfg.get("after_update", {{}}).get(repo, cfg["status"].get(repo))))
     sys.exit(with_cfg(lambda c: c).get("update_rc", 0))
@@ -323,7 +330,44 @@ def test_rebuild_required_worktree_is_cloned_from_the_validated_seed(rig: Rig):
     assert rc == 0 and report["action"] == "clone" and report["healed"] is True
     assert (report["before"], report["after"]) == ("rebuild_required", "ok")
     assert rig.clone_calls() == [
-        f"clone-graph --from {rig.pms} --to {wt} --json --force --lock-wait 30"]
+        f"clone-graph --from {rig.pms} --to {wt} --json --force --no-update --lock-wait 30"]
+
+
+WRONG_ROOT_ERROR = (
+    "RuntimeError: the graph holds 9 file(s) such as '/Users/x/IdeaProjects/pms/a.java', none of "
+    "them under '/tmp/wt'; it was built with a different repository root. Rebuild it, or retry "
+    "with the root it was built with, instead of reconciling every file away.")
+
+
+@pytest.mark.parametrize("status", ["stale_graph", "stale_worktree"])
+def test_wrong_root_update_error_forces_a_reclone_from_the_seed(rig: Rig, status: str):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "ok", wt: status},
+                  update_once={"rc": 1, "stderr": WRONG_ROOT_ERROR})
+    rc, report = rig.run(wt)
+    assert rc == 0 and report["action"] == "clone" and report["healed"] is True
+    assert (report["before"], report["after"]) == (status, "ok")
+    assert [c.split()[0] for c in rig.calls() if c.split()[0] not in ("status", "--version")] == [
+        "update", "clone-graph", "update"]
+    assert rig.clone_calls() == [
+        f"clone-graph --from {rig.pms} --to {wt} --json --force --no-update --lock-wait 30"]
+
+
+def test_other_update_failures_are_not_reclones(rig: Rig):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "ok", wt: "stale_graph"}, update_rc=1,
+                  update_stderr="RuntimeError: disk I/O error")
+    rc, report = rig.run(wt)
+    assert rc == 3 and report["action"] == "update" and rig.clone_calls() == []
+
+
+def test_wrong_root_with_no_clone_reports_instead_of_cloning(rig: Rig):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "ok", wt: "stale_graph"}, update_rc=1,
+                  update_stderr=WRONG_ROOT_ERROR)
+    rc, report = rig.run(wt, "--no-clone")
+    assert rc == 3 and report["action"] == "update" and rig.clone_calls() == []
+    assert "different repository root" in report["next"] and "--no-clone" in report["next"]
 
 
 def test_missing_graph_worktree_is_cloned_without_force(rig: Rig):
@@ -333,6 +377,41 @@ def test_missing_graph_worktree_is_cloned_without_force(rig: Rig):
     assert rc == 0 and report["before"] == "missing_graph" and report["action"] == "clone"
     (call,) = rig.clone_calls()
     assert "--force" not in call and f"--to {wt}" in call
+
+
+def test_update_timeout_after_the_clone_leaves_a_usable_stale_graph(rig: Rig):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "ok", wt: "rebuild_required"},
+                  after_clone={wt: "stale_graph"}, after_update={wt: "ok"}, update_sleep=10)
+    done = subprocess.run(rig.command(wt), capture_output=True, text=True, timeout=120,
+                          env={**rig.env(), "CRG_HEAL_UPDATE_SECONDS": "0.5"}, check=False)
+    report = json.loads(done.stdout)
+    assert done.returncode == 3 and report["action"] == "clone"
+    assert (report["before"], report["after"]) == ("rebuild_required", "stale_graph")
+    assert report["usable"] is True and report["claim_scope"] == "degraded"
+    assert "update timed out" in report["next"]
+    assert [c.split()[0] for c in rig.calls() if not c.startswith("status")] == [
+        "clone-graph", "update"]
+    assert "--no-update" in rig.clone_calls()[0]
+
+
+def test_building_seed_is_polled_until_ok_before_the_clone(rig: Rig):
+    wt = rig.worktree("feature")
+    rig.configure(status={wt: "rebuild_required"},
+                  sequence={rig.pms: ["building", "building", "ok"]})
+    rc, report = rig.run(wt)
+    assert rc == 0 and report["action"] == "clone" and report["after"] == "ok"
+    assert len(rig.clone_calls()) == 1
+
+
+def test_seed_that_stays_building_is_refused_within_the_budget(rig: Rig):
+    wt = rig.worktree("feature")
+    rig.configure(status={rig.pms: "building", wt: "rebuild_required"})
+    done = subprocess.run(rig.command(wt, "--budget", "2"), capture_output=True, text=True,
+                          timeout=120, env=rig.env(), check=False)
+    report = json.loads(done.stdout)
+    assert done.returncode == 4 and rig.clone_calls() == []
+    assert "seed graph is building" in report["next"]
 
 
 def test_seed_directory_wins_when_it_exists(rig: Rig):
@@ -349,8 +428,10 @@ def test_seed_without_a_graph_is_cloned_from_the_ok_main_checkout(rig: Rig):
     rc, report = rig.run(seed)
     assert rc == 0 and report["action"] == "clone" and report["healed"] is True
     assert (report["before"], report["after"]) == ("missing_graph", "ok")
-    assert rig.clone_calls() == [f"clone-graph --from {rig.pms} --to {seed} --json --lock-wait 30"]
-    assert [c.split()[0] for c in rig.calls() if not c.startswith("status")] == ["clone-graph"]
+    assert rig.clone_calls() == [
+        f"clone-graph --from {rig.pms} --to {seed} --json --no-update --lock-wait 30"]
+    assert [c.split()[0] for c in rig.calls() if not c.startswith("status")] == [
+        "clone-graph", "update"]
 
 
 def test_seed_bootstrap_catches_up_when_the_clone_lands_stale(rig: Rig):
