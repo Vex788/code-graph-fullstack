@@ -33,7 +33,7 @@ dependencies = [
     "fastmcp>=3.2.4,<5",
     "tree-sitter>=0.23.0,<1",
     # 1.x downloads grammars at runtime and changes the exception types.
-    "tree-sitter-language-pack>=0.3.0,<1",
+    "tree-sitter-language-pack>=0.3.0,<2",
     "pyyaml>=6.0,<7",
     "networkx>=3.2,<4",
     "watchdog>=4.0.0,<7",
