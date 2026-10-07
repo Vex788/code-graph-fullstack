@@ -938,7 +938,10 @@ def test_graph_bootstrap_timeout_is_reported(tmp_path: Path):
 
 def test_bootstrap_budget_fits_caller_timeout():
     text = rendered("bug-hunter")["skills/graph-bootstrap/scripts/graph_bootstrap.py"]
-    budget = int(re.search(r"^TOTAL_BUDGET_SECONDS = (\d+)", text, re.M).group(1))
+    values = {name: int(n) for name, n in re.findall(r"^(\w+_SECONDS) = (\d+)", text, re.M)}
+    budget = (values["GIT_HEAD_SECONDS"] + values["SEED_BUILD_WAIT_SECONDS"]
+              + values["SEED_REFRESH_SECONDS"] + values["CLONE_SECONDS"]
+              + 3 * values["STATUS_SECONDS"])
     assert budget <= 900  # manage_review_worktrees.py waits 900 s for the script
 
 

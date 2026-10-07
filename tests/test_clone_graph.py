@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 import sys
@@ -200,6 +201,45 @@ def test_failure_mid_rewrite_publishes_no_graph(seed: Path, tmp_path: Path, monk
     assert sorted(p.name for p in target_db.parent.glob("graph.db*")) == [
         "graph.db", "graph.db.lock",
     ]
+
+
+def test_failed_publish_does_not_drop_the_old_wal(seed: Path, tmp_path: Path, monkeypatch):
+    worktree = _worktree(tmp_path)
+    clone_graph(seed, worktree, update=False)
+    target_db = get_db_path(worktree)
+
+    # Commit a row and die without a clean close: the frame lives only in -wal.
+    probe = (
+        "import os, sqlite3, sys\n"
+        "conn = sqlite3.connect(sys.argv[1])\n"
+        "conn.execute('PRAGMA journal_mode=WAL')\n"
+        "conn.execute('PRAGMA wal_autocheckpoint=0')\n"
+        "conn.execute('CREATE TABLE IF NOT EXISTS probe (v INTEGER)')\n"
+        "conn.execute('INSERT INTO probe VALUES (7)')\n"
+        "conn.commit()\n"
+        "os._exit(0)\n"
+    )
+    subprocess.run([sys.executable, "-c", probe, str(target_db)], check=True)
+    assert Path(f"{target_db}-wal").exists()
+
+    real_replace = os.replace
+
+    def failing_replace(source, destination):
+        if Path(destination) == target_db:
+            raise OSError("simulated publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="simulated"):
+        clone_graph(seed, worktree, update=False, force=True)
+    monkeypatch.undo()
+
+    assert not list(target_db.parent.glob("*.replacing")), "parked sidecars must be restored"
+    conn = sqlite3.connect(target_db)
+    try:
+        assert conn.execute("SELECT v FROM probe").fetchone() == (7,)
+    finally:
+        conn.close()
 
 
 def test_seed_db_path_and_seed_root(seed: Path, tmp_path: Path):

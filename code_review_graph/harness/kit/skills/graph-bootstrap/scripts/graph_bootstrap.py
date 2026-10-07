@@ -22,16 +22,21 @@ import subprocess
 import time
 from pathlib import Path
 
-SEED_REFRESH_SECONDS = 180
-CLONE_SECONDS = 600
+GIT_HEAD_SECONDS = 30
+SEED_REFRESH_SECONDS = 120
+CLONE_SECONDS = 520
 STATUS_SECONDS = 30
-# Two status reads plus the refresh and the clone; callers must wait longer.
-TOTAL_BUDGET_SECONDS = 840
-assert SEED_REFRESH_SECONDS + CLONE_SECONDS + 2 * STATUS_SECONDS <= TOTAL_BUDGET_SECONDS
+SEED_BUILD_WAIT_SECONDS = 120
+# Worst case: the git probe, the seed status, the building-seed poll (wait plus
+# one status read), a stale-seed refresh, the clone plus its catch-up, and the
+# verify read; callers must wait longer than this total.
+TOTAL_BUDGET_SECONDS = (GIT_HEAD_SECONDS + STATUS_SECONDS
+                        + SEED_BUILD_WAIT_SECONDS + STATUS_SECONDS
+                        + SEED_REFRESH_SECONDS + CLONE_SECONDS + STATUS_SECONDS)
+assert TOTAL_BUDGET_SECONDS <= 880, TOTAL_BUDGET_SECONDS
 
 LOCK_BUSY = 75
 UPDATE_LOCK_WAIT_SECONDS = 60
-SEED_BUILD_WAIT_SECONDS = 120
 SEED_POLL_SECONDS = 5
 TEMPORARY_ROOTS = (Path("/tmp"), Path("/private/tmp"))
 # partial_index is not a seed: its gaps would be copied into every clone.
@@ -74,15 +79,19 @@ def readiness(stage: str, root: Path, timeout: float) -> tuple[str, dict]:
         doc = None
     if not isinstance(doc, dict):
         return "unavailable", {}
-    status = (doc.get("readiness") or {}).get("status")
+    block = doc.get("readiness")
+    status = block.get("status") if isinstance(block, dict) else None
     return (status if isinstance(status, str) else "unavailable"), doc
 
 
 def git_head(root: Path) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=30, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=GIT_HEAD_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -179,7 +188,8 @@ def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds:
     return {
         "status": verdict,
         "readiness": status,
-        "reasons": (doc.get("readiness") or {}).get("reasons", []),
+        "reasons": (doc["readiness"].get("reasons", [])
+                    if isinstance(doc.get("readiness"), dict) else []),
         "seconds": round(time.time() - started, 1),
         "rows_rewritten": cloned.get("rows_rewritten") if isinstance(cloned, dict) else None,
         "fts_rows": cloned.get("fts_rows") if isinstance(cloned, dict) else None,
@@ -210,7 +220,8 @@ def main() -> int:
     parser.add_argument("--bootstrap-graph", action="store_true",
                         help="accepted from the pipeline's prepare step")
     args = parser.parse_args()
-    budget = args.refresh_seed_seconds + args.clone_seconds + 2 * STATUS_SECONDS
+    budget = (GIT_HEAD_SECONDS + SEED_BUILD_WAIT_SECONDS + args.refresh_seed_seconds
+              + args.clone_seconds + 3 * STATUS_SECONDS)
     try:
         result = bootstrap(args.worktree.resolve(), args.seed.resolve(),
                            args.refresh_seed_seconds, args.clone_seconds,

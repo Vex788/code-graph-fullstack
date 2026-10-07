@@ -168,16 +168,30 @@ def clone_graph(
             raise FileExistsError(f"{target_db} exists; pass --force to replace it")
         building = target_db.with_name(target_db.name + ".cloning")
         _discard(building)
+        parked: list[tuple[Path, Path]] = []
         try:
             _backup(seed_db, building)
             changed, fts_rows = _reroot(building, str(old_root), str(new_root))
             _fsync(building)
-            # A stale WAL must never pair with the new file.
-            _discard_sidecars(target_db)
+            # A stale WAL must never pair with the new file, so the old
+            # sidecars are parked aside before the publish and restored if it
+            # fails: a failed force-clone can no longer drop the previous
+            # graph's committed frames.
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = Path(f"{target_db}{suffix}")
+                if sidecar.exists():
+                    aside = sidecar.with_name(sidecar.name + ".replacing")
+                    aside.unlink(missing_ok=True)
+                    sidecar.replace(aside)
+                    parked.append((aside, sidecar))
             os.replace(building, target_db)
         except BaseException:
+            for aside, sidecar in parked:
+                aside.replace(sidecar)
             _discard(building)
             raise
+        for aside, _ in parked:
+            aside.unlink(missing_ok=True)
         _discard(building)
         logger.info(
             "Cloned graph %s -> %s (%d FTS rows)", seed_db, target_db, fts_rows,
