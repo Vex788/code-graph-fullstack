@@ -30,7 +30,7 @@ dependencies = [
     # fastmcp >=3.2.4 is required for Message-based prompts and includes the
     # CVE-2025-62800/62801/66416 fixes. 4.x is verified (prompts.py imports
     # Message via a shim); <5 blocks the next unverified major. See: #488
-    "fastmcp>=3.2.4,<4",
+    "fastmcp>=3.2.4,<5",
     "tree-sitter>=0.23.0,<1",
     # 1.x downloads grammars at runtime and changes the exception types.
     "tree-sitter-language-pack>=0.3.0,<1",
