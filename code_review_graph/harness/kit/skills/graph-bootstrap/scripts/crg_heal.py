@@ -13,7 +13,9 @@ lock serialises healers and one machine-wide lock caps clones at one. A
 ``stale_worktree`` update runs once per fingerprint of the worktree and the tool
 (``--version`` and contract version), so a tool upgrade re-arms it. An update that fails
 with "built with a different repository root" (a graph copied raw from another checkout) is
-not retried: the root is force-cloned from the seed instead, under the same locks and budget.
+not retried: a worktree root is force-cloned from the seed instead, under the same locks and
+budget; the seed root itself cannot be repaired this way and is reported as needing a full
+seed rebuild.
 
 Prints one JSON object with ``--json``. Exit 0 ready, 3 usable but degraded
 (``partial_index``/``stale_graph``/``stale_worktree``), 4 not usable, 75 busy past
@@ -228,12 +230,13 @@ def update(root: Path, remaining: float) -> str:
 
 def refresh(root: Path, family: str, seed: Path, deadline: float,
             no_clone: bool) -> tuple[str, int, str]:
-    """(action, forced exit code or -1, note): one update, or a forced re-clone from the seed
-    when the update says the graph was built with another repository root (it never heals)."""
+    """(action, forced exit code or -1, note): one update; when the update says the graph was
+    built with another repository root, a worktree is force-cloned from the seed while the seed
+    itself is reported as needing a full rebuild (an update never heals a root mismatch)."""
     note = update(root, deadline - time.monotonic())
     if note != WRONG_ROOT:
         return "update", -1, note
-    blocked = blocked_next(root, family, seed, "rebuild_required", no_clone)
+    blocked = blocked_next(root, family, seed, "wrong_root", no_clone)
     if blocked:
         return "update", -1, f"{WRONG_ROOT}; {blocked}"
     action, forced, note = clone(root, seed, "rebuild_required", deadline)
@@ -280,10 +283,16 @@ def clone(root: Path, source: Path, status: str, deadline: float,
 
 
 def blocked_next(root: Path, family: str, seed: Path, status: str, no_clone: bool) -> str:
-    """Why this blocking status cannot be cloned, or '' when a clone may run."""
+    """Why this blocking status cannot be cloned, or '' when a clone may run.
+
+    ``wrong_root`` is the update's root-mismatch signal for the seed itself: no clone can
+    repair it, only a full seed rebuild.
+    """
     if family != "pms":
         return "no seed graph for sp_api_library: nightly crg-postprocess-all"
     if root == seed:
+        if status == "wrong_root":
+            return "seed graph root mismatch; a full seed rebuild is required"
         if status == "rebuild_required":
             return "nightly crg-postprocess-all"
         if root == real(PMS_ROOT):

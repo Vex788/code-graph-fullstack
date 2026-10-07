@@ -38,7 +38,7 @@ assert TOTAL_BUDGET_SECONDS <= 880, TOTAL_BUDGET_SECONDS
 LOCK_BUSY = 75
 UPDATE_LOCK_WAIT_SECONDS = 60
 SEED_POLL_SECONDS = 5
-TEMPORARY_ROOTS = (Path("/tmp"), Path("/private/tmp"))
+TEMPORARY_ROOTS = (Path("/tmp"), Path("/private/tmp"), Path("/var/folders"))
 # partial_index is not a seed: its gaps would be copied into every clone.
 USABLE_SEED = {"ok", "stale_graph", "stale_worktree"}
 STALE = {"stale_graph", "stale_worktree"}
@@ -96,9 +96,11 @@ def git_head(root: Path) -> str:
 
 
 def is_temporary_root(root: Path) -> bool:
-    """A root no graph may be seeded from: scratch tmp or an in-flight worktree."""
+    """Whether *root* is a WORKTREE that must not receive a graph: scratch tmp or an in-flight
+    worktree. Only the worktree target is ever checked; the seed may live anywhere."""
     resolved = root.resolve()
     return (".orca-preparing" in resolved.parts
+            or any(root == tmp or root.is_relative_to(tmp) for tmp in TEMPORARY_ROOTS)
             or any(resolved == tmp or resolved.is_relative_to(tmp) for tmp in TEMPORARY_ROOTS))
 
 
@@ -133,11 +135,13 @@ def bootstrap(worktree: Path, seed: Path, refresh_seconds: float, clone_seconds:
               force: bool = True, lock_wait: float | None = None,
               update_seconds: float | None = None,
               seed_build_wait_seconds: float = SEED_BUILD_WAIT_SECONDS) -> dict:
-    """Clone *seed* into *worktree*. With *update_seconds* the clone runs ``--no-update`` and the
-    catch-up update is its own stage, cut at that timeout or the end of *clone_seconds*."""
-    worktree = Path(worktree).resolve()
+    """Clone *seed* into *worktree*. Only *worktree* passes ``is_temporary_root``, never the
+    seed. With *update_seconds* the clone runs ``--no-update`` and the catch-up update is its
+    own stage, cut at that timeout or the end of *clone_seconds*."""
+    worktree = Path(worktree)
     if is_temporary_root(worktree):
         return {"status": "skip", "reason": "temporary root"}
+    worktree = worktree.resolve()
     head = git_head(worktree)
     if not head:
         return {"status": "skip", "reason": "worktree is not a git checkout"}
@@ -223,7 +227,7 @@ def main() -> int:
     budget = (GIT_HEAD_SECONDS + SEED_BUILD_WAIT_SECONDS + args.refresh_seed_seconds
               + args.clone_seconds + 3 * STATUS_SECONDS)
     try:
-        result = bootstrap(args.worktree.resolve(), args.seed.resolve(),
+        result = bootstrap(args.worktree, args.seed.resolve(),
                            args.refresh_seed_seconds, args.clone_seconds,
                            seed_build_wait_seconds=args.seed_build_wait_seconds)
     except StageError as error:

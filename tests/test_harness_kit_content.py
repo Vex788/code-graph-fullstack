@@ -861,7 +861,8 @@ def test_graph_bootstrap_skips_a_seed_still_building_after_the_wait(tmp_path: Pa
 
 @skip_windows
 @pytest.mark.parametrize("worktree", ["/tmp/crg-bootstrap-scratch",
-                                      "/private/tmp/crg-bootstrap-scratch"])
+                                      "/private/tmp/crg-bootstrap-scratch",
+                                      "/var/folders/x"])
 def test_graph_bootstrap_refuses_a_temporary_root(tmp_path: Path, worktree: str):
     seed = _git_repo(tmp_path / "seed")
     _commit(seed, "seed")

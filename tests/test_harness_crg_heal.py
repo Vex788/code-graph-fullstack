@@ -481,6 +481,18 @@ def test_seed_with_rebuild_required_still_waits_for_the_nightly_build(rig: Rig):
     assert rc == 4 and "crg-postprocess-all" in report["next"] and rig.clone_calls() == []
 
 
+def test_wrong_root_seed_reports_the_full_seed_rebuild_it_needs(rig: Rig):
+    """The seed cannot be re-cloned from itself: name the rebuild instead of the nightly."""
+    seed = rig.worktree(".crg-seed-pms")
+    rig.configure(status={seed: "stale_graph"},
+                  update_once={"rc": 1, "stderr": WRONG_ROOT_ERROR})
+    rc, report = rig.run(seed)
+    assert rc == 3 and report["action"] == "update" and rig.clone_calls() == []
+    assert report["next"].endswith(
+        "seed graph root mismatch; a full seed rebuild is required")
+    assert "crg-postprocess-all" not in report["next"]
+
+
 def test_clone_only_clones_a_missing_graph_and_forces_a_rebuild_required_one(rig: Rig):
     fresh, rebuilt = rig.worktree("fresh"), rig.worktree("rebuilt")
     rig.configure(status={rig.pms: "ok", rebuilt: "rebuild_required"})

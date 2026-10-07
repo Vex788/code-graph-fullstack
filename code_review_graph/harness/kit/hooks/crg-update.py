@@ -13,7 +13,8 @@ graph needs a full rebuild, which is logged and never started from here.
 Anything else is a failure, retried up to RETRY_LIMIT times before the queue
 is poisoned (logged once; the next successful update clears it). An update that says
 the graph was built with a different repository root is never counted: it is logged as
-``crg_update_wrong_root`` and left to ``crg-heal``, which re-clones the root.
+``crg_update_wrong_root`` and left to ``crg-heal``, which re-clones a worktree root from
+the seed (a seed root with a mismatched graph is reported there as needing a full rebuild).
 
 A repository without a graph is skipped: hooks never build. An agent that meets a
 blocking status runs ``crg-heal`` once instead.
