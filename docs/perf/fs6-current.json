@@ -4,7 +4,7 @@
     "cpu_count": 15,
     "fork_git_head": "ce4f248116984953fcabf81c00d1cbc68daf9769",
     "machine": "arm64",
-    "package_path": "/Users/vex788/IdeaProjects/code-graph-fullstack/code_review_graph",
+    "package_path": "<repo-root>/code_review_graph",
     "parse_executor": "auto",
     "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
     "python": "3.14.0",
