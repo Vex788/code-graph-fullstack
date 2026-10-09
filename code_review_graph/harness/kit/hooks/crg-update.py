@@ -563,13 +563,15 @@ def selftest() -> dict:
     assert not moves_head("git log --grep=checkout")
     assert not moves_head("echo git checkout")
     assert not moves_head("ls -la")
-    assert git_command_roots("git -C /tmp/repo checkout main") == [Path("/tmp/repo")]
-    assert git_command_roots("git --git-dir=/tmp/repo/.git status") == [Path("/tmp/repo")]
-    assert git_command_roots("git --git-dir /tmp/repo/.git status") == [Path("/tmp/repo")]
-    assert git_command_roots('git -C "/tmp/my repo" switch x') == [Path("/tmp/my repo")]
+    # B108 below is test data, not filesystem use: these literals only feed
+    # git_command_roots(), which parses argv strings and never touches disk.
+    assert git_command_roots("git -C /tmp/repo checkout main") == [Path("/tmp/repo")]  # nosec B108
+    assert git_command_roots("git --git-dir=/tmp/repo/.git status") == [Path("/tmp/repo")]  # nosec B108
+    assert git_command_roots("git --git-dir /tmp/repo/.git status") == [Path("/tmp/repo")]  # nosec B108
+    assert git_command_roots('git -C "/tmp/my repo" switch x') == [Path("/tmp/my repo")]  # nosec B108
     assert git_command_roots("git -C relative/repo switch x") == [Path("relative/repo")]
     assert git_command_roots("git -C /tmp/a -C /tmp/b switch x") == [
-        Path("/tmp/a"), Path("/tmp/b")]
+        Path("/tmp/a"), Path("/tmp/b")]  # nosec B108
     assert git_command_roots("git -c core.pager=cat stash pop") == []
     patch = "*** Begin Patch\n*** Update File: src/A.java\n*** Move to: src/B.java\n"
     assert edited_paths({"patch": patch}) == ["src/A.java", "src/B.java"]

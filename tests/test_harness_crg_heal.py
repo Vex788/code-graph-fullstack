@@ -145,7 +145,12 @@ class Rig:
 
     def env(self) -> dict[str, str]:
         return {**os.environ, "HOME": str(self.home), "CRG_BIN": str(self.stub),
-                "STUB_CONFIG": str(self.cfg), "CRG_HEAL_POLL_SECONDS": "0.05"}
+                "STUB_CONFIG": str(self.cfg), "CRG_HEAL_POLL_SECONDS": "0.05",
+                # The hermetic HOME lives under pytest's tmp dir by construction;
+                # without the opt-out the temporary-root guard skips every clone
+                # flow under test (on Linux; on macOS the guard misses resolved
+                # /private/var/folders and the tests pass for the wrong reason).
+                "CRG_ALLOW_TEMPORARY_ROOT": "1"}
 
     def command(self, repo: Path | str, *args: str) -> list[str]:
         return [sys.executable, str(self.script), "--repo", str(repo), "--json", *args]

@@ -17,9 +17,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# ToolResult lives at fastmcp.tools.tool on 3.x but is only re-exported from
+# fastmcp.tools on 4.x; the package namespace works on both (pip installs 4.x
+# on Windows CI while uv.lock pins 3.x).
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import TextContent
 from typing_extensions import NotRequired, TypedDict  # pydantic rejects typing.TypedDict below 3.12
 
