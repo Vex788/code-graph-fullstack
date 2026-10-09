@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.9] - 2026-10-09
+
+### Fixed
+- A no-op `update` no longer reports a graph with a stale search index as
+  complete. `nodes_fts` is kept in step by row triggers, so it can only drift
+  when those triggers are missing (an interrupted bulk load, an older writer).
+  A no-op update now repairs that drift (one `sqlite_master` count to detect,
+  a rebuild only on drift), and the repair is reported on stdout. A healthy
+  no-op update is unaffected.
+- `update --skip-postprocess` no longer implies a synced index: when the graph
+  carries FTS drift, the run and the next no-op update both report it and name
+  the remediation, instead of returning an ordinary success.
+- A failed FTS rebuild is drift, not a warning nobody reads, on every path that
+  rebuilds: a file update, a no-op update, and the explicit `postprocess`
+  command. `postprocess` no longer prints a bare `done` when the rebuild it was
+  asked for failed.
+
+### Packaging
+- `uv.lock` re-synced with `pyproject.toml`; `uv sync --frozen` was broken at
+  `2.3.8+fs.8` because the committed lock still pinned `2.3.8+fs.6`,
+  `fastmcp<4` and `tree-sitter-language-pack<1`. No resolved version moves.
+
 ## [2.3.8+fs.6] - 2026-09-28
 
 Covers fs.5 and fs.6. **Run `code-review-graph build` once after upgrading.**

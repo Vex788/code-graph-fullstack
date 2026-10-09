@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -21,11 +22,11 @@ from code_review_graph.incremental import (
     get_db_path,
     incremental_update,
 )
-from code_review_graph.migrations import INDEX_GENERATION
+from code_review_graph.migrations import FTS_TRIGGERS, INDEX_GENERATION
 from code_review_graph.readiness import compute_readiness
 from code_review_graph.readiness_facts import gather_facts
 
-from .witness.conftest import build, copy_fixture, git
+from .witness.conftest import build, copy_fixture, git, open_store
 
 USER_SERVICE = "src/main/java/com/acme/service/UserService.java"
 
@@ -578,3 +579,177 @@ def test_symbolic_base_at_head_keeps_the_noop_fast_path(repo: Path):
 
     assert result["status"] == "ok", result
     assert "No changes detected" in result["summary"]
+
+
+# ---------------------------------------------------------------------------
+# FTS drift on a no-op update (#1104)
+# ---------------------------------------------------------------------------
+
+
+def _drop_fts_triggers(repo: Path) -> None:
+    """Leave the graph in the state an interrupted bulk load leaves behind.
+
+    The row triggers are what keep ``nodes_fts`` in step with ``nodes``; without
+    them every write after this point is invisible to search.
+    """
+    conn = sqlite3.connect(get_db_path(repo))
+    try:
+        for name in FTS_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")  # nosec B608 - fixed names
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _unindexed_symbols(repo: Path) -> set[str]:
+    """Graph symbols that a valid FTS lookup cannot find."""
+    store = open_store(repo)
+    try:
+        missing = {
+            str(row[0])
+            for row in store._conn.execute(
+                "SELECT name FROM nodes WHERE id NOT IN (SELECT id FROM nodes_fts_docsize)"
+            )
+        }
+        for name in missing:
+            found = store._conn.execute(
+                "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH ?",
+                (f'"{name}"',),
+            ).fetchone()[0]
+            assert not found, f"{name} is indexed but does not match its own row"
+        return missing
+    finally:
+        store.close()
+
+
+def test_noop_update_repairs_unsynced_fts(repo: Path):
+    """A no-op update must repair FTS drift, not certify the stale index."""
+    build(repo)
+    _drop_fts_triggers(repo)
+    _append_method(repo, USER_SERVICE, "driftProbe")
+    git(repo, "commit", "-qam", "edit")
+    assert build(repo, full=False, postprocess="none")["files_updated"] == 1
+    assert _unindexed_symbols(repo), "precondition: the new symbol is not searchable"
+
+    result = build(repo, full=False, postprocess="minimal")
+
+    assert result["status"] == "ok", result
+    assert "No changes detected" in result["summary"]
+    assert result.get("fts_repaired") is True, result
+    assert not _unindexed_symbols(repo)
+
+
+def test_noop_update_reports_skipped_fts_repair(repo: Path):
+    """--skip-postprocess stays cheap but says the index is not maintained."""
+    build(repo)
+    _drop_fts_triggers(repo)
+
+    result = build(repo, full=False, postprocess="none")
+
+    assert result["status"] == "ok", result
+    assert result.get("fts_stale") is True, result
+    assert "fts_repaired" not in result
+
+
+def test_skip_postprocess_update_reports_the_drift_it_creates(repo: Path):
+    """The update that leaves the index unsynced says so, not just the next one."""
+    build(repo)
+    _drop_fts_triggers(repo)
+    _append_method(repo, USER_SERVICE, "skipProbe")
+    git(repo, "commit", "-qam", "edit")
+
+    result = build(repo, full=False, postprocess="none")
+
+    assert result["status"] == "ok", result
+    assert result.get("fts_stale") is True, result
+    assert _unindexed_symbols(repo), "the reported drift must be the real one"
+
+
+def test_noop_update_with_pending_flows_repairs_unsynced_fts(repo: Path):
+    """The other no-op branch repairs drift through the post-processing gate.
+
+    ``postprocess="full"`` with a pending flows delta diverts into
+    ``_run_postprocess``, which owns its own FTS gate. That coupling is what
+    keeps this sub-path covered, so pin it rather than trust it.
+    """
+    from code_review_graph.incremental import read_flows_stale
+
+    build(repo)
+    _drop_fts_triggers(repo)
+    _append_method(repo, USER_SERVICE, "flowsProbe")
+    git(repo, "commit", "-qam", "edit")
+    # --skip-postprocess writes the nodes, leaves the index unsynced, and keeps
+    # the flows delta pending: both properties the no-op branch keys on.
+    assert build(repo, full=False, postprocess="none")["files_updated"] == 1
+    store = open_store(repo)
+    try:
+        assert read_flows_stale(store) is not None, "precondition: flows are pending"
+    finally:
+        store.close()
+    assert _unindexed_symbols(repo), "precondition: the new symbol is not searchable"
+
+    result = build(repo, full=False, postprocess="full")
+
+    assert result["status"] == "ok", result
+    assert "No changes detected" in result["summary"]
+    assert result.get("fts_rebuilt") is True, result
+    assert not _unindexed_symbols(repo)
+
+
+def test_failed_fts_rebuild_on_noop_update_never_reports_success(repo: Path):
+    """A rebuild that raises is drift, not a warning nobody reads."""
+    build(repo)
+    _append_method(repo, USER_SERVICE, "boomProbe")
+    git(repo, "commit", "-qam", "edit")
+    assert build(repo, full=False, postprocess="none")["files_updated"] == 1
+    _drop_fts_triggers(repo)
+
+    with patch(
+        "code_review_graph.search.rebuild_fts_index",
+        side_effect=sqlite3.OperationalError("database is locked"),
+    ):
+        result = build(repo, full=False, postprocess="minimal")
+
+    assert result["status"] == "ok", result  # the build itself is not the failure
+    assert "No changes detected" in result["summary"]
+    assert result.get("fts_stale") is True, result
+    assert "fts_repaired" not in result
+    assert any("FTS" in w for w in result["warnings"]), result
+
+
+def test_failed_fts_rebuild_in_postprocess_pipeline_never_reports_success(repo: Path):
+    """The same holds inside _run_postprocess, which owns the other branch."""
+    build(repo)
+    _drop_fts_triggers(repo)
+    _append_method(repo, USER_SERVICE, "boomProbe2")
+    git(repo, "commit", "-qam", "edit")
+
+    with patch(
+        "code_review_graph.search.rebuild_fts_index",
+        side_effect=sqlite3.OperationalError("database is locked"),
+    ):
+        result = build(repo, full=False, postprocess="minimal")
+
+    assert result.get("fts_stale") is True, result
+    assert result.get("fts_repaired") is not True, result
+    assert result.get("fts_rebuilt") is not True, result
+
+
+def test_healthy_noop_update_does_not_touch_fts(repo: Path):
+    """The drift check must stay free on a graph whose index is in sync."""
+    build(repo)
+    _append_method(repo, USER_SERVICE, "cheapProbe")
+    git(repo, "commit", "-qam", "edit")
+    assert build(repo, full=False, postprocess="minimal")["files_updated"] == 1
+    assert not _unindexed_symbols(repo)
+
+    with patch(
+        "code_review_graph.search.rebuild_fts_index",
+        side_effect=AssertionError("healthy no-op update rebuilt FTS"),
+    ) as rebuild:
+        result = build(repo, full=False, postprocess="minimal")
+
+    assert result["status"] == "ok", result
+    assert "fts_repaired" not in result
+    assert result.get("fts_stale") is not True
+    rebuild.assert_not_called()

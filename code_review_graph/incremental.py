@@ -1156,7 +1156,10 @@ def _commit_object_exists(repo_root: Path, ref: str) -> bool:
     """
     if not ref or ref.startswith("-") or not _SAFE_GIT_REF.fullmatch(ref):
         return False
-    return _git_output(repo_root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"]) is not None
+    return (
+        _git_output(repo_root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+        is not None
+    )
 
 
 def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None:
