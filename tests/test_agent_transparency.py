@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -467,7 +468,7 @@ def test_mcp_query_wrapper_forwards_max_results(monkeypatch):
 
     tool = getattr(main_module.query_graph_tool, "fn", None)
     underlying = tool or main_module.query_graph_tool
-    result = underlying("callers_of", "target", max_results=7)
+    result = asyncio.run(underlying("callers_of", "target", max_results=7))
 
     assert result["status"] == "ok"
     assert captured["max_results"] == 7

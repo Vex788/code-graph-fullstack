@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from ..incremental import get_db_path
+from ..incremental import GitUnavailableError, discover_review_changes, get_db_path
 from ..migrations import SchemaMigrationPending, SchemaTooNewError
 from ..parser import normalize_file_path
 from ..readiness import GIT_OK, GIT_UNAVAILABLE, ReadinessStatus
@@ -74,27 +74,6 @@ def missing_graph_response(root: Path) -> dict[str, Any] | None:
         "missing_graph",
         "No graph database found. Build the graph before requesting context.",
     )
-
-
-def _has_git_changes(root: Path, base: str) -> bool:
-    """Quick check for uncommitted or diffed changes."""
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", base, "--"],
-            capture_output=True, stdin=subprocess.DEVNULL, text=True,
-            cwd=str(root), timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return True
-        # Also check staged/unstaged
-        result2 = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, stdin=subprocess.DEVNULL, text=True,
-            cwd=str(root), timeout=10,
-        )
-        return bool(result2.stdout.strip())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
 
 
 def get_minimal_context(
@@ -200,30 +179,41 @@ def get_minimal_context(
         risk_score = 0.0
         top_affected: list[str] = []
         test_gap_count = 0
-        if changed_files or _has_git_changes(root, base):
+        discovery_failed = ""
+        files = changed_files
+        if not files:
+            # One discover_review_changes call replaces the old pair of
+            # hardcoded 10-second git probes, on the short discovery budget:
+            # CLAUDE.md tells agents to call this tool first, so a slow
+            # repository blocks here before anything else (#262).
+            try:
+                files, base = discover_review_changes(root, base)
+            except GitUnavailableError as exc:
+                # Never silently "no changes": that is the answer an agent
+                # acts on. Say the lookup failed and carry on with the other
+                # sections.
+                discovery_failed = str(exc)
+                logger.warning("Change discovery failed in get_minimal_context: %s", exc)
+                files = None
+        if files:
             try:
                 from ..changes import analyze_changes
-                from ..incremental import get_changed_files as _get_changed
 
-                files = changed_files
-                if not files:
-                    files = _get_changed(root, base)
-                if files:
-                    abs_files = [normalize_file_path(root / f) for f in files]
-                    analysis = analyze_changes(
-                        store, abs_files, repo_root=str(root), base=base,
-                    )
-                    risk_score = analysis.get("risk_score", 0.0)
-                    risk = (
-                        "high" if risk_score > 0.7
-                        else "medium" if risk_score > 0.4
-                        else "low"
-                    )
-                    top_affected = [
-                        f.get("name", "")
-                        for f in analysis.get("changed_functions", [])[:5]
-                    ]
-                    test_gap_count = len(analysis.get("test_gaps", []))
+                abs_files = [normalize_file_path(root / f) for f in files]
+                analysis = analyze_changes(
+                    store, abs_files, repo_root=str(root), base=base,
+                )
+                risk_score = analysis.get("risk_score", 0.0)
+                risk = (
+                    "high" if risk_score > 0.7
+                    else "medium" if risk_score > 0.4
+                    else "low"
+                )
+                top_affected = [
+                    f.get("name", "")
+                    for f in analysis.get("changed_functions", [])[:5]
+                ]
+                test_gap_count = len(analysis.get("test_gaps", []))
             except (
                 ImportError, OSError, ValueError,
                 sqlite3.Error, subprocess.SubprocessError,
@@ -282,6 +272,9 @@ def get_minimal_context(
             summary_parts.append(f"Risk: {risk} ({risk_score:.2f}).")
         if test_gap_count:
             summary_parts.append(f"{test_gap_count} test gaps.")
+        if discovery_failed:
+            # A degraded run must not read like a healthy one.
+            summary_parts.append(f"Degraded: {discovery_failed}")
 
         response = compact_response(
             summary=" ".join(summary_parts),

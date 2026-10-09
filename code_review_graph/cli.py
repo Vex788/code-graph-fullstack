@@ -2312,16 +2312,20 @@ def main() -> None:
                     format_context_savings_panel,
                 )
                 from .incremental import (
-                    get_changed_files,
-                    get_staged_and_unstaged,
+                    GitUnavailableError,
+                    discover_review_changes,
                 )
 
                 # Reuse the base the update actually resolved to (args.base is
-                # None by default now, which get_changed_files cannot accept).
+                # None by default now, which discovery cannot accept). The
+                # brief is auxiliary: a discovery failure warns and is skipped,
+                # it does not fail the update that just succeeded.
                 brief_base = result.get("base_resolved") or "HEAD~1"
-                changed = get_changed_files(repo_root, brief_base)
-                if not changed:
-                    changed = get_staged_and_unstaged(repo_root)
+                try:
+                    changed, _ = discover_review_changes(repo_root, brief_base)
+                except GitUnavailableError as exc:
+                    print(f"Warning: {exc}", file=sys.stderr)
+                    changed = []
                 if changed:
                     impact = analyze_changes(
                         store,
@@ -2585,12 +2589,16 @@ def main() -> None:
                 attach_context_savings,
                 estimate_file_tokens,
             )
-            from .incremental import get_changed_files, get_staged_and_unstaged
+            from .incremental import GitUnavailableError, discover_review_changes
 
             base = args.base
-            changed = get_changed_files(repo_root, base)
-            if not changed:
-                changed = get_staged_and_unstaged(repo_root)
+            try:
+                changed, base = discover_review_changes(repo_root, base)
+            except GitUnavailableError as exc:
+                # A timeout is a failure, not a clean tree: exit 1 rather
+                # than print the all-clear a review gate would act on (#913).
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
 
             if not changed:
                 print("No changes detected.")

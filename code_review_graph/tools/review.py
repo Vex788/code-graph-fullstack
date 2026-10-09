@@ -11,7 +11,7 @@ from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..flows import get_affected_flows as _get_affected_flows
 from ..graph import _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
-from ..incremental import get_changed_files, get_staged_and_unstaged
+from ..incremental import GitUnavailableError, discover_review_changes
 from ..parser import normalize_file_path
 from ._common import (
     _bounded,
@@ -29,17 +29,28 @@ _GIT_UNAVAILABLE_WARNING = (
 )
 
 
-def _auto_changed_files(root: Path, base: str) -> list[str] | None:
-    """Changed files from git; None when git could not answer."""
-    changed = get_changed_files(root, base)
-    return changed or get_staged_and_unstaged(root)
+def _auto_changed_files(root: Path, base: str) -> tuple[list[str] | None, str]:
+    """Changed files from git; ``(None, reason)`` when git could not answer.
+
+    Discovery runs on the short ``CRG_DISCOVERY_TIMEOUT`` budget, so a slow
+    Git cannot hold the tool call past the client's request ceiling. A
+    budget exhaustion is returned as a failure with its reason, never read
+    as a clean tree (#262, #913).
+    """
+    try:
+        changed, _ = discover_review_changes(root, base)
+    except GitUnavailableError as exc:
+        logger.warning("change discovery unavailable for %s: %s", root, exc)
+        return None, str(exc)
+    return changed, ""
 
 
-def _git_unavailable(response: dict[str, Any]) -> dict[str, Any]:
+def _git_unavailable(response: dict[str, Any], reason: str = "") -> dict[str, Any]:
     """Mark an empty auto-detected result as git failure, not a clean tree."""
-    response["summary"] = "No changed files: git unavailable. " + _GIT_UNAVAILABLE_WARNING
+    detail = reason or _GIT_UNAVAILABLE_WARNING
+    response["summary"] = "No changed files: git unavailable. " + detail
     response["git"] = "unavailable"
-    response["warning"] = _GIT_UNAVAILABLE_WARNING
+    response["warning"] = detail
     return response
 
 # Hard ceilings shared by the review tools. All three walk the full impact
@@ -203,8 +214,9 @@ def get_review_context(
     try:
         # Get impact radius first
         git_failed = False
+        git_error = ""
         if changed_files is None:
-            changed_files = _auto_changed_files(root, base)
+            changed_files, git_error = _auto_changed_files(root, base)
             git_failed = changed_files is None
 
         if not changed_files:
@@ -213,7 +225,7 @@ def get_review_context(
                 "summary": "No changes detected. Nothing to review.",
                 "context": {},
             }
-            return _git_unavailable(empty) if git_failed else empty
+            return _git_unavailable(empty, git_error) if git_failed else empty
 
         graph_files = _resolve_graph_file_paths(store, root, changed_files)
         original_tokens = estimate_file_tokens(root, changed_files)
@@ -525,8 +537,9 @@ def get_affected_flows_func(
     store, root = _get_store(repo_root)
     try:
         git_failed = False
+        git_error = ""
         if changed_files is None:
-            changed_files = _auto_changed_files(root, base)
+            changed_files, git_error = _auto_changed_files(root, base)
             git_failed = changed_files is None
 
         if not changed_files:
@@ -536,7 +549,7 @@ def get_affected_flows_func(
                 "affected_flows": [],
                 "total": 0,
             }
-            return _git_unavailable(empty) if git_failed else empty
+            return _git_unavailable(empty, git_error) if git_failed else empty
 
         # Convert to absolute paths for graph lookup. Graph identity uses
         # POSIX separators (#774), so normalize the joined paths.
@@ -641,8 +654,9 @@ def detect_changes_func(
     try:
         # Detect changed files if not provided.
         git_failed = False
+        git_error = ""
         if changed_files is None:
-            changed_files = _auto_changed_files(root, base)
+            changed_files, git_error = _auto_changed_files(root, base)
             git_failed = changed_files is None
 
         if not changed_files:
@@ -656,7 +670,7 @@ def detect_changes_func(
                 "review_priorities": [],
                 "impacted_nodes": [],
             }
-            return _git_unavailable(empty) if git_failed else empty
+            return _git_unavailable(empty, git_error) if git_failed else empty
 
         original_tokens = estimate_file_tokens(root, changed_files)
 

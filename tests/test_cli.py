@@ -323,8 +323,8 @@ class TestDetectChangesCommand:
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
                     mock_db.return_value = MagicMock()
                     with patch(
-                        "code_review_graph.incremental.get_changed_files",
-                        return_value=["app.py"],
+                        "code_review_graph.incremental.discover_review_changes",
+                        return_value=(["app.py"], "HEAD~1"),
                     ):
                         with patch(
                             "code_review_graph.changes.analyze_changes",
@@ -360,8 +360,8 @@ class TestDetectChangesCommand:
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
                     mock_db.return_value = MagicMock()
                     with patch(
-                        "code_review_graph.incremental.get_changed_files",
-                        return_value=["app.py"],
+                        "code_review_graph.incremental.discover_review_changes",
+                        return_value=(["app.py"], "HEAD~1"),
                     ):
                         with patch(
                             "code_review_graph.changes.analyze_changes",
@@ -397,8 +397,8 @@ class TestDetectChangesCommand:
                 with patch("code_review_graph.incremental.get_db_path") as mock_db:
                     mock_db.return_value = MagicMock()
                     with patch(
-                        "code_review_graph.incremental.get_changed_files",
-                        return_value=["app.py"],
+                        "code_review_graph.incremental.discover_review_changes",
+                        return_value=(["app.py"], "HEAD~1"),
                     ):
                         with patch(
                             "code_review_graph.changes.analyze_changes",

@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
 from .constants import SECURITY_KEYWORDS as _SECURITY_KEYWORDS
 from .constants import env_int
 from .flows import get_affected_flows
@@ -48,8 +49,6 @@ _WEB_LANGUAGES = frozenset({
 })
 _STYLE_LANGUAGES = frozenset({"css", "scss"})
 _MAX_CROSS_STACK_LINKS = 50
-
-_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds, configurable
 
 _SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
 _SAFE_SVN_REV = re.compile(r"^r?\d+(:r?\d+|:HEAD|:BASE|:COMMITTED)?$", re.IGNORECASE)

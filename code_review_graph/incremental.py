@@ -24,7 +24,8 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple, Optional
 
-from .constants import env_float, env_int
+from .constants import GIT_TIMEOUT as _GIT_TIMEOUT
+from .constants import discovery_timeout, env_float, env_int
 from .graph import STORE_BATCH_FILES, GraphStore
 from .locking import writer_lock
 from .migrations import INDEX_GENERATION, get_index_generation
@@ -1049,28 +1050,37 @@ def _is_binary(path: Path) -> bool:
         return True
 
 
-_GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds, configurable
-
 # When True, `git ls-files --recurse-submodules` is used so that files
 # inside git submodules are included in the graph.  Opt-in via env var;
 # can also be overridden per-call through function parameters.
 _RECURSE_SUBMODULES = os.environ.get("CRG_RECURSE_SUBMODULES", "").lower() in ("1", "true", "yes")
 
 
-def _git_output(repo_root: Path, args: list[str]) -> str | None:
+def _git_output(
+    repo_root: Path,
+    args: list[str],
+    *,
+    timeout: float | None = None,
+) -> str | None:
     """One ``git`` call; a single retry at double timeout on any failure.
 
     Anchor and base capture run while builds hammer the repository, so a
     timeout or a busy exit must not be read as definitive knowledge.
+
+    *timeout* is an explicit per-attempt budget, used by the change-discovery
+    chain for the short :func:`~.constants.discovery_timeout`. When it is set
+    there is no retry: the point of a discovery budget is to answer, or fail,
+    inside it.
     """
-    for timeout in (_GIT_TIMEOUT, _GIT_TIMEOUT * 2):
+    budgets = (_GIT_TIMEOUT, _GIT_TIMEOUT * 2) if timeout is None else (timeout,)
+    for budget in budgets:
         try:
             result = subprocess.run(
                 ["git", *args],
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 cwd=str(repo_root),
-                timeout=timeout,
+                timeout=budget,
                 stdin=subprocess.DEVNULL,
             )
         except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
@@ -1188,15 +1198,26 @@ def resolve_incremental_base(repo_root: Path, store: "GraphStore") -> str | None
     return None
 
 
-def _git_diff_output(repo_root: Path, args: list[str]) -> bytes | None:
-    """``git diff`` stdout, or None when git could not answer after one retry."""
-    for timeout in (_GIT_TIMEOUT, _GIT_TIMEOUT * 2):
+def _git_diff_output(
+    repo_root: Path,
+    args: list[str],
+    *,
+    timeout: float | None = None,
+) -> bytes | None:
+    """``git diff`` stdout, or None when git could not answer after one retry.
+
+    *timeout* is an explicit per-attempt budget, used by the change-discovery
+    chain for the short :func:`~.constants.discovery_timeout`. When it is set
+    there is no retry, for the same reason as :func:`_git_output`.
+    """
+    budgets = (_GIT_TIMEOUT, _GIT_TIMEOUT * 2) if timeout is None else (timeout,)
+    for budget in budgets:
         try:
             result = subprocess.run(
                 ["git", *args],
                 capture_output=True,
                 cwd=str(repo_root),
-                timeout=timeout,
+                timeout=budget,
                 stdin=subprocess.DEVNULL,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -1206,32 +1227,68 @@ def _git_diff_output(repo_root: Path, args: list[str]) -> bytes | None:
     return None
 
 
-def get_changed_files_strict(repo_root: Path, base: str = "HEAD~1") -> Optional[list[str]]:
+def get_changed_files_strict(
+    repo_root: Path,
+    base: str = "HEAD~1",
+    *,
+    timeout: float | None = None,
+    require_vcs: bool = False,
+) -> Optional[list[str]]:
     """Changed files; ``None`` when git could not answer (``[]`` means none).
 
     Callers that treat the result as knowledge must distinguish the two: a
     failed discovery read as an empty diff once made updates exit "up to date"
     without stamping the anchor, freezing the receipt on a stale graph.
+
+    Args:
+        repo_root: Repository root directory.
+        base: Git ref (or SVN revision range) to diff against.
+        timeout: Seconds allowed for each subprocess. ``None`` (default) uses
+            the general ``CRG_GIT_TIMEOUT`` budget with one retry, which is
+            what build, incremental update and watch want; the read-only
+            change-discovery chain passes the shorter
+            :func:`~.constants.discovery_timeout` instead, without a retry.
+        require_vcs: Strengthen the failure detection for callers whose whole
+            answer is "these files changed". With a ``.git`` marker present,
+            a git that cannot answer is ``None`` even when the final
+            ``git rev-parse`` probe also fails -- the probe distinguishes
+            "not a working tree" from "git is broken", and conflating the two
+            is what let a timed-out discovery read as a clean tree (#913).
     """
     vcs_kind = detect_vcs(repo_root)
     is_git = vcs_kind == "git"
     if vcs_kind == "svn":
-        return _get_svn_changed_files(repo_root, base if _SAFE_SVN_REV.match(base) else None)
+        return _get_svn_changed_files(
+            repo_root,
+            base if _SAFE_SVN_REV.match(base) else None,
+            timeout=timeout,
+            require_vcs=require_vcs,
+        )
     # Git path
     if base.startswith("-") or not _SAFE_GIT_REF.fullmatch(base):
         logger.warning("Invalid git ref rejected: %s", base)
         return []
     # --name-status (not --name-only): renames/copies must report BOTH
     # paths, or the old path never reaches the purge loop (issue #684).
-    output = _git_diff_output(repo_root, ["diff", "--name-status", "-z", base, "--"])
+    output = _git_diff_output(
+        repo_root, ["diff", "--name-status", "-z", base, "--"], timeout=timeout,
+    )
     if output is None:
         # Fallback: try diff against empty tree (initial commit)
-        output = _git_diff_output(repo_root, ["diff", "--name-status", "-z", "--cached"])
+        output = _git_diff_output(
+            repo_root, ["diff", "--name-status", "-z", "--cached"], timeout=timeout,
+        )
     if output is None:
-        if not is_git or _git_output(repo_root, ["rev-parse", "--git-dir"]) is None:
-            # Either no VCS marker at all, or git itself cannot run here
-            # (an empty .git marker directory, a broken checkout): the failed
-            # diff is expected, and there is no diff to discover.
+        if not is_git:
+            # No VCS marker at all: the failed diff is expected, and there
+            # is no diff to discover.
+            return []
+        if not require_vcs and (
+            _git_output(repo_root, ["rev-parse", "--git-dir"], timeout=timeout)
+            is None
+        ):
+            # An empty .git marker directory or a broken checkout: git
+            # itself cannot run here, so there is no diff to discover.
             return []
         logger.warning("git diff failed while discovering changed files")
         return None
@@ -1257,7 +1314,13 @@ def _unindexed_untracked_files(repo_root: Path, store: GraphStore) -> list[str]:
     return [rel for rel in untracked if normalize_file_path(repo_root / rel) in missing]
 
 
-def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
+def get_changed_files(
+    repo_root: Path,
+    base: str = "HEAD~1",
+    *,
+    timeout: float | None = None,
+    require_vcs: bool = False,
+) -> list[str]:
     """Get list of changed files via git diff or svn status.
 
     Legacy wrapper: a failed discovery reads as an empty list. New callers
@@ -1266,30 +1329,55 @@ def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     For SVN working copies the *base* parameter is ignored; modified/added/
     deleted files are detected from ``svn status``.  Pass an SVN revision
     range (e.g. ``"r100:HEAD"``) as *base* to compare against a specific
-    revision instead.
+    revision instead. *timeout* and *require_vcs* are forwarded to
+    :func:`get_changed_files_strict`.
     """
-    strict = get_changed_files_strict(repo_root, base)
+    strict = get_changed_files_strict(
+        repo_root, base, timeout=timeout, require_vcs=require_vcs,
+    )
     return strict if strict is not None else []
 
-def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> list[str]:
+
+class GitUnavailableError(RuntimeError):
+    """The VCS could not answer; callers must not read this as a clean tree."""
+
+
+def _get_svn_changed_files(
+    repo_root: Path,
+    rev_range: str | None = None,
+    *,
+    timeout: float | None = None,
+    require_vcs: bool = False,
+) -> list[str]:
     """Return changed files in an SVN working copy.
 
     When *rev_range* is given (e.g. ``"r100:HEAD"``), ``svn diff --summarize``
     is used to list files changed between those revisions.  Otherwise
     ``svn status`` reports working-copy modifications.
+
+    *timeout* is the per-subprocess budget; ``None`` uses ``CRG_GIT_TIMEOUT``.
+    With *require_vcs* an svn that cannot answer raises
+    :class:`GitUnavailableError` instead of returning an empty list.
     """
+    budget = _GIT_TIMEOUT if timeout is None else timeout
+
+    def _failed(why: str) -> list[str]:
+        if require_vcs:
+            raise GitUnavailableError(f"svn {why}")
+        return []
+
     try:
         if rev_range:
             result = subprocess.run(
                 ["svn", "diff", "--summarize", "--non-interactive", "-r", rev_range],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                cwd=str(repo_root), timeout=budget,
                 stdin=subprocess.DEVNULL,
             )
             if result.returncode != 0:
                 logger.warning("svn diff --summarize failed (rc=%d): %s",
                                result.returncode, result.stderr[:200])
-                return []
+                return _failed(f"diff failed (rc={result.returncode})")
             files = []
             for line in result.stdout.splitlines():
                 # Format: "M       path/to/file"  (first char is status)
@@ -1300,7 +1388,7 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
             result = subprocess.run(
                 ["svn", "status", "--non-interactive"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=str(repo_root), timeout=_GIT_TIMEOUT,
+                cwd=str(repo_root), timeout=budget,
                 stdin=subprocess.DEVNULL,
             )
             files = []
@@ -1314,11 +1402,9 @@ def _get_svn_changed_files(repo_root: Path, rev_range: str | None = None) -> lis
                     path = line[8:].strip() if len(line) > 8 else line[1:].strip()
                     files.append(path)
             return files
-    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError):
-        return []
-
-class GitUnavailableError(RuntimeError):
-    """git could not answer; callers must not read this as a clean tree."""
+    except (FileNotFoundError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        logger.warning("svn discovery failed: %s", exc)
+        return _failed(f"could not be run ({exc})")
 
 
 def read_git_dirty_paths(repo_root: Path, timeout: Optional[float] = None) -> list[str]:
@@ -1353,19 +1439,102 @@ def read_git_dirty_paths(repo_root: Path, timeout: Optional[float] = None) -> li
     return files
 
 
-def get_staged_and_unstaged(repo_root: Path) -> Optional[list[str]]:
+def get_staged_and_unstaged(
+    repo_root: Path,
+    *,
+    timeout: Optional[float] = None,
+    require_vcs: bool = False,
+) -> Optional[list[str]]:
     """Get all modified files (staged + unstaged + untracked).
 
     Returns None when git cannot answer (non-zero exit, timeout, missing
     binary): that is "unavailable", never a clean tree.
+
+    *timeout* is the per-subprocess budget; ``None`` uses
+    ``CRG_GIT_TIMEOUT``. With *require_vcs* an svn that cannot answer raises
+    :class:`GitUnavailableError` instead of returning an empty list.
+
+    The untracked walk stays at ``--untracked-files=all`` (inside
+    :func:`read_git_dirty_paths`): scoping it down was tried and withdrawn
+    because git collapses a wholly-untracked directory to one ``dir/`` record,
+    which is not a file any caller can open. The discovery budget bounds the
+    walk instead.
     """
     if detect_vcs(repo_root) == "svn":
-        return _get_svn_changed_files(repo_root)
+        return _get_svn_changed_files(
+            repo_root, timeout=timeout, require_vcs=require_vcs,
+        )
     try:
-        return read_git_dirty_paths(repo_root)
+        return read_git_dirty_paths(repo_root, timeout)
     except GitUnavailableError as exc:
         logger.warning("git status unavailable for %s: %s", repo_root, exc)
         return None
+
+
+def _discovery_failure(vcs: str, tool: str, budget: float) -> GitUnavailableError:
+    """The error raised when change discovery exhausts its budget."""
+    return GitUnavailableError(
+        f"could not determine the changes: {vcs} {tool} failed or did not "
+        f"answer within the {budget:g}s discovery budget. Raise "
+        "CRG_DISCOVERY_TIMEOUT, or pass changed_files explicitly."
+    )
+
+
+def discover_review_changes(
+    repo_root: Path,
+    base: str = "HEAD~1",
+) -> tuple[list[str], str]:
+    """Discover the files under review, on the short discovery budget.
+
+    This is the chain every review-shaped tool and command runs when the
+    caller did not name ``changed_files`` itself: diff the base and fall back
+    to the working tree when that diff is empty.
+
+    Two things make it different from calling the two functions directly, and
+    both exist because this chain runs inside an MCP tool call that a client
+    will abandon at its own request ceiling (#262):
+
+    * every subprocess gets :func:`~.constants.discovery_timeout` -- a few
+      seconds -- not the 30-second ``CRG_GIT_TIMEOUT`` that build, update and
+      watch need, so the worst case for the whole chain is seconds rather
+      than minutes;
+    * every step runs with ``require_vcs=True``, so exhausting that budget
+      raises :class:`GitUnavailableError` instead of returning an empty list.
+      The second is what licenses the first: shortening a budget whose
+      timeout path returns ``[]`` would only make the false all-clear easier
+      to hit (#913), and a caller would read it as "nothing changed".
+
+    The untracked walk is deliberately left at ``--untracked-files=all``:
+    scoping it down was tried and withdrawn upstream, because git collapses a
+    wholly-untracked new package to one ``dir/`` record and the first commit
+    of a new package then reads as "no changes" with ``status: ok``. Being
+    slow is a bug; confidently reviewing nothing is a worse one. The budget
+    above bounds the walk and reports it when it does.
+
+    Returns:
+        ``(changed_files, base)``. The same *base* is returned so callers can
+        reuse it for diff hunks and risk scoring without resolving twice.
+
+    Raises:
+        GitUnavailableError: the VCS could not be run, or overran the
+            discovery budget. Never raised for a repository that simply has
+            no changes.
+    """
+    budget = discovery_timeout()
+    vcs = detect_vcs(repo_root)
+    changed = get_changed_files_strict(
+        repo_root, base, timeout=budget, require_vcs=True,
+    )
+    if changed is None:
+        raise _discovery_failure(vcs, "diff", budget)
+    if not changed:
+        dirty = get_staged_and_unstaged(
+            repo_root, timeout=budget, require_vcs=True,
+        )
+        if dirty is None:
+            raise _discovery_failure(vcs, "status", budget)
+        changed = dirty
+    return changed, base
 
 
 def get_all_tracked_files(
