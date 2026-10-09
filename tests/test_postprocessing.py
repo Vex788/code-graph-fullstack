@@ -2,11 +2,13 @@
 
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from code_review_graph import incremental
 from code_review_graph.graph import GraphStore
-from code_review_graph.incremental import full_build, incremental_update
+from code_review_graph.incremental import full_build, incremental_update, watch
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.postprocessing import run_post_processing
 
@@ -557,6 +559,239 @@ class TestWatchCallbackIntegration:
                 max_depth=0,
             )
             assert {test["name"] for test in tests} == {"test_render_thing"}
+        finally:
+            store.close()
+
+
+class TestAutoWatchPostProcessing:
+    """#1103: ``serve --auto-watch`` indexed nodes but never the derived indexes.
+
+    ``start_watch_thread`` is the MCP server's watcher.  It used to call
+    ``watch()`` without the post-processing callback, so an addition landed in
+    ``nodes`` while FTS, flows and communities stayed where the last explicit
+    build left them.
+    """
+
+    @staticmethod
+    def _auto_watch_callback(repo: Path):
+        """The callback ``start_watch_thread`` hands to ``watch``."""
+        from code_review_graph.incremental import start_watch_thread
+
+        seen: dict[str, object] = {}
+
+        def capture(repo_root, store, on_files_updated=None, stop_event=None):
+            seen["callback"] = on_files_updated
+
+        store = GraphStore(repo / "graph.db")
+        try:
+            with patch("code_review_graph.incremental.watch", capture):
+                thread = start_watch_thread(repo, store, daemon=True)
+                assert thread is not None
+                thread.join(timeout=10)
+            assert not thread.is_alive()
+        finally:
+            store.close()
+        return seen["callback"]
+
+    @staticmethod
+    def _assert_fts_matches_nodes(store) -> None:
+        """Every node is indexed and every indexed row still resolves."""
+        missing = store._conn.execute(
+            "SELECT count(*) FROM nodes WHERE id NOT IN (SELECT id FROM nodes_fts_docsize)"
+        ).fetchone()[0]
+        stale = store._conn.execute(
+            "SELECT count(*) FROM nodes_fts_docsize WHERE id NOT IN (SELECT id FROM nodes)"
+        ).fetchone()[0]
+        assert (missing, stale) == (0, 0), (
+            f"{missing} node(s) missing from FTS, {stale} stale FTS row(s)"
+        )
+
+    @staticmethod
+    def _hits(store, term: str) -> int:
+        return store._conn.execute(
+            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH ?", (term,)
+        ).fetchone()[0]
+
+    @staticmethod
+    def _node_names(store) -> set[str]:
+        return {row["name"] for row in store._conn.execute("SELECT name FROM nodes")}
+
+    def _repo(self, repo: Path) -> Path:
+        """A committed one-file git repository, so drift detection is not timing-dependent."""
+        import subprocess
+
+        (repo / "src").mkdir(parents=True)
+        source = repo / "src" / "mod.py"
+        source.write_text(
+            "def alphaHelper():\n    return 1\n\ndef betaCaller():\n    return alphaHelper()\n",
+            encoding="utf-8",
+        )
+        identity = ["-c", "user.email=t@test", "-c", "user.name=t"]
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "initial"]):
+            subprocess.run(
+                ["git", *identity, *args], cwd=repo, check=True, capture_output=True,
+            )
+        return source
+
+    def test_auto_watch_supplies_the_post_processing_callback(self, tmp_path):
+        """The wiring itself: no callback means no post-processing at all."""
+        repo = self._repo(tmp_path)
+        callback = self._auto_watch_callback(repo.parent)
+
+        assert callback is not None, (
+            "start_watch_thread started a watcher with no post-processing "
+            "callback; every batch would leave the derived indexes stale"
+        )
+        # Bound to the canonical root so embeddings resolve the repo settings
+        # the same way the CLI watch command does.
+        store = GraphStore(repo.parent / "graph.db")
+        try:
+            assert callback(store)["postprocess_level"] == "full"
+        finally:
+            store.close()
+
+    def test_auto_watch_post_processing_holds_the_writer_lock(self, tmp_path):
+        """A watch batch writes derived tables beside concurrent tool calls.
+
+        An MCP server is the one entry point where the watcher and a graph
+        build share a process, so the callback takes the same writer lock the
+        build tool takes rather than writing flows and communities unlocked.
+        """
+        repo = self._repo(tmp_path)
+        callback = self._auto_watch_callback(repo.parent)
+        store = GraphStore(repo.parent / "graph.db")
+        held: list[bool] = []
+        real = incremental.store_writer_lock
+
+        @contextmanager
+        def recording_lock(target, wait=None):
+            held.append(True)
+            with real(target, wait):
+                yield
+
+        try:
+            with patch.object(incremental, "store_writer_lock", recording_lock):
+                callback(store)
+            assert held, "the auto-watch callback wrote derived tables unlocked"
+        finally:
+            store.close()
+
+    def test_added_symbol_is_searchable_after_an_auto_watch_batch(self, tmp_path):
+        from watchdog.events import FileModifiedEvent
+
+        from code_review_graph.incremental import (
+            _create_watch_handler,
+            incremental_update,
+            read_flows_stale,
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = self._repo(repo)
+        store = GraphStore(repo / "graph.db")
+        try:
+            incremental_update(repo, store, changed_files=["src/mod.py"])
+            run_post_processing(store)
+            # Triggers alone keep FTS in step on a healthy database, so drop
+            # them: what is under test is that a batch runs post-processing,
+            # which is the only thing left that can rebuild the index.
+            for trigger in ("nodes_fts_sync_ins", "nodes_fts_sync_del", "nodes_fts_sync_upd"):
+                store._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+            handler = _create_watch_handler(
+                repo, store, self._auto_watch_callback(repo)
+            )
+            source.write_text(
+                source.read_text() + "\ndef gammaHelper():\n    return alphaHelper() + 2\n",
+                encoding="utf-8",
+            )
+            handler.process([FileModifiedEvent(str(source))])
+            handler.raise_if_failed()
+
+            self._assert_fts_matches_nodes(store)
+            assert self._hits(store, "gammaHelper") == 1
+            assert read_flows_stale(store) is None, "the batch's pending delta was never cleared"
+        finally:
+            store.close()
+
+    def test_modified_and_deleted_symbols_leave_no_stale_fts_rows(self, tmp_path):
+        from watchdog.events import FileDeletedEvent, FileModifiedEvent
+
+        from code_review_graph.incremental import (
+            _create_watch_handler,
+            incremental_update,
+        )
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = self._repo(repo)
+        store = GraphStore(repo / "graph.db")
+        try:
+            incremental_update(repo, store, changed_files=["src/mod.py"])
+            run_post_processing(store)
+            for trigger in ("nodes_fts_sync_ins", "nodes_fts_sync_del", "nodes_fts_sync_upd"):
+                store._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+            handler = _create_watch_handler(
+                repo, store, self._auto_watch_callback(repo)
+            )
+
+            # A modification renames the symbol, so the old name must go.
+            source.write_text(
+                "def alphaHelper():\n    return 1\n\n"
+                "def betaCaller():\n    return alphaHelper()\n\n"
+                "def gammaHelper():\n    return alphaHelper() + 2\n",
+                encoding="utf-8",
+            )
+            handler.process([FileModifiedEvent(str(source))])
+            handler.raise_if_failed()
+            source.write_text(
+                source.read_text().replace("gammaHelper", "deltaHelper"),
+                encoding="utf-8",
+            )
+            handler.process([FileModifiedEvent(str(source))])
+            handler.raise_if_failed()
+
+            self._assert_fts_matches_nodes(store)
+            assert self._hits(store, "gammaHelper") == 0, "the renamed symbol is still indexed"
+            assert self._hits(store, "deltaHelper") == 1
+
+            # A deletion must drop the row from both sides.
+            source.unlink()
+            handler.process([FileDeletedEvent(str(source))])
+            handler.raise_if_failed()
+
+            self._assert_fts_matches_nodes(store)
+            assert self._hits(store, "deltaHelper") == 0
+        finally:
+            store.close()
+
+    def test_startup_reconciliation_is_post_processed(self, tmp_path):
+        """Edits made while no watcher ran are caught by the first reconciliation."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        source = self._repo(repo)
+        store = GraphStore(repo / "graph.db")
+        try:
+            incremental_update(repo, store, changed_files=["src/mod.py"])
+            run_post_processing(store)
+            for trigger in ("nodes_fts_sync_ins", "nodes_fts_sync_del", "nodes_fts_sync_upd"):
+                store._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+            source.write_text(
+                source.read_text() + "\ndef gammaHelper():\n    return alphaHelper() + 2\n",
+                encoding="utf-8",
+            )
+            with (
+                patch("watchdog.observers.Observer"),
+                watch_loop_sleep(KeyboardInterrupt),
+            ):
+                watch(repo, store, on_files_updated=self._auto_watch_callback(repo))
+
+            self._assert_fts_matches_nodes(store)
+            assert self._hits(store, "gammaHelper") == 1, (
+                f"gammaHelper unsearchable; graph holds {self._node_names(store)}"
+            )
         finally:
             store.close()
 
