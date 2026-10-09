@@ -777,6 +777,16 @@ def _bootstrap_stub(tmp_path: Path, readiness: str, clone_rc: int = 0, sleep: in
     return stub
 
 
+def _bootstrap_env(stub: Path) -> dict[str, str]:
+    """Env for graph_bootstrap clone-flow tests.
+
+    Hermetic worktrees live under pytest's tmp dir by construction, so the
+    temporary-root guard is opted out; the guard itself is pinned by
+    test_graph_bootstrap_refuses_a_temporary_root, which must not use this.
+    """
+    return {**os.environ, "CRG_BIN": str(stub), "CRG_ALLOW_TEMPORARY_ROOT": "1"}
+
+
 @skip_windows
 @pytest.mark.parametrize(("readiness", "rc", "status"), [
     ("ok", 0, "ok"), ("stale_graph", 2, "degraded"), ("stale_worktree", 2, "degraded"),
@@ -791,7 +801,7 @@ def test_graph_bootstrap_clones_then_checks_readiness(tmp_path, readiness, rc, s
     result = subprocess.run(
         [sys.executable, str(script), "--bootstrap-graph", "--worktree", str(worktree),
          "--seed", str(seed)],
-        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
+        capture_output=True, text=True, timeout=120, env=_bootstrap_env(stub),
     )
     assert result.returncode == rc, result.stdout + result.stderr
     report = json.loads(result.stdout)
@@ -812,7 +822,7 @@ def test_graph_bootstrap_never_seeds_from_a_partial_index(tmp_path: Path):
     script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
     result = subprocess.run(
         [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed)],
-        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+        capture_output=True, text=True, timeout=60, env=_bootstrap_env(stub),
     )
     report = json.loads(result.stdout)
     assert (report["status"], report["seed_readiness"]) == ("skip", "partial_index")
@@ -830,7 +840,7 @@ def test_graph_bootstrap_polls_a_building_seed_until_ok(tmp_path: Path):
     result = subprocess.run(
         [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed),
          "--seed-build-wait-seconds", "1"],
-        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
+        capture_output=True, text=True, timeout=120, env=_bootstrap_env(stub),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout)
@@ -850,7 +860,7 @@ def test_graph_bootstrap_skips_a_seed_still_building_after_the_wait(tmp_path: Pa
     result = subprocess.run(
         [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed),
          "--seed-build-wait-seconds", "1"],
-        capture_output=True, text=True, timeout=120, env={**os.environ, "CRG_BIN": str(stub)},
+        capture_output=True, text=True, timeout=120, env=_bootstrap_env(stub),
     )
     assert result.returncode == 2
     report = json.loads(result.stdout)
@@ -912,7 +922,7 @@ def test_graph_bootstrap_skips_a_seed_without_graph(tmp_path: Path):
     script = _script(tmp_path, "claude", "skills/graph-bootstrap/scripts/graph_bootstrap.py")
     result = subprocess.run(
         [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed)],
-        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+        capture_output=True, text=True, timeout=60, env=_bootstrap_env(stub),
     )
     report = json.loads(result.stdout)
     assert (report["status"], report["seed_readiness"]) == ("skip", "missing_graph")
@@ -929,7 +939,7 @@ def test_graph_bootstrap_timeout_is_reported(tmp_path: Path):
     result = subprocess.run(
         [sys.executable, str(script), "--worktree", str(worktree), "--seed", str(seed),
          "--clone-seconds", "1"],
-        capture_output=True, text=True, timeout=60, env={**os.environ, "CRG_BIN": str(stub)},
+        capture_output=True, text=True, timeout=60, env=_bootstrap_env(stub),
     )
     assert result.returncode == 2
     report = json.loads(result.stdout)
