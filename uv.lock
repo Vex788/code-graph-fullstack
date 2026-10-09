@@ -436,7 +436,7 @@ wheels = [
 
 [[package]]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.12"
+version = "2.3.8+fs.13"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },

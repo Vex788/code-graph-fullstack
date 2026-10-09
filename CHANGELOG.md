@@ -15,6 +15,24 @@
   executes them on Linux and Windows, against VS Code 1.115.0, and against
   the packaged VSIX (upstream issue #218).
 
+## [2.3.8+fs.13] - 2026-10-09
+
+### Fixed
+- `build` no longer stalls in the call-target and signature stages of
+  post-processing on large graphs (upstream #721; the reporter's 142k-node /
+  1.14M-edge graph never finished, and a 193-file C# project showed the same
+  hang). `_resolve_bare_endpoints` and `resolve_cpp_scoped_call_targets`
+  wrote one autocommitted `UPDATE` per edge, and the store runs SQLite with
+  `isolation_level=None`, so each row was its own transaction and WAL round
+  trip — effectively never finishing with 10^5+ bare edges. Mutations are now
+  collected and applied with chunked `executemany` inside a single explicit
+  transaction, the bare-edge candidate read streams lazily instead of
+  materialising the full edge set, and an already-resolved graph exits
+  through an `EXISTS` probe without fetching candidates. The `postprocess`
+  signature loop now runs in one transaction like the build and pipeline
+  paths already did. Result counts and post-state are unchanged; a
+  regression test pins the single-commit behaviour.
+
 ## [2.3.8+fs.12] - 2026-10-09
 
 ### Fixed

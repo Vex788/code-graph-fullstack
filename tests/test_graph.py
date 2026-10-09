@@ -1235,6 +1235,37 @@ class TestResolveBareEndpoints:
         assert self.store.resolve_bare_call_targets() == 1
         assert self._endpoints("CALLS") == [(caller_qn, helper_qn)]
 
+    def test_resolution_updates_land_in_one_transaction(self, monkeypatch):
+        """Regression for #721: resolved endpoints are applied by one batched
+        statement inside a single explicit transaction. The previous per-row
+        path ran on autocommit (``isolation_level=None``), so each UPDATE was
+        its own commit — effectively a hang on graphs with 10^5+ bare edges.
+        """
+        file_path = "/repo/src/app.py"
+        caller_qn = self._func("caller", file_path)
+        helper_qn = self._func("helper", file_path)
+        for line in range(1, 6):
+            self.store.upsert_edge(EdgeInfo(
+                kind="CALLS",
+                source=caller_qn,
+                target="helper",
+                file_path=file_path,
+                line=line,
+            ))
+        self.store.commit()
+
+        commits = []
+        original = type(self.store._conn).real_commit
+
+        def counting(conn):
+            commits.append(1)
+            return original(conn)
+
+        monkeypatch.setattr(type(self.store._conn), "real_commit", counting)
+        assert self.store.resolve_bare_call_targets() == 5
+        assert len(commits) == 1
+        assert self._endpoints("CALLS") == [(caller_qn, helper_qn)] * 5
+
     def test_unique_unrelated_call_target_stays_bare(self):
         caller_file = "/repo/src/app.py"
         caller_qn = self._func("caller", caller_file)
