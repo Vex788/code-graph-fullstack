@@ -16,6 +16,16 @@ import { registerWalkthroughCommands, showWelcomeIfNeeded } from "./onboarding/w
 import { StatusBar } from "./views/statusBar";
 import { ScmDecorationProvider } from "./features/scmDecorations";
 
+// Re-exported so the packaged-activation smoke test (test/activation.smoke.cjs)
+// and the reader unit tests can exercise the same code the extension ships.
+export { SqliteReader };
+export {
+  openSqliteEngine,
+  SqliteUnavailableError,
+  nodeSqliteProbe,
+  betterSqlite3Probe,
+} from "./backend/sqliteEngine";
+
 let sqliteReader: SqliteReader | undefined;
 let autoUpdateTimer: ReturnType<typeof setTimeout> | undefined;
 let scmDecorationProvider: ScmDecorationProvider | undefined;
@@ -57,6 +67,32 @@ function getWorkspaceRoot(): string | undefined {
   return folders[0]?.uri.fsPath;
 }
 
+
+/**
+ * Open the graph database, reporting failure instead of aborting activation.
+ *
+ * Activation must survive an unreadable database or a runtime without a
+ * SQLite engine (issue #63): the commands and views are still registered and
+ * the user gets the reason, rather than "command not found".
+ */
+function openReader(
+  dbPath: string,
+  reportErrors: boolean
+): SqliteReader | undefined {
+  try {
+    return new SqliteReader(dbPath);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (reportErrors) {
+      void vscode.window.showErrorMessage(
+        `Code Graph: cannot read ${dbPath}. ${message}`
+      );
+    } else {
+      console.error(`[code-review-graph] cannot read ${dbPath}: ${message}`);
+    }
+    return undefined;
+  }
+}
 
 /**
  * Navigate to a node's source file location.
@@ -780,7 +816,8 @@ async function reinitialize(
   }
 
   sqliteReader?.close();
-  sqliteReader = new SqliteReader(dbPath);
+  const reader = openReader(dbPath, true);
+  sqliteReader = reader;
 
   // Refresh tree views
   await vscode.commands.executeCommand(
@@ -809,7 +846,7 @@ function watchGraphDb(context: vscode.ExtensionContext): void {
     // Close and reopen to pick up external writes
     if (sqliteReader && dbPathRef.current) {
       sqliteReader.close();
-      sqliteReader = new SqliteReader(dbPathRef.current);
+      sqliteReader = openReader(dbPathRef.current, false);
       vscode.commands.executeCommand("codeReviewGraph.codeGraph.refresh");
     }
   });
@@ -820,7 +857,7 @@ function watchGraphDb(context: vscode.ExtensionContext): void {
       const dbPath = findGraphDb(wsRoot);
       if (dbPath) {
         dbPathRef.current = dbPath;
-        sqliteReader = new SqliteReader(dbPath);
+        sqliteReader = openReader(dbPath, false);
         vscode.commands.executeCommand("codeReviewGraph.codeGraph.refresh");
       }
     }
@@ -890,55 +927,58 @@ export async function activate(
 
     if (dbPath) {
       // Graph database found - initialize
-      sqliteReader = new SqliteReader(dbPath);
+      const reader = openReader(dbPath, true);
+      sqliteReader = reader;
 
-      // Schema compatibility check
-      const schemaWarning = sqliteReader.checkSchemaCompatibility();
-      if (schemaWarning) {
-        const choice = await vscode.window.showWarningMessage(
-          `Code Graph: ${schemaWarning}`,
-          "Rebuild Graph",
-          "Dismiss"
-        );
-        if (choice === "Rebuild Graph") {
-          await vscode.commands.executeCommand("codeReviewGraph.buildGraph");
+      if (reader) {
+        // Schema compatibility check
+        const schemaWarning = reader.checkSchemaCompatibility();
+        if (schemaWarning) {
+          const choice = await vscode.window.showWarningMessage(
+            `Code Graph: ${schemaWarning}`,
+            "Rebuild Graph",
+            "Dismiss"
+          );
+          if (choice === "Rebuild Graph") {
+            await vscode.commands.executeCommand("codeReviewGraph.buildGraph");
+          }
         }
+
+        // Register tree view providers
+        const codeGraphProvider = new CodeGraphTreeProvider(
+          reader,
+          workspaceRoot
+        );
+        const blastRadiusProvider = new BlastRadiusTreeProvider();
+        const statsProvider = new StatsTreeProvider(reader);
+
+        context.subscriptions.push(
+          vscode.window.registerTreeDataProvider(
+            "codeReviewGraph.codeGraph",
+            codeGraphProvider
+          ),
+          vscode.window.registerTreeDataProvider(
+            "codeReviewGraph.blastRadius",
+            blastRadiusProvider
+          ),
+          vscode.window.registerTreeDataProvider(
+            "codeReviewGraph.stats",
+            statsProvider
+          )
+        );
+
+        // Create status bar
+        const statusBar = new StatusBar();
+        statusBar.update(reader);
+        statusBar.show();
+        context.subscriptions.push(statusBar);
+
+        // Register SCM file decoration provider
+        scmDecorationProvider = new ScmDecorationProvider();
+        context.subscriptions.push(
+          vscode.window.registerFileDecorationProvider(scmDecorationProvider)
+        );
       }
-
-      // Register tree view providers
-      const codeGraphProvider = new CodeGraphTreeProvider(
-        sqliteReader,
-        workspaceRoot
-      );
-      const blastRadiusProvider = new BlastRadiusTreeProvider();
-      const statsProvider = new StatsTreeProvider(sqliteReader);
-
-      context.subscriptions.push(
-        vscode.window.registerTreeDataProvider(
-          "codeReviewGraph.codeGraph",
-          codeGraphProvider
-        ),
-        vscode.window.registerTreeDataProvider(
-          "codeReviewGraph.blastRadius",
-          blastRadiusProvider
-        ),
-        vscode.window.registerTreeDataProvider(
-          "codeReviewGraph.stats",
-          statsProvider
-        )
-      );
-
-      // Create status bar
-      const statusBar = new StatusBar();
-      statusBar.update(sqliteReader);
-      statusBar.show();
-      context.subscriptions.push(statusBar);
-
-      // Register SCM file decoration provider
-      scmDecorationProvider = new ScmDecorationProvider();
-      context.subscriptions.push(
-        vscode.window.registerFileDecorationProvider(scmDecorationProvider)
-      );
     } else {
       // No graph database found - show welcome
       showWelcomeIfNeeded(context);

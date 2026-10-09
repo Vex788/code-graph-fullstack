@@ -148,3 +148,39 @@ jobs:
           tests/test_wiki.py
           tests/test_skills.py::TestInstallCodexHooks
           tests/test_skills.py::TestInstallCursorHooks
+
+  vscode-extension:
+    name: VS Code extension (Node ${{ matrix.node-version }})
+    # Node 22 is the runtime VS Code Server uses on WSL/SSH (issue #63);
+    # Node 24 covers current local Electron builds.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22", "24"]
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check
+        run: npm run lint
+      - name: Reader unit tests
+        run: npm test
+      - name: Package the extension
+        run: npm run package -- --out crg-extension.vsix
+      - name: Unpack the VSIX
+        run: unzip -q crg-extension.vsix -d unpacked
+      - name: Assert package content (no native artifacts)
+        run: node test/package-content.cjs unpacked/extension
+      - name: Activation smoke on the packaged extension
+        run: node test/activation.smoke.cjs unpacked/extension
+      - name: Degraded runtime keeps activation alive
+        run: node test/activation.smoke.cjs unpacked/extension degraded
