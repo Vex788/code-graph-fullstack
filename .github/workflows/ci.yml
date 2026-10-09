@@ -176,9 +176,11 @@ jobs:
         run: npm test
       - name: Package the extension
         run: npm run package -- --out crg-extension.vsix
+      - name: Unpack the VSIX
+        run: unzip -q crg-extension.vsix -d unpacked
+      - name: Assert package content (no native artifacts)
+        run: node test/package-content.cjs unpacked/extension
       - name: Activation smoke on the packaged extension
-        run: |
-          unzip -q crg-extension.vsix -d unpacked
-          node test/activation.smoke.cjs unpacked/extension
+        run: node test/activation.smoke.cjs unpacked/extension
       - name: Degraded runtime keeps activation alive
         run: node test/activation.smoke.cjs unpacked/extension degraded
