@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Activation no longer fails on VS Code 1.115+ (Electron 39+) when no SQLite
+  native module matches the Electron ABI: the extension now reads the graph
+  through the built-in `node:sqlite` module, and a missing reader degrades
+  graph features instead of leaving every command unregistered (issue #218).
+- `Code Graph: Build Graph` no longer ends with
+  `command 'codeReviewGraph.codeGraph.refresh' not found`; the refresh command
+  is registered and the tree views reload after a rebuild.
+- Tree views populate after the first build without a window reload.
+- `vsce package` now builds `dist/` first (`vscode:prepublish`), so release
+  VSIXes cannot ship without the extension entry point.
+
+### Added
+- `npm test` runs the extension and activation test suites inside a real
+  VS Code (`test/activation.test.ts`, `test/run-activation.mjs`).
+
 ## 0.2.2 - 2026-04-11
 
 ### Fixed

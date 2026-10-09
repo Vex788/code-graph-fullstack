@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed
+- The VS Code extension activates on current VS Code (Electron 39+) again: it
+  reads `.code-review-graph/graph.db` through the extension host's built-in
+  `node:sqlite`, so no native addon has to match the Electron ABI, and a
+  reader failure no longer leaves every `Code Graph:` command unregistered
+  (upstream issue #218).
+- `Code Graph: Build Graph` no longer fails with
+  `command 'codeReviewGraph.codeGraph.refresh' not found` after a successful
+  build; the refresh command is registered and the tree views follow rebuilds.
+- The release workflow builds and attaches `code-review-graph.vsix`, and
+  `vsce package` compiles `dist/` itself, so a release VSIX can no longer
+  omit the extension entry point.
+
+### Added
+- CI runs the VS Code extension suite on Linux and Windows, including an
+  activation run against the packaged VSIX and against VS Code 1.115.0
+  (upstream issue #218).
+
 ## [2.3.8+fs.10] - 2026-10-09
 
 ### Fixed

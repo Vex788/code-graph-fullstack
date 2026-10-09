@@ -5,36 +5,81 @@
  * query methods.  All writes are performed by the Python side; this
  * module never mutates the database.
  *
- * Uses `better-sqlite3` with prepared statements for performance.
+ * Uses the built-in `node:sqlite` module shipped with the VS Code extension
+ * host (Electron 39 / Node 22.13 and newer).  No native addon is involved,
+ * so there is no Electron ABI to match and activation cannot fail on a
+ * module-load mismatch (issue #218).
  */
 
-import type BetterSqlite3 from 'better-sqlite3';
 import type { KnownEdgeKind, KnownNodeKind } from '../generated/kinds';
 
-type DatabaseType = BetterSqlite3.Database;
+// ---------------------------------------------------------------------------
+// Driver (node:sqlite)
+// ---------------------------------------------------------------------------
 
-// Load better-sqlite3 with graceful error handling for ABI mismatches.
-// On WSL or mismatched Node.js versions, the native module may fail to load.
-// better-sqlite3 uses `export =` so we import the value via require() and
-// type it as the DatabaseConstructor.
-let Database: typeof import('better-sqlite3');
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  Database = require('better-sqlite3');
-} catch (err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  const isAbiMismatch = msg.includes('NODE_MODULE_VERSION')
-    || msg.includes('was compiled against')
-    || msg.includes('not a valid Win32');
-  if (isAbiMismatch) {
-    console.error(
-      '[code-review-graph] better-sqlite3 ABI mismatch. '
-      + 'Your VS Code uses a different Node.js version than the one '
-      + 'this extension was built for. '
-      + 'Try: cd ~/.vscode/extensions/code-review-graph-* && npm rebuild better-sqlite3'
-    );
+/** Minimal prepared-statement surface used by the reader. */
+interface SqliteStatement {
+  all(...params: unknown[]): unknown[];
+  get(...params: unknown[]): unknown;
+}
+
+/** Minimal read-only connection surface used by the reader. */
+interface SqliteDatabase {
+  pragma(source: string): unknown;
+  prepare(sql: string): SqliteStatement;
+  close(): void;
+}
+
+interface NodeSqliteDatabase {
+  close(): void;
+  prepare(sql: string): SqliteStatement;
+}
+
+interface NodeSqliteModule {
+  DatabaseSync: new (
+    location: string,
+    options?: { readOnly?: boolean }
+  ) => NodeSqliteDatabase;
+}
+
+let nodeSqlite: NodeSqliteModule | undefined;
+
+/**
+ * Load `node:sqlite` on first use.  It is loaded lazily so a missing module
+ * degrades the graph features instead of failing extension activation.
+ */
+function loadNodeSqlite(): NodeSqliteModule {
+  if (!nodeSqlite) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      nodeSqlite = require('node:sqlite') as NodeSqliteModule;
+    } catch {
+      throw new Error(
+        'the built-in SQLite module (node:sqlite) is not available in this '
+        + `VS Code build (Electron ${process.versions.electron ?? 'unknown'}, `
+        + `Node ${process.versions.node}). Update VS Code to restore graph `
+        + 'features.'
+      );
+    }
   }
-  throw err;
+  return nodeSqlite;
+}
+
+/** Open `dbPath` read-only through the built-in SQLite module. */
+function openReadOnlyDatabase(dbPath: string): SqliteDatabase {
+  const sqlite = loadNodeSqlite();
+  const db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  return {
+    pragma(source: string): unknown {
+      return db.prepare(`PRAGMA ${source}`).get();
+    },
+    prepare(sql: string): SqliteStatement {
+      return db.prepare(sql);
+    },
+    close(): void {
+      db.close();
+    },
+  };
 }
 
 /**
@@ -98,7 +143,7 @@ export interface ImpactRadius {
 }
 
 // ---------------------------------------------------------------------------
-// Raw row types returned by better-sqlite3
+// Raw row types returned by SQLite
 // ---------------------------------------------------------------------------
 
 interface NodeRow {
@@ -160,7 +205,7 @@ const MAX_OPEN_RETRIES = 3;
 const RETRY_BACKOFF_MS = 100;
 
 export class SqliteReader {
-  private db: DatabaseType | null = null;
+  private db: SqliteDatabase | null = null;
 
   /**
    * Create a SqliteReader with retry logic that does not block the event loop.
@@ -184,9 +229,33 @@ export class SqliteReader {
   }
 
   constructor(dbPath: string) {
-    this.db = new Database(dbPath, { readonly: true });
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('busy_timeout = 5000');
+    this.open(dbPath);
+  }
+
+  /**
+   * Close the current handle and open `dbPath` again on the same instance.
+   * Tree providers keep their reader reference, so reopening beats replacing.
+   */
+  reopen(dbPath: string): void {
+    this.close();
+    this.open(dbPath);
+  }
+
+  private open(dbPath: string): void {
+    const db = openReadOnlyDatabase(dbPath);
+    this.db = db;
+    try {
+      // The Python writer owns the journal mode; keep it if SQLite refuses.
+      db.pragma('journal_mode = WAL');
+    } catch {
+      // Ignore: WAL is already set by the writer for a healthy database.
+    }
+    try {
+      // Writes during reads should retry instead of failing immediately.
+      db.pragma('busy_timeout = 5000');
+    } catch {
+      // Ignore: optional convenience pragma.
+    }
   }
 
   /**
@@ -340,8 +409,7 @@ export class SqliteReader {
   /**
    * Edges where both source and target are in the given set.
    *
-   * Uses a parameterised IN clause -- safe for arbitrary set sizes
-   * (better-sqlite3 handles large parameter lists efficiently).
+   * Uses a parameterised IN clause -- safe for arbitrary set sizes.
    */
   getEdgesAmong(qualifiedNames: Set<string>): GraphEdge[] {
     if (qualifiedNames.size === 0) { return []; }
@@ -562,7 +630,7 @@ export class SqliteReader {
   // -----------------------------------------------------------------------
 
   /** Return the open database handle or throw. */
-  private _db(): DatabaseType {
+  private _db(): SqliteDatabase {
     if (!this.db) {
       throw new Error('SqliteReader: database is closed');
     }

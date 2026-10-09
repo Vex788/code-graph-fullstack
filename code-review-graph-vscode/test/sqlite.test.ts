@@ -10,8 +10,18 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import Database from 'better-sqlite3';
 import { SqliteReader, GraphNode, GraphEdge } from '../src/backend/sqlite';
+
+// `node:sqlite` types require @types/node >= 22; declare the tiny surface
+// the fixture builder needs.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { DatabaseSync } = require('node:sqlite') as {
+  DatabaseSync: new (dbPath: string) => {
+    exec(sql: string): void;
+    prepare(sql: string): { run(...params: unknown[]): unknown };
+    close(): void;
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Schema (mirrors the Python backend exactly)
@@ -191,7 +201,7 @@ function createTestDb(): string {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crg-test-'));
   const dbPath = path.join(tmpDir, 'graph.db');
 
-  const db = new Database(dbPath);
+  const db = new DatabaseSync(dbPath);
   db.exec(SCHEMA_SQL);
 
   const insertNode = db.prepare(`
@@ -216,12 +226,9 @@ function createTestDb(): string {
     'INSERT INTO metadata (key, value) VALUES (?, ?)'
   );
 
-  const insertMany = db.transaction(() => {
-    for (const n of TEST_NODES) { insertNode.run(n); }
-    for (const e of TEST_EDGES) { insertEdge.run(e); }
-    insertMeta.run('last_updated', '2025-06-15T10:30:00Z');
-  });
-  insertMany();
+  for (const n of TEST_NODES) { insertNode.run(n); }
+  for (const e of TEST_EDGES) { insertEdge.run(e); }
+  insertMeta.run('last_updated', '2025-06-15T10:30:00Z');
   db.close();
 
   return dbPath;

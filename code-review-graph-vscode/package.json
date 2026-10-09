@@ -289,23 +289,24 @@
   },
   "scripts": {
     "compile": "node esbuild.mjs",
+    "compile:tests": "esbuild test/sqlite.test.ts test/activation.test.ts --bundle --platform=node --format=cjs --outdir=out --out-extension:.js=.cjs --external:vscode --external:node:sqlite --sourcemap",
     "watch": "node esbuild.mjs --watch",
+    "vscode:prepublish": "node esbuild.mjs --production",
     "package": "vsce package",
     "lint": "tsc --noEmit",
-    "test": "node --experimental-vm-modules node_modules/@vscode/test-electron/out/runTest.js"
+    "test": "npm run compile && npm run compile:tests && node test/run-activation.mjs"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/d3": "^7.4.3",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/test-electron": "^2.3.8",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^2.22.0",
     "esbuild": "^0.20.0",
+    "mocha": "^10.8.2",
     "typescript": "^5.3.3"
   },
   "dependencies": {
-    "better-sqlite3": "^12.4.1",
     "d3": "^7.9.0"
   }
 }
