@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.11] - 2026-10-09
+
+### Fixed
+- `install` no longer certifies a double-wrapped `code-review-graph` entry as
+  "already configured". The Add-to-Cursor button on code-review-graph.com
+  sends the entry already keyed by its own server name
+  (`{"code-review-graph": {"command": ...}}`), so Cursor stores it one level
+  deeper than any MCP client reads and rejects it with "Server
+  'code-review-graph' must have either a command (for stdio) or url (for
+  SSE)" (#703). Both the project `.cursor/mcp.json` and the user-level
+  `~/.cursor/mcp.json` that button writes are flattened back to the entry the
+  user asked for; only that exact shape is touched, and the regression test
+  decodes the deployed Cursor link and asserts the resulting JSON shape.
+
 ## [2.3.8+fs.10] - 2026-10-09
 
 ### Fixed

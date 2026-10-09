@@ -436,7 +436,7 @@ wheels = [
 
 [[package]]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.10"
+version = "2.3.8+fs.11"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
