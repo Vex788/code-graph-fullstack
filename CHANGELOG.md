@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+- `Code Graph: Build Graph` no longer fails with
+  `command 'codeReviewGraph.codeGraph.refresh' not found` after a successful
+  build (upstream issue #218): the refresh command is registered, and the
+  tree views follow rebuilds and watcher updates without a window reload.
+- The release workflow builds and attaches `code-review-graph.vsix` alongside
+  the Python artifacts.
+
+### Added
+- Activation tests run inside a real VS Code (`npm run test:electron`); CI
+  executes them on Linux and Windows, against VS Code 1.115.0, and against
+  the packaged VSIX (upstream issue #218).
+
 ## [2.3.8+fs.13] - 2026-10-09
 
 ### Fixed

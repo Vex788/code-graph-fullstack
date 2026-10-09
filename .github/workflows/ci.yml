@@ -184,3 +184,80 @@ jobs:
         run: node test/activation.smoke.cjs unpacked/extension
       - name: Degraded runtime keeps activation alive
         run: node test/activation.smoke.cjs unpacked/extension degraded
+
+  vscode-extension-e2e:
+    name: Extension activation in VS Code (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
+      - name: Install extension dependencies
+        run: npm ci
+      - name: Compile extension and tests
+        run: npm run compile && npm run compile:tests
+      - name: Run activation tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a node test/run-activation.mjs
+      - name: Run activation tests (Windows)
+        if: runner.os == 'Windows'
+        run: node test/run-activation.mjs
+
+  vscode-extension-1-115:
+    name: VS Code 1.115.0 activation (#218)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
+      - name: Install extension dependencies
+        run: npm ci
+      - name: Compile extension and tests
+        run: npm run compile && npm run compile:tests
+      - name: Run activation tests on VS Code 1.115.0
+        env:
+          CRG_VSCODE_VERSION: "1.115.0"
+        run: xvfb-run -a node test/run-activation.mjs
+
+  vscode-extension-vsix:
+    name: Packaged VSIX activates in VS Code (#218)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
+      - name: Install extension dependencies
+        run: npm ci
+      - name: Package VSIX
+        run: npx vsce package --out crg.vsix
+      - name: Unpack the VSIX
+        run: unzip -q crg.vsix -d unpacked
+      - name: Run activation tests against the packaged VSIX
+        run: |
+          npm run compile:tests
+          CRG_EXTENSION_DIR="$PWD/unpacked/extension" xvfb-run -a node test/run-activation.mjs

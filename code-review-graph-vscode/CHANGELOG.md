@@ -13,12 +13,18 @@
 - Activation no longer aborts when the graph database cannot be opened. The
   commands and views are registered and the reason is reported once, instead
   of every command failing with "command not found".
+- `Code Graph: Build Graph` no longer ends with
+  `command 'codeReviewGraph.codeGraph.refresh' not found`: the refresh command
+  is registered, and the tree views reload after a rebuild or an incremental
+  update without a window reload.
 
 ### Added
 - CI job that type-checks, unit-tests, packages the VSIX and activates the
   packaged extension on Node 22 (VS Code Server / WSL) and Node 24.
 - `npm test` reader unit tests and `npm run test:activation` smoke test that
   run under plain Node, without downloading Electron.
+- Activation tests that run in a real VS Code (`npm run test:electron`),
+  including a pinned VS Code 1.115.0 run in CI (issue #218).
 
 ## 0.2.2 - 2026-04-11
 
