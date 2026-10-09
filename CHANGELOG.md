@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.12] - 2026-10-09
+
+### Fixed
+- MCP review tools no longer hang past a client's request ceiling when git is
+  slow (upstream #262). `get_minimal_context`, `get_impact_radius`,
+  `get_review_context` and `get_affected_flows` — plus every other MCP tool
+  that can take seconds — now run their blocking work off the stdio event
+  loop through one `_offload` helper, and `CRG_TOOL_TIMEOUT` bounds every
+  read-only tool with `status: error` naming the tool and the budget. The
+  five writing tools (build, post-process, embed, wiki, apply-refactor) are
+  offloaded but never cut short: a cancelled await cannot stop their worker,
+  so a "timeout" there would report failure while the write went on.
+- Change discovery (the `git diff` + `git status` chain a review tool runs
+  when `changed_files` is omitted) gets its own budget,
+  `CRG_DISCOVERY_TIMEOUT` (default 5s; an explicitly set `CRG_GIT_TIMEOUT` is
+  honoured verbatim). It previously inherited the 30-second per-subprocess
+  budget — and one retry at 60s — so a slow git could hold one tool call for
+  minutes. Exhausting the budget is reported as `git: unavailable` (or a CLI
+  `Error:` and exit 1 for `detect-changes`), never as "no changes" (#913).
+- `get_minimal_context` no longer runs two hardcoded 10-second git probes
+  before answering; discovery is one short-budget call, and a failure is
+  named in the summary as `Degraded: ...`.
+- The working-tree walk stays at `--untracked-files=all`: scoping it down was
+  tried and withdrawn upstream because git collapses a wholly-untracked
+  directory to one `dir/` record, which made the first commit of a new
+  package read as "no changes" with `status: ok`. The discovery budget bounds
+  the walk instead, and reports it when it does.
+
+### Packaging
+- `anyio>=4.0,<5` is now a direct dependency: the tool offload has to use the
+  same thread limiter FastMCP dispatches sync tool bodies through, not
+  `asyncio.to_thread`'s smaller default executor.
+
 ## [2.3.8+fs.11] - 2026-10-09
 
 ### Fixed

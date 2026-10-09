@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.11"
+version = "2.3.8+fs.12"
 description = "Fork of code-review-graph: fullstack code mapping (templates, routes, ORM) for AI review agents"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = "MIT"
@@ -31,6 +31,11 @@ dependencies = [
     # CVE-2025-62800/62801/66416 fixes. 4.x is verified (prompts.py imports
     # Message via a shim); <5 blocks the next unverified major. See: #488
     "fastmcp>=3.2.4,<5",
+    # main.py imports anyio directly: the MCP tool offload has to use the
+    # same thread limiter FastMCP dispatches sync tool bodies through, not
+    # asyncio's smaller default executor. A direct import gets a direct
+    # dependency rather than relying on fastmcp to keep pulling it in.
+    "anyio>=4.0,<5",
     "tree-sitter>=0.23.0,<1",
     # 1.x downloads grammars at runtime and changes the exception types.
     "tree-sitter-language-pack>=0.3.0,<2",

@@ -436,9 +436,10 @@ wheels = [
 
 [[package]]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.11"
+version = "2.3.8+fs.12"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "fastmcp" },
     { name = "mcp" },
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -532,6 +533,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.0,<5" },
     { name = "code-graph-fullstack", extras = ["communities"], marker = "extra == 'all'" },
     { name = "code-graph-fullstack", extras = ["embeddings"], marker = "extra == 'all'" },
     { name = "code-graph-fullstack", extras = ["embeddings-fast"], marker = "extra == 'all'" },
