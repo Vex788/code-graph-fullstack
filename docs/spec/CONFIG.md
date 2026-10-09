@@ -113,6 +113,7 @@ not list. Defaults are the values at the read site.
 | `CRG_RECONCILE_STATE_DIR` | `crg-reconcile` next to the target's hook state | Per-root update-attempt fingerprints (worktree state plus the tool's `--version` and contract version) `crg-heal` shares with the reconcile loop. |
 | `CRG_HEAL_POLL_SECONDS` | `5` | Seconds `crg-heal` waits between status reads of a `building` graph (tests). |
 | `CRG_HEAL_UPDATE_SECONDS` | `180` | Cap in seconds for the separate `update --skip-flows` stage after `crg-heal` clones a seed graph (tests); a timeout leaves the clone `stale_graph`. |
+| `CRG_ALLOW_TEMPORARY_ROOT` | unset | `1`: let `clone-graph`/`crg-heal` bootstrap into a worktree under a scratch tmp root (tests; the hermetic HOME lives under pytest's tmp dir). |
 | `CRG_STUB_MSG` | unset | Message a test stub binary prints; used only by the harness kit fixtures. |
 | `CRG_STUB_RC` | `0` | Exit code of the `--selftest` stub binary. |
 

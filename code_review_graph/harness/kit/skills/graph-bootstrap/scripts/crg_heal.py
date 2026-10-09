@@ -81,7 +81,9 @@ def real(path: str | Path) -> Path:
 
 
 def sha12(root: Path) -> str:
-    return hashlib.sha1(str(root).encode()).hexdigest()[:12]
+    # A lock-file name fragment, not a security decision: usedforsecurity=False
+    # documents that bandit (B324) has nothing to flag here.
+    return hashlib.sha1(str(root).encode(), usedforsecurity=False).hexdigest()[:12]
 
 
 # --- scope ---------------------------------------------------------------------------
@@ -141,7 +143,8 @@ def tool_version() -> str:
 def fingerprint(root: Path, tool_id: str) -> str:
     """crg-reconcile's fingerprint, 16 hex: sha1 of HEAD, status --porcelain, diff HEAD and
     ``<tool_id>\\n``. The tool id makes a tool upgrade re-arm an update that already ran."""
-    digest = hashlib.sha1()
+    # A reconcile dedupe key, not authentication: usedforsecurity=False (B324).
+    digest = hashlib.sha1(usedforsecurity=False)
     for args in (("rev-parse", "HEAD"), ("status", "--porcelain"), ("diff", "HEAD")):
         done = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
                               timeout=60, check=False)

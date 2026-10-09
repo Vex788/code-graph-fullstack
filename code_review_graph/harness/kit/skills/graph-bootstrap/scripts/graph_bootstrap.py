@@ -38,7 +38,11 @@ assert TOTAL_BUDGET_SECONDS <= 880, TOTAL_BUDGET_SECONDS
 LOCK_BUSY = 75
 UPDATE_LOCK_WAIT_SECONDS = 60
 SEED_POLL_SECONDS = 5
-TEMPORARY_ROOTS = (Path("/tmp"), Path("/private/tmp"), Path("/var/folders"))
+TEMPORARY_ROOTS = (Path("/tmp"), Path("/private/tmp"), Path("/var/folders"))  # nosec B108
+# Compared resolved: on macOS /tmp is a symlink to /private/tmp and scratch
+# checkouts resolve to /private/var/folders, so the raw spellings above never
+# match a resolved worktree. Compared only, never created under.
+_TEMPORARY_ROOTS_RESOLVED = tuple(p.resolve() for p in TEMPORARY_ROOTS)
 # partial_index is not a seed: its gaps would be copied into every clone.
 USABLE_SEED = {"ok", "stale_graph", "stale_worktree"}
 STALE = {"stale_graph", "stale_worktree"}
@@ -97,11 +101,16 @@ def git_head(root: Path) -> str:
 
 def is_temporary_root(root: Path) -> bool:
     """Whether *root* is a WORKTREE that must not receive a graph: scratch tmp or an in-flight
-    worktree. Only the worktree target is ever checked; the seed may live anywhere."""
+    worktree. Only the worktree target is ever checked; the seed may live anywhere.
+    ``CRG_ALLOW_TEMPORARY_ROOT=1`` opts out (tests: their hermetic HOME lives
+    under pytest's tmp dir by construction)."""
+    if os.environ.get("CRG_ALLOW_TEMPORARY_ROOT"):
+        return False
     resolved = root.resolve()
     return (".orca-preparing" in resolved.parts
             or any(root == tmp or root.is_relative_to(tmp) for tmp in TEMPORARY_ROOTS)
-            or any(resolved == tmp or resolved.is_relative_to(tmp) for tmp in TEMPORARY_ROOTS))
+            or any(resolved == tmp or resolved.is_relative_to(tmp)
+                   for tmp in _TEMPORARY_ROOTS_RESOLVED))
 
 
 def wait_out_build(seed: Path, wait_seconds: float) -> str:

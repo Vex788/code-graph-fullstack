@@ -1,5 +1,6 @@
 """Tests for skills and hooks auto-install."""
 
+import base64
 import json
 import os
 import stat
@@ -1458,6 +1459,26 @@ class TestCodeBuddyPlatform:
         assert settings_path.read_text(encoding="utf-8") == first
 
 
+# The exact Add-to-Cursor link code-review-graph.com/install served when #703
+# was filed. Its base64 ``config`` decodes to the entry already keyed by its
+# own server name, so Cursor stores it double-wrapped and rejects it with
+# "Server 'code-review-graph' must have either a command (for stdio) or url
+# (for SSE)".
+_DEPLOYED_CURSOR_DEEPLINK = (
+    "cursor://anysphere.cursor-deeplink/mcp/install?name=code-review-graph"
+    "&config=eyJjb2RlLXJldmlldy1ncmFwaCI6IHsiY29tbWFuZCI6ICJ1dngiLCAiYXJncyI6"
+    "IFsiY29kZS1yZXZpZXctZ3JhcGgiLCAic2VydmUiXX19"
+)
+
+
+def _deployed_cursor_payload() -> dict:
+    """Decode the ``config`` parameter of the deployed Add-to-Cursor link."""
+    query = _DEPLOYED_CURSOR_DEEPLINK.split("?", 1)[1]
+    config = dict(part.split("=", 1) for part in query.split("&"))["config"]
+    raw = config.encode("ascii") + b"=" * (-len(config) % 4)
+    return json.loads(base64.urlsafe_b64decode(raw))
+
+
 class TestInstallPlatformConfigs:
     @_needs_tomllib
     def test_install_codex_config(self, tmp_path):
@@ -1536,7 +1557,11 @@ class TestInstallPlatformConfigs:
         with patch.dict(
             PLATFORMS,
             {
-                "cursor": {**PLATFORMS["cursor"], "detect": lambda: True},
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "detect": lambda: True,
+                    "user_config_path": lambda: tmp_path / "home" / ".cursor" / "mcp.json",
+                },
             },
         ):
             configured = install_platform_configs(tmp_path, target="cursor")
@@ -1546,6 +1571,196 @@ class TestInstallPlatformConfigs:
         data = json.loads(config_path.read_text())
         assert "code-review-graph" in data["mcpServers"]
         assert data["mcpServers"]["code-review-graph"]["type"] == "stdio"
+
+    def test_install_repairs_cursor_entry_the_deeplink_writes_double_wrapped(
+        self, tmp_path
+    ):
+        """#703: decode the deployed link, install, and assert the exact shape."""
+        payload = _deployed_cursor_payload()
+        assert payload == {
+            "code-review-graph": {
+                "command": "uvx",
+                "args": ["code-review-graph", "serve"],
+            }
+        }
+        config_path = tmp_path / ".cursor" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            json.dumps({"mcpServers": {"code-review-graph": payload}}, indent=2),
+            encoding="utf-8",
+        )
+        user_config = tmp_path / "home" / ".cursor" / "mcp.json"
+        with patch.dict(
+            PLATFORMS,
+            {
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "detect": lambda: True,
+                    "user_config_path": lambda: user_config,
+                },
+            },
+        ):
+            configured = install_platform_configs(tmp_path, target="cursor")
+
+        assert configured == ["Cursor"]
+        assert not user_config.exists()
+        # The repaired file is exactly the "AFTER" shape from #703:
+        # command/args sit directly under the server name, no wrapper.
+        assert json.loads(config_path.read_text(encoding="utf-8")) == {
+            "mcpServers": {
+                "code-review-graph": {
+                    "command": "uvx",
+                    "args": ["code-review-graph", "serve"],
+                }
+            }
+        }
+
+    def test_install_repairs_double_wrapped_user_cursor_entry(self, tmp_path):
+        user_config = tmp_path / "home" / ".cursor" / "mcp.json"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "code-review-graph": _deployed_cursor_payload(),
+                        "other-server": {"command": "other"},
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(
+            PLATFORMS,
+            {
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "user_config_path": lambda: user_config,
+                },
+            },
+        ):
+            install_platform_configs(tmp_path, target="cursor")
+
+        assert json.loads(user_config.read_text(encoding="utf-8")) == {
+            "mcpServers": {
+                "code-review-graph": {
+                    "command": "uvx",
+                    "args": ["code-review-graph", "serve"],
+                },
+                "other-server": {"command": "other"},
+            }
+        }
+
+    def test_user_cursor_repair_drops_a_pinned_cwd(self, tmp_path):
+        user_config = tmp_path / "home" / ".cursor" / "mcp.json"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "code-review-graph": {
+                            "code-review-graph": {
+                                "command": "uvx",
+                                "args": ["code-review-graph", "serve"],
+                                "cwd": "/somewhere/else",
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(
+            PLATFORMS,
+            {
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "user_config_path": lambda: user_config,
+                },
+            },
+        ):
+            install_platform_configs(tmp_path, target="cursor")
+
+        entry = json.loads(user_config.read_text(encoding="utf-8"))["mcpServers"][
+            "code-review-graph"
+        ]
+        assert entry == {"command": "uvx", "args": ["code-review-graph", "serve"]}
+
+    def test_install_leaves_a_working_cursor_entry_untouched(self, tmp_path):
+        config_path = tmp_path / ".cursor" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+        original = {
+            "mcpServers": {
+                "code-review-graph": {
+                    "command": "uvx",
+                    "args": ["code-review-graph", "serve"],
+                    "type": "stdio",
+                }
+            }
+        }
+        config_path.write_text(json.dumps(original, indent=2), encoding="utf-8")
+        with patch.dict(
+            PLATFORMS,
+            {
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "user_config_path": lambda: tmp_path / "home" / ".cursor" / "mcp.json",
+                },
+            },
+        ):
+            configured = install_platform_configs(tmp_path, target="cursor")
+
+        assert configured == ["Cursor"]
+        assert json.loads(config_path.read_text(encoding="utf-8")) == original
+
+    def test_install_does_not_flatten_unrelated_nesting(self, tmp_path):
+        """Only the deeplink shape is repaired: the inner object must be an entry."""
+        config_path = tmp_path / ".cursor" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+        original = {
+            "mcpServers": {"code-review-graph": {"code-review-graph": {"note": "mine"}}}
+        }
+        config_path.write_text(json.dumps(original, indent=2), encoding="utf-8")
+        with patch.dict(
+            PLATFORMS,
+            {
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "user_config_path": lambda: tmp_path / "home" / ".cursor" / "mcp.json",
+                },
+            },
+        ):
+            install_platform_configs(tmp_path, target="cursor")
+
+        assert json.loads(config_path.read_text(encoding="utf-8")) == original
+
+    def test_install_dry_run_reports_wrapper_repair_without_writing(
+        self, tmp_path, capsys
+    ):
+        payload = {"code-review-graph": _deployed_cursor_payload()}
+        config_path = tmp_path / ".cursor" / "mcp.json"
+        config_path.parent.mkdir(parents=True)
+        project_original = json.dumps({"mcpServers": payload}, indent=2)
+        config_path.write_text(project_original, encoding="utf-8")
+        user_config = tmp_path / "home" / ".cursor" / "mcp.json"
+        user_config.parent.mkdir(parents=True)
+        user_original = json.dumps({"mcpServers": payload}, indent=2)
+        user_config.write_text(user_original, encoding="utf-8")
+        with patch.dict(
+            PLATFORMS,
+            {
+                "cursor": {
+                    **PLATFORMS["cursor"],
+                    "user_config_path": lambda: user_config,
+                },
+            },
+        ):
+            install_platform_configs(tmp_path, target="cursor", dry_run=True)
+
+        out = capsys.readouterr().out
+        assert out.count("would repair a double-wrapped") == 2
+        assert config_path.read_text(encoding="utf-8") == project_original
+        assert user_config.read_text(encoding="utf-8") == user_original
 
     def test_install_windsurf_config(self, tmp_path):
         windsurf_dir = tmp_path / ".codeium" / "windsurf"
