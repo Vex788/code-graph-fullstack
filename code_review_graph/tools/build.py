@@ -801,24 +801,27 @@ def run_postprocess(
 
         try:
             rows = store.get_nodes_without_signature()
-            for row in rows:
-                node_id, name, kind, params, ret = (
-                    row[0],
-                    row[1],
-                    row[2],
-                    row[3],
-                    row[4],
-                )
-                if kind in ("Function", "Test"):
-                    sig = f"def {name}({params or ''})"
-                    if ret:
-                        sig += f" -> {ret}"
-                elif kind == "Class":
-                    sig = f"class {name}"
-                else:
-                    sig = name
-                store.update_node_signature(node_id, sig[:512])
-            store.commit()
+            # One transaction for the whole batch: the per-row autocommit this
+            # replaced issued a WAL commit per node, which dominates on graphs
+            # with 10^5+ nodes (issue #721).
+            with store.transaction():
+                for row in rows:
+                    node_id, name, kind, params, ret = (
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
+                    )
+                    if kind in ("Function", "Test"):
+                        sig = f"def {name}({params or ''})"
+                        if ret:
+                            sig += f" -> {ret}"
+                    elif kind == "Class":
+                        sig = f"class {name}"
+                    else:
+                        sig = name
+                    store.update_node_signature(node_id, sig[:512])
             result["signatures_updated"] = True
         except (sqlite3.OperationalError, TypeError, KeyError) as e:
             logger.warning("Signature computation failed: %s", e)

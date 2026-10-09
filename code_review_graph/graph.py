@@ -51,6 +51,11 @@ from .parser import EdgeInfo, NodeInfo, normalize_file_path
 
 logger = logging.getLogger(__name__)
 
+# Maximum rows bound into a single executemany() call for batched writes.
+# Chunking keeps peak memory bounded while the surrounding transaction means
+# SQLite performs one commit per batch job instead of one per row (issue #721).
+_UPDATE_BATCH = 50_000
+
 # These are the canonical language values stored for the JavaScript ecosystem.
 # JSX files are stored as ``javascript`` and Astro files as ``typescript`` by
 # ``EXTENSION_TO_LANGUAGE``; TSX keeps its own grammar name.
@@ -1035,7 +1040,10 @@ class GraphStore:
             candidates_by_name.setdefault(candidate["name"], []).append(candidate)
 
         resolved = 0
-        changed = False
+        # Collect every mutation and apply them in one transaction at the end
+        # (see below); the previous loop autocommitted per row (issue #721).
+        call_updates: list[tuple[str, str, int]] = []
+        mirror_updates: list[tuple[str, str, int]] = []
 
         def sync_tested_by(
             call_edge: sqlite3.Row,
@@ -1077,8 +1085,7 @@ class GraphStore:
                     and mirror_extra == desired_extra
                 ):
                     continue
-                self._conn.execute(
-                    "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
+                mirror_updates.append(
                     (source_qualified, serialized_extra, mirror["id"]),
                 )
                 changed_mirror = True
@@ -1140,20 +1147,17 @@ class GraphStore:
                 ):
                     extra.pop(key, None)
                 serialized_extra = json.dumps(extra, sort_keys=True)
-                call_changed = (
+                if (
                     edge["target_qualified"] != candidates[0]
                     or previous_extra != extra
-                )
-                if call_changed:
-                    self._conn.execute(
-                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                ):
+                    call_updates.append(
                         (candidates[0], serialized_extra, edge["id"]),
                     )
                     resolved += 1
-                mirror_changed = sync_tested_by(
+                sync_tested_by(
                     edge, target, candidates[0], extra, serialized_extra,
                 )
-                changed = changed or call_changed or mirror_changed
             elif len(candidates) > 1:
                 for key in (
                     "unresolved_targets",
@@ -1168,19 +1172,14 @@ class GraphStore:
                     "ambiguous_targets_truncated": len(candidates) > 20,
                 })
                 serialized_extra = json.dumps(extra, sort_keys=True)
-                call_changed = (
+                if (
                     edge["target_qualified"] != target
                     or previous_extra != extra
-                )
-                if call_changed:
-                    self._conn.execute(
-                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
-                        (target, serialized_extra, edge["id"]),
-                    )
-                mirror_changed = sync_tested_by(
+                ):
+                    call_updates.append((target, serialized_extra, edge["id"]))
+                sync_tested_by(
                     edge, target, target, extra, serialized_extra,
                 )
-                changed = changed or call_changed or mirror_changed
             else:
                 extra["cpp_scoped_target"] = target
                 for key in (
@@ -1195,22 +1194,31 @@ class GraphStore:
                     "unresolved_targets_truncated": False,
                 })
                 serialized_extra = json.dumps(extra, sort_keys=True)
-                call_changed = (
+                if (
                     edge["target_qualified"] != target
                     or previous_extra != extra
-                )
-                if call_changed:
-                    self._conn.execute(
-                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
-                        (target, serialized_extra, edge["id"]),
-                    )
-                mirror_changed = sync_tested_by(
+                ):
+                    call_updates.append((target, serialized_extra, edge["id"]))
+                sync_tested_by(
                     edge, target, target, extra, serialized_extra,
                 )
-                changed = changed or call_changed or mirror_changed
 
-        if changed:
-            self._conn.commit()
+        if call_updates or mirror_updates:
+            # Same batching rationale as _resolve_bare_endpoints: one prepared
+            # statement and one commit instead of one autocommitted UPDATE
+            # (plus a WAL commit) per edge (issue #721). Chunking keeps peak
+            # memory bounded.
+            with self.transaction():
+                for start in range(0, len(call_updates), _UPDATE_BATCH):
+                    self._conn.executemany(
+                        "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+                        call_updates[start:start + _UPDATE_BATCH],
+                    )
+                for start in range(0, len(mirror_updates), _UPDATE_BATCH):
+                    self._conn.executemany(
+                        "UPDATE edges SET source_qualified = ?, extra = ? WHERE id = ?",
+                        mirror_updates[start:start + _UPDATE_BATCH],
+                    )
         return resolved
 
     def resolve_bare_tested_by_sources(self) -> int:
@@ -1230,29 +1238,42 @@ class GraphStore:
         if endpoint == "target_qualified":
             raw_key = "bare_call_target"
             endpoint_column = "target_qualified"
-            select_sql = (
-                "SELECT id, source_qualified, target_qualified, file_path, extra "
-                "FROM edges WHERE kind = ? "
-                "AND (target_qualified NOT LIKE '%::%' "
-                "OR extra LIKE '%\"bare_call_target\"%')"
+            bare_condition = (
+                "target_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_call_target\"%'"
             )
         elif endpoint == "source_qualified":
             raw_key = "bare_tested_by_source"
             endpoint_column = "source_qualified"
-            select_sql = (
-                "SELECT id, source_qualified, target_qualified, file_path, extra "
-                "FROM edges WHERE kind = ? "
-                "AND (source_qualified NOT LIKE '%::%' "
-                "OR extra LIKE '%\"bare_tested_by_source\"%')"
+            bare_condition = (
+                "source_qualified NOT LIKE '%::%' "
+                "OR extra LIKE '%\"bare_tested_by_source\"%'"
             )
         else:
             raise ValueError(f"Invalid edge endpoint column: {endpoint!r}")
 
+        select_sql = (
+            "SELECT id, source_qualified, target_qualified, file_path, extra "
+            "FROM edges WHERE kind = ? AND (" + bare_condition + ")"
+        )
+
         conn = self._conn
 
-        bare_edges = conn.execute(select_sql, (kind,)).fetchall()
-        if not bare_edges:
+        # Cheap no-op guard: EXISTS stops at the first matching row, so a graph
+        # whose endpoints are already resolved pays one indexed probe instead
+        # of materialising the candidate set (issue #721).
+        has_bare = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM edges WHERE kind = ? AND ("
+            + bare_condition
+            + "))",
+            (kind,),
+        ).fetchone()[0]
+        if not has_bare:
             return 0
+
+        # Stream candidate rows lazily: the full candidate set is memory-heavy
+        # on large graphs and the loop consumes it exactly once (issue #721).
+        bare_edges = conn.execute(select_sql, (kind,))
 
         # bare_name -> [(qualified_name, defining_file)]
         node_lookup: dict[str, list[tuple[str, str]]] = {}
@@ -1332,7 +1353,10 @@ class GraphStore:
                 imported |= expanded
 
         resolved = 0
-        changed = False
+        # Collect every mutation, then apply them as one batched statement in
+        # a single transaction (see below) instead of exercising autocommit
+        # once per row (issue #721).
+        updates: list[tuple[str, str, int]] = []
         for edge in bare_edges:
             try:
                 edge_extra = json.loads(edge["extra"] or "{}")
@@ -1453,16 +1477,26 @@ class GraphStore:
                 and edge_extra == desired_extra
             ):
                 continue
-            conn.execute(
-                f"UPDATE edges SET {endpoint_column} = ?, extra = ? WHERE id = ?",
-                (desired_endpoint, serialized_extra, edge["id"]),
-            )
-            changed = True
+            updates.append((desired_endpoint, serialized_extra, edge["id"]))
             if len(supported) == 1 and edge[endpoint] != desired_endpoint:
                 resolved += 1
 
-        if changed:
-            conn.commit()
+        bare_edges.close()
+
+        if updates:
+            # Apply every mutation as one prepared statement inside a single
+            # transaction. The previous code ran on autocommit
+            # (isolation_level=None), so each row became its own commit — one
+            # WAL round trip per edge, effectively a hang on graphs with 10^5+
+            # bare edges (issue #721). Chunking keeps peak memory bounded.
+            update_sql = (
+                f"UPDATE edges SET {endpoint_column} = ?, extra = ? WHERE id = ?"
+            )
+            with self.transaction():
+                for start in range(0, len(updates), _UPDATE_BATCH):
+                    conn.executemany(
+                        update_sql, updates[start:start + _UPDATE_BATCH],
+                    )
         if resolved:
             endpoint_label = (
                 "sources" if endpoint == "source_qualified" else "targets"
