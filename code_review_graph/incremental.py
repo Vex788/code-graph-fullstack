@@ -3250,8 +3250,12 @@ def watch(
         store: Graph database to update.
         on_files_updated: Optional callback invoked after each debounced
             batch of file updates completes.  Receives the store as its
-            only argument.  Used by the CLI to run post-processing
-            (FTS, flows, communities) after watch updates.
+            only argument.  Runs post-processing (FTS, flows,
+            communities) after watch updates.  Left unset, a batch updates
+            the graph but leaves every derived index where the last
+            post-processing left it, so search answers from a stale FTS
+            index.  Both entry points supply one: ``start_watch_thread``
+            for ``serve --auto-watch`` and the CLI ``watch`` command.
         stop_event: Optional event that ends the loop cleanly, for callers
             that run ``watch`` on a thread they need to shut down.
 
@@ -3365,18 +3369,43 @@ def start_watch_thread(
     store: GraphStore,
     daemon: bool = True,
     stop_event: threading.Event | None = None,
+    on_files_updated: Optional[Callable] = None,
 ) -> threading.Thread | None:
     """Start watch mode in a background thread that restarts after failures.
 
     Every restart begins with a catch-up reconciliation, so edits made while
     the watcher was down are indexed. Returns the started thread, or None if
     watchdog is unavailable.
+
+    Each update batch is post-processed by default, matching the standalone
+    ``watch`` command: without it the graph nodes move but the derived
+    indexes do not, so a watcher-started server answers searches from a stale
+    FTS index.  See: #1103.
+
+    ``on_files_updated`` overrides that default; pass a no-op callable to
+    watch without post-processing.
     """
     try:
         import watchdog  # noqa: F401
     except ImportError:
         logger.warning("watchdog not installed; auto-watch disabled")
         return None
+
+    if on_files_updated is None:
+        from .postprocessing import run_pending_post_processing
+
+        canonical_root = _canonical_repo_root(repo_root)
+
+        def post_process(batch_store: GraphStore) -> dict[str, Any]:
+            # An MCP server runs this thread beside tool calls that build, so
+            # the derived tables are written under the writer lock exactly as
+            # ``build_or_update_graph`` writes them.
+            with store_writer_lock(batch_store):
+                return run_pending_post_processing(
+                    batch_store, repo_root=canonical_root,
+                )
+
+        on_files_updated = post_process
 
     stop = stop_event or threading.Event()
 
@@ -3387,7 +3416,7 @@ def start_watch_thread(
         while not stop.is_set():
             started = time.monotonic()
             try:
-                watch(repo_root, store, stop_event=stop)
+                watch(repo_root, store, on_files_updated=on_files_updated, stop_event=stop)
                 return
             except Exception as exc:  # noqa: BLE001 - restart on anything
                 logger.error("Auto-watch for %s failed, restarting: %s", repo_root, exc)

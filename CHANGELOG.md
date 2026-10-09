@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [2.3.8+fs.10] - 2026-10-09
+
+### Fixed
+- `serve --auto-watch` (and `mcp --auto-watch`) now post-processes each watcher
+  batch, so the FTS index, flows, communities and embeddings stay in step with
+  the graph. The watcher used to call `watch()` without the post-processing
+  callback that the standalone `watch` command passes: new symbols landed in
+  `nodes` but were not searchable, and `flows_stale` stayed set. Both the
+  startup reconciliation and every subsequent batch are covered.
+- The auto-watch post-processing runs under the graph writer lock, the same lock
+  `build_or_update_graph` holds while it post-processes. An MCP server is the
+  one entry point where the watcher thread and a build share a process.
+
+### Notes
+- With embeddings enabled, `serve --auto-watch` now queues embeddings for
+  changed nodes after each batch, matching `code-review-graph watch`. Embeddings
+  remain off unless enabled in repository settings.
+
 ## [2.3.8+fs.9] - 2026-10-09
 
 ### Fixed
