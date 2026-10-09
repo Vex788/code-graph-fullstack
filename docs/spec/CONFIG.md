@@ -18,7 +18,8 @@ not list. Defaults are the values at the read site.
 | `CRG_HOME` | `~/.code-review-graph` | Per-user state: `registry.json`, `watch.toml`, daemon pid/state, logs. |
 | `CRG_REPO_ROOT` | auto-detected | Explicit repository root override. |
 | `CRG_RECURSE_SUBMODULES` | off | `1`/`true`/`yes`: include git submodule files. |
-| `CRG_GIT_TIMEOUT` | `30` | Seconds per git subprocess. |
+| `CRG_GIT_TIMEOUT` | `30` | Seconds per git subprocess (build, update, watch). When set explicitly it is also the fallback discovery budget. |
+| `CRG_DISCOVERY_TIMEOUT` | `5` | Seconds per subprocess for read-only change discovery (a review tool auto-detecting `changed_files`). Exhausting it is reported as a git failure, never as "no changes" (#262). |
 
 ### Parsing and build
 
@@ -54,7 +55,7 @@ not list. Defaults are the values at the read site.
 | Variable | Default | Effect |
 |---|---|---|
 | `CRG_TOOLS` | all tools | Tool names and presets to expose, like `serve --tools` ([TOOLS.md](TOOLS.md)). |
-| `CRG_TOOL_TIMEOUT` | `0` (off) | Seconds before a tool call is cancelled. |
+| `CRG_TOOL_TIMEOUT` | `0` (off) | Seconds before a bounded tool call is cancelled and answered with `status: error`. Writing tools (build, post-process, embed, wiki, apply-refactor) are never cut short. |
 | `CRG_RECEIPT_TTL` | `2` | Seconds the `_graph` receipt is reused while graph and git are unchanged; `0` disables. |
 | `CRG_SELF_HEAL_BUDGET` | `40` | Seconds a tool call may spend catching a stale graph up before answering; `0` disables the query-time self-heal. |
 | `CRG_SELF_HEAL_DEBOUNCE` | `60` | Seconds between self-heal attempts per repository. |
@@ -112,6 +113,7 @@ not list. Defaults are the values at the read site.
 | `CRG_RECONCILE_STATE_DIR` | `crg-reconcile` next to the target's hook state | Per-root update-attempt fingerprints (worktree state plus the tool's `--version` and contract version) `crg-heal` shares with the reconcile loop. |
 | `CRG_HEAL_POLL_SECONDS` | `5` | Seconds `crg-heal` waits between status reads of a `building` graph (tests). |
 | `CRG_HEAL_UPDATE_SECONDS` | `180` | Cap in seconds for the separate `update --skip-flows` stage after `crg-heal` clones a seed graph (tests); a timeout leaves the clone `stale_graph`. |
+| `CRG_ALLOW_TEMPORARY_ROOT` | unset | `1`: let `clone-graph`/`crg-heal` bootstrap into a worktree under a scratch tmp root (tests; the hermetic HOME lives under pytest's tmp dir). |
 | `CRG_STUB_MSG` | unset | Message a test stub binary prints; used only by the harness kit fixtures. |
 | `CRG_STUB_RC` | `0` | Exit code of the `--selftest` stub binary. |
 

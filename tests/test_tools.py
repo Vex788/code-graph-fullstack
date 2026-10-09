@@ -2106,6 +2106,53 @@ class TestGetMinimalContext:
         assert "summary" in result
         assert "next_tool_suggestions" in result
 
+    def test_discovery_failure_is_reported_degraded_not_empty(self, monkeypatch):
+        """A review-shaped call must not read as clean when git could not run.
+
+        ``get_minimal_context`` is the entry point agents call first (#262),
+        so a discovery budget exhaustion has to be visible in the summary,
+        not silently absorbed as "no changed files".
+        """
+        from types import SimpleNamespace
+
+        from code_review_graph.incremental import GitUnavailableError
+        from code_review_graph.readiness import GIT_OK, ReadinessStatus
+        from code_review_graph.tools import context as context_module
+
+        monkeypatch.setattr(
+            context_module, "gather_report",
+            lambda root, db: SimpleNamespace(
+                readiness=SimpleNamespace(
+                    status=ReadinessStatus.OK,
+                    reasons=[],
+                    to_dict=lambda: {"status": "ok"},
+                ),
+                drift={"missing": [], "mismatched": [], "deleted": [],
+                       "check": "full"},
+                facts=SimpleNamespace(
+                    git_state=GIT_OK, built_at_commit="deadbeef",
+                    failed_files=[], resolver_failures=[],
+                ),
+            ),
+        )
+
+        def discovery_timed_out(_root, _base):
+            raise GitUnavailableError(
+                "could not determine the changes: git diff failed or did not "
+                "answer within the 5s discovery budget. Raise "
+                "CRG_DISCOVERY_TIMEOUT, or pass changed_files explicitly."
+            )
+
+        monkeypatch.setattr(
+            context_module, "discover_review_changes", discovery_timed_out,
+        )
+
+        result = context_module.get_minimal_context(repo_root=str(self.root))
+
+        assert result["status"] == "ok"
+        assert "Degraded:" in result["summary"]
+        assert "CRG_DISCOVERY_TIMEOUT" in result["summary"]
+
     def test_missing_graph_returns_not_ready_without_creating_database(self, tmp_path):
         from code_review_graph.tools.context import get_minimal_context
 
@@ -2124,13 +2171,15 @@ class TestGetMinimalContext:
         assert not db_path.parent.exists()
 
     def test_mcp_wrapper_reports_missing_graph_without_creating_state(self, tmp_path):
+        import asyncio
+
         from code_review_graph.main import get_minimal_context_tool
 
         repo = tmp_path / "cold-worktree"
         repo.mkdir()
         (repo / ".git").write_text("gitdir: ../main/.git/worktrees/cold\n")
 
-        result = get_minimal_context_tool(repo_root=str(repo))
+        result = asyncio.run(get_minimal_context_tool(repo_root=str(repo)))
 
         assert result["status"] == "not_ready"
         assert result["reason"] == "missing_graph"
@@ -2436,6 +2485,8 @@ class TestGraphProvenance:
         assert existing["_graph"] == {"updated_at": "existing"}
 
     def test_registered_sync_tool_preserves_existing_fields(self, tmp_path):
+        import asyncio
+
         from code_review_graph.main import list_graph_stats_tool
 
         repo = self._make_repo(tmp_path, {
@@ -2444,7 +2495,7 @@ class TestGraphProvenance:
         })
         expected = list_graph_stats(repo_root=str(repo))
         underlying = getattr(list_graph_stats_tool, "fn", None) or list_graph_stats_tool
-        result = underlying(repo_root=str(repo))
+        result = asyncio.run(underlying(repo_root=str(repo)))
 
         envelope = result.pop("_graph")
         assert result == expected
@@ -2495,6 +2546,42 @@ def test_impact_radius_tool_exposes_best_first_scores(monkeypatch, tmp_path):
     ]
     scores = [node["impact_score"] for node in result["impacted_nodes"]]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_impact_radius_reports_git_unavailable_not_no_changes(monkeypatch, tmp_path):
+    """#262/#913: a discovery that could not run is not an all-clear.
+
+    The empty response below is what an agent acts on as "nothing to
+    review"; a discovery budget exhaustion must be distinguishable from
+    it, with the knob that governs the budget named.
+    """
+    from code_review_graph.incremental import GitUnavailableError
+
+    store = GraphStore(tmp_path / "impact.db")
+    monkeypatch.setattr(
+        query_module, "_get_store", lambda _repo_root: (store, tmp_path),
+    )
+
+    def discovery_timed_out(_root, _base):
+        raise GitUnavailableError(
+            "could not determine the changes: git diff failed or did not "
+            "answer within the 5s discovery budget. Raise "
+            "CRG_DISCOVERY_TIMEOUT, or pass changed_files explicitly."
+        )
+
+    monkeypatch.setattr(
+        query_module, "discover_review_changes", discovery_timed_out,
+    )
+    try:
+        result = query_module.get_impact_radius(repo_root=str(tmp_path))
+    finally:
+        store.close()
+
+    assert result["status"] == "ok"
+    assert result["changed_nodes"] == []
+    assert result.get("git") == "unavailable"
+    assert "CRG_DISCOVERY_TIMEOUT" in result["warning"]
+    assert "git unavailable" in result["summary"]
 
 
 def _query_repo(tmp_path):

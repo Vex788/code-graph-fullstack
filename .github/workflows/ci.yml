@@ -150,86 +150,114 @@ jobs:
           tests/test_skills.py::TestInstallCursorHooks
 
   vscode-extension:
-    name: VS Code extension (${{ matrix.os }})
+    name: VS Code extension (Node ${{ matrix.node-version }})
+    # Node 22 is the runtime VS Code Server uses on WSL/SSH (issue #63);
+    # Node 24 covers current local Electron builds.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22", "24"]
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check
+        run: npm run lint
+      - name: Reader unit tests
+        run: npm test
+      - name: Package the extension
+        run: npm run package -- --out crg-extension.vsix
+      - name: Unpack the VSIX
+        run: unzip -q crg-extension.vsix -d unpacked
+      - name: Assert package content (no native artifacts)
+        run: node test/package-content.cjs unpacked/extension
+      - name: Activation smoke on the packaged extension
+        run: node test/activation.smoke.cjs unpacked/extension
+      - name: Degraded runtime keeps activation alive
+        run: node test/activation.smoke.cjs unpacked/extension degraded
+
+  vscode-extension-e2e:
+    name: Extension activation in VS Code (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
       - name: Install extension dependencies
-        working-directory: code-review-graph-vscode
         run: npm ci
       - name: Compile extension and tests
-        working-directory: code-review-graph-vscode
         run: npm run compile && npm run compile:tests
       - name: Run activation tests (Linux)
         if: runner.os == 'Linux'
-        working-directory: code-review-graph-vscode
         run: xvfb-run -a node test/run-activation.mjs
       - name: Run activation tests (Windows)
         if: runner.os == 'Windows'
-        working-directory: code-review-graph-vscode
         run: node test/run-activation.mjs
 
   vscode-extension-1-115:
     name: VS Code 1.115.0 activation (#218)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
       - name: Install extension dependencies
-        working-directory: code-review-graph-vscode
         run: npm ci
       - name: Compile extension and tests
-        working-directory: code-review-graph-vscode
         run: npm run compile && npm run compile:tests
       - name: Run activation tests on VS Code 1.115.0
-        working-directory: code-review-graph-vscode
         env:
           CRG_VSCODE_VERSION: "1.115.0"
         run: xvfb-run -a node test/run-activation.mjs
 
-  vsix:
-    name: Packaged VSIX activates (#218)
+  vscode-extension-vsix:
+    name: Packaged VSIX activates in VS Code (#218)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: code-review-graph-vscode
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: code-review-graph-vscode/package-lock.json
       - name: Install extension dependencies
-        working-directory: code-review-graph-vscode
         run: npm ci
       - name: Package VSIX
-        working-directory: code-review-graph-vscode
         run: npx vsce package --out crg.vsix
-      - name: Verify VSIX contents
-        working-directory: code-review-graph-vscode
-        run: |
-          unzip -l crg.vsix | grep -q 'extension/dist/extension.js'
-          unzip -l crg.vsix | grep -q 'extension/dist/webview/graph.js'
-          # The fixed build ships no native addon, so no Electron ABI to match.
-          if unzip -l crg.vsix | grep -q '\.node$'; then
-            echo "::error::native module found in VSIX"
-            exit 1
-          fi
+      - name: Unpack the VSIX
+        run: unzip -q crg.vsix -d unpacked
       - name: Run activation tests against the packaged VSIX
-        working-directory: code-review-graph-vscode
         run: |
           npm run compile:tests
-          mkdir -p /tmp/crg-ext
-          unzip -q crg.vsix -d /tmp/crg-ext
-          CRG_EXTENSION_DIR=/tmp/crg-ext/extension xvfb-run -a node test/run-activation.mjs
+          CRG_EXTENSION_DIR="$PWD/unpacked/extension" xvfb-run -a node test/run-activation.mjs

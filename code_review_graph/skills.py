@@ -174,6 +174,11 @@ PLATFORMS: dict[str, dict[str, Any]] = {
     "cursor": {
         "name": "Cursor",
         "config_path": lambda root: root / ".cursor" / "mcp.json",
+        # Cursor also reads a user-level config, and the Add-to-Cursor link
+        # on code-review-graph.com writes there. Only a double-wrapped entry
+        # is ever repaired (see ``_repair_self_wrapped_user_entry``); an
+        # install never adds a server to this file.
+        "user_config_path": lambda: Path.home() / ".cursor" / "mcp.json",
         "key": "mcpServers",
         "detect": lambda: (Path.home() / ".cursor").exists(),
         "format": "object",
@@ -693,6 +698,77 @@ def _strip_jsonc(text: str) -> str:
     return "".join(out)
 
 
+def _is_self_wrapped_entry(entry: Any, server_name: str) -> bool:
+    """Return True for the double-wrapped shape the Add-to-Cursor link writes.
+
+    The Cursor deeplink carries ``name=<server>`` *and* a config payload
+    already keyed by that same name, so Cursor stores the entry one level
+    deeper than any MCP client reads::
+
+        "mcpServers": {"<server>": {"<server>": {"command": ...}}}
+
+    Only that exact shape counts: one key, equal to the server name, holding
+    an object with ``command`` or ``url``. See #703.
+    """
+    if not isinstance(entry, dict) or list(entry) != [server_name]:
+        return False
+    inner = entry[server_name]
+    return isinstance(inner, dict) and ("command" in inner or "url" in inner)
+
+
+def _repair_self_wrapped_user_entry(
+    plat: dict[str, Any], *, dry_run: bool
+) -> bool:
+    """Flatten a double-wrapped entry the Add-to-Cursor link left in a user config.
+
+    The Add-to-Cursor button writes Cursor's *user-level* config, never the
+    project file this installer owns, so a broken entry there keeps Cursor
+    rejecting the server even after a clean project install. Only the exact
+    self-wrapped shape is rewritten and only the inner entry is kept: a
+    working entry, an unrelated server, and a hand-written nesting are left
+    alone. A pinned ``cwd`` is dropped because a user-level entry serves
+    every project. Returns True when the file was rewritten (or would be,
+    under ``dry_run``).
+    """
+    path_getter = plat.get("user_config_path")
+    if path_getter is None:
+        return False
+    config_path: Path = path_getter()
+    if not config_path.exists():
+        return False
+    try:
+        parsed = json.loads(
+            _strip_jsonc(config_path.read_text(encoding="utf-8", errors="replace"))
+        )
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    servers = parsed.get(plat["key"])
+    if not isinstance(servers, dict):
+        return False
+    wrapped = servers.get("code-review-graph")
+    if not _is_self_wrapped_entry(wrapped, "code-review-graph"):
+        return False
+    inner = dict(wrapped["code-review-graph"])
+    inner.pop("cwd", None)
+    servers["code-review-graph"] = inner
+    if dry_run:
+        print(
+            f"  {plat['name']}: [dry-run] would repair a double-wrapped "
+            f"'code-review-graph' entry in {config_path}"
+        )
+        return True
+    config_path.write_text(
+        json.dumps(parsed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(
+        f"  {plat['name']}: repaired a double-wrapped 'code-review-graph' "
+        f"entry in {config_path}"
+    )
+    return True
+
+
 def install_platform_configs(
     repo_root: Path,
     target: str = "all",
@@ -827,6 +903,7 @@ def install_platform_configs(
             )
             continue
 
+        repaired = False
         if plat["format"] == "array":
             arr = existing.get(server_key, [])
             # Check if already present
@@ -852,23 +929,44 @@ def install_platform_configs(
                         del existing[legacy_key]
                     migrated = True
             servers = existing.get(server_key, {})
-            if "code-review-graph" in servers and not migrated:
-                print(f"  {plat['name']}: already configured in {config_path}")
-                _record_configured(key, plat)
-                continue
-            servers["code-review-graph"] = server_entry
-            existing[server_key] = servers
+            wrapped = servers.get("code-review-graph")
+            if _is_self_wrapped_entry(wrapped, "code-review-graph"):
+                # The Add-to-Cursor link writes the entry pre-wrapped in its
+                # own name and Cursor rejects that shape. Flatten it and keep
+                # the inner entry the user asked to install (#703).
+                servers["code-review-graph"] = wrapped["code-review-graph"]
+                existing[server_key] = servers
+                repaired = True
+            else:
+                if "code-review-graph" in servers and not migrated:
+                    print(f"  {plat['name']}: already configured in {config_path}")
+                    _record_configured(key, plat)
+                    continue
+                servers["code-review-graph"] = server_entry
+                existing[server_key] = servers
 
         if dry_run:
-            print(f"  [dry-run] {plat['name']}: would write {config_path}")
+            if repaired:
+                print(f"  [dry-run] {plat['name']}: would repair a "
+                      f"double-wrapped 'code-review-graph' entry in {config_path}")
+            else:
+                print(f"  [dry-run] {plat['name']}: would write {config_path}")
         else:
             config_path.parent.mkdir(parents=True, exist_ok=True)
             config_path.write_text(
                 json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
-            print(f"  {plat['name']}: configured {config_path}")
+            if repaired:
+                print(f"  {plat['name']}: repaired a double-wrapped "
+                      f"'code-review-graph' entry in {config_path}")
+            else:
+                print(f"  {plat['name']}: configured {config_path}")
 
         _record_configured(key, plat)
+
+    cursor = platforms_to_install.get("cursor")
+    if cursor is not None:
+        _repair_self_wrapped_user_entry(cursor, dry_run=dry_run)
 
     return configured
 

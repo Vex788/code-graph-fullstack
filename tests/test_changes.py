@@ -495,11 +495,13 @@ class TestChanges:
         from code_review_graph.tools import detect_changes_func
 
         # Patch _get_store to use our test store,
-        # and get_changed_files/get_staged_and_unstaged to return empty.
+        # and discover_review_changes to report a genuinely clean tree.
         with (
             patch("code_review_graph.tools.review._get_store") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=[]),
-            patch("code_review_graph.tools.review.get_staged_and_unstaged", return_value=[]),
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=([], "HEAD~1"),
+            ),
             # Prevent the tool from closing our shared store, then restore the
             # real method so teardown releases the database handle on Windows.
             patch.object(self.store, "close"),
@@ -519,11 +521,23 @@ class TestChanges:
     @pytest.mark.parametrize("dirty", [None, []])
     def test_git_unavailable_is_not_reported_as_no_changes(self, tool, dirty):
         from code_review_graph import tools
+        from code_review_graph.incremental import GitUnavailableError
 
+        discovery = (
+            GitUnavailableError("could not determine the changes: git diff "
+                                "failed or did not answer within the 5s "
+                                "discovery budget. Raise CRG_DISCOVERY_TIMEOUT, "
+                                "or pass changed_files explicitly.")
+            if dirty is None
+            else None
+        )
         with (
             patch("code_review_graph.tools.review._get_store") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=[]),
-            patch("code_review_graph.tools.review.get_staged_and_unstaged", return_value=dirty),
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                side_effect=discovery,
+                return_value=([], "HEAD~1"),
+            ),
             patch.object(self.store, "close"),
         ):
             mock_get_store.return_value = (self.store, Path("/fake/repo"))
@@ -532,6 +546,7 @@ class TestChanges:
             assert result.get("git") == "unavailable", result
             assert "git" in result["summary"]
             assert result.get("warning")
+            assert "CRG_DISCOVERY_TIMEOUT" in result["warning"]
         else:
             assert "git" not in result and "warning" not in result
 
@@ -543,7 +558,10 @@ class TestChanges:
 
         with (
             patch("code_review_graph.tools.review._get_store") as mock_get_store,
-            patch("code_review_graph.tools.review.get_changed_files", return_value=["app.py"]),
+            patch(
+                "code_review_graph.tools.review.discover_review_changes",
+                return_value=(["app.py"], "HEAD~1"),
+            ),
             patch(
                 "code_review_graph.tools.review.parse_git_diff_ranges",
                 return_value={"app.py": [(1, 10)]},

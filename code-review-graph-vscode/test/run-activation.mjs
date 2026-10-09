@@ -28,11 +28,9 @@ if (!fs.existsSync(path.join(extensionDir, 'dist', 'extension.js'))) {
   );
   process.exit(1);
 }
-for (const bundle of ['sqlite.test.cjs', 'activation.test.cjs']) {
-  if (!fs.existsSync(path.join(here, '..', 'out', bundle))) {
-    console.error(`Missing out/${bundle}: run "npm run compile:tests" first.`);
-    process.exit(1);
-  }
+if (!fs.existsSync(path.join(here, '..', 'out', 'activation.test.cjs'))) {
+  console.error('Missing out/activation.test.cjs: run "npm run compile:tests" first.');
+  process.exit(1);
 }
 
 // The VS Code IPC socket lives under the cache path's user-data dir; a deep

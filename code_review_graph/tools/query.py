@@ -12,7 +12,7 @@ from ..context_savings import attach_context_savings, estimate_file_tokens
 from ..embeddings import EmbeddingStore
 from ..graph import GraphNode, GraphStore, _sanitize_name, edge_to_dict, node_to_dict
 from ..hints import generate_hints, get_session
-from ..incremental import get_changed_files, get_db_path, get_staged_and_unstaged
+from ..incremental import GitUnavailableError, discover_review_changes, get_db_path
 from ..kinds import EDGE_KINDS_BY_NAME
 from ..parser import _is_test_file, normalize_file_path
 from ..search import hybrid_search
@@ -482,13 +482,20 @@ def get_impact_radius(
 
     store, root = _get_store(repo_root)
     try:
+        git_error = ""
         if changed_files is None:
-            changed_files = get_changed_files(root, base)
-            if not changed_files:
-                changed_files = get_staged_and_unstaged(root)
+            try:
+                changed_files, base = discover_review_changes(root, base)
+            except GitUnavailableError as exc:
+                # Distinct from the "no changed files" answer below: that one
+                # is an all-clear a client will act on. Git that could not be
+                # run, or that overran the discovery budget, says nothing
+                # about the working tree (#262).
+                logger.warning("change discovery unavailable for %s: %s", root, exc)
+                git_error = str(exc)
 
         if not changed_files:
-            return {
+            empty: dict[str, Any] = {
                 "status": "ok",
                 "summary": "No changed files detected.",
                 "changed_nodes": [],
@@ -497,6 +504,11 @@ def get_impact_radius(
                 "truncated": False,
                 "total_impacted": 0,
             }
+            if git_error:
+                empty["summary"] = "No changed files: git unavailable. " + git_error
+                empty["git"] = "unavailable"
+                empty["warning"] = git_error
+            return empty
 
         # Resolve user-facing paths to the file paths stored in the graph.
         original_tokens = estimate_file_tokens(root, changed_files)

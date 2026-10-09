@@ -16,6 +16,16 @@ import { registerWalkthroughCommands, showWelcomeIfNeeded } from "./onboarding/w
 import { StatusBar } from "./views/statusBar";
 import { ScmDecorationProvider } from "./features/scmDecorations";
 
+// Re-exported so the packaged-activation smoke test (test/activation.smoke.cjs)
+// and the reader unit tests can exercise the same code the extension ships.
+export { SqliteReader };
+export {
+  openSqliteEngine,
+  SqliteUnavailableError,
+  nodeSqliteProbe,
+  betterSqlite3Probe,
+} from "./backend/sqliteEngine";
+
 let sqliteReader: SqliteReader | undefined;
 let autoUpdateTimer: ReturnType<typeof setTimeout> | undefined;
 let scmDecorationProvider: ScmDecorationProvider | undefined;
@@ -23,20 +33,6 @@ let codeGraphTreeProvider: CodeGraphTreeProvider | undefined;
 let blastRadiusTreeProvider: BlastRadiusTreeProvider | undefined;
 let statsTreeProvider: StatsTreeProvider | undefined;
 let statusBar: StatusBar | undefined;
-let readerFailureReported = false;
-
-/**
- * Report that the SQLite reader could not be opened, once per session.
- * Activation and the CLI commands (Build/Update Graph) keep working.
- */
-function reportReaderFailure(err: unknown): void {
-  if (readerFailureReported) {
-    return;
-  }
-  readerFailureReported = true;
-  const message = err instanceof Error ? err.message : String(err);
-  void vscode.window.showErrorMessage(`Code Graph: ${message}`);
-}
 
 /** Refresh every graph tree view (registered as codeReviewGraph.codeGraph.refresh). */
 function refreshTreeViews(): void {
@@ -82,6 +78,32 @@ function getWorkspaceRoot(): string | undefined {
   return folders[0]?.uri.fsPath;
 }
 
+
+/**
+ * Open the graph database, reporting failure instead of aborting activation.
+ *
+ * Activation must survive an unreadable database or a runtime without a
+ * SQLite engine (issue #63): the commands and views are still registered and
+ * the user gets the reason, rather than "command not found".
+ */
+function openReader(
+  dbPath: string,
+  reportErrors: boolean
+): SqliteReader | undefined {
+  try {
+    return new SqliteReader(dbPath);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (reportErrors) {
+      void vscode.window.showErrorMessage(
+        `Code Graph: cannot read ${dbPath}. ${message}`
+      );
+    } else {
+      console.error(`[code-review-graph] cannot read ${dbPath}: ${message}`);
+    }
+    return undefined;
+  }
+}
 
 /**
  * Navigate to a node's source file location.
@@ -803,7 +825,7 @@ function registerCommands(
  * Reinitialize the reader and tree providers after a graph rebuild.
  */
 async function reinitialize(
-  _context: vscode.ExtensionContext
+  context: vscode.ExtensionContext
 ): Promise<void> {
   const workspaceRoot = getWorkspaceRoot();
   if (!workspaceRoot) {
@@ -815,20 +837,9 @@ async function reinitialize(
     return;
   }
 
-  try {
-    if (sqliteReader) {
-      // Reopen on the same instance so tree providers keep working.
-      sqliteReader.reopen(dbPath);
-    } else {
-      sqliteReader = new SqliteReader(dbPath);
-    }
-    readerFailureReported = false;
-  } catch (err) {
-    sqliteReader?.close();
-    sqliteReader = undefined;
-    reportReaderFailure(err);
-  }
-
+  sqliteReader?.close();
+  const reader = openReader(dbPath, true);
+  sqliteReader = reader;
   statusBar?.update(sqliteReader);
 
   // Refresh tree views
@@ -855,15 +866,10 @@ function watchGraphDb(context: vscode.ExtensionContext): void {
   }
 
   watcher.onDidChange(() => {
-    // Reopen to pick up external writes
+    // Close and reopen to pick up external writes
     if (sqliteReader && dbPathRef.current) {
-      try {
-        sqliteReader.reopen(dbPathRef.current);
-      } catch (err) {
-        sqliteReader.close();
-        sqliteReader = undefined;
-        reportReaderFailure(err);
-      }
+      sqliteReader.close();
+      sqliteReader = openReader(dbPathRef.current, false);
       statusBar?.update(sqliteReader);
       void vscode.commands.executeCommand("codeReviewGraph.codeGraph.refresh");
     }
@@ -875,13 +881,7 @@ function watchGraphDb(context: vscode.ExtensionContext): void {
       const dbPath = findGraphDb(wsRoot);
       if (dbPath) {
         dbPathRef.current = dbPath;
-        try {
-          sqliteReader = new SqliteReader(dbPath);
-          readerFailureReported = false;
-        } catch (err) {
-          sqliteReader = undefined;
-          reportReaderFailure(err);
-        }
+        sqliteReader = openReader(dbPath, false);
         statusBar?.update(sqliteReader);
         void vscode.commands.executeCommand("codeReviewGraph.codeGraph.refresh");
       }
@@ -951,14 +951,9 @@ export async function activate(
   const dbPath = workspaceRoot ? findGraphDb(workspaceRoot) : undefined;
 
   if (dbPath) {
-    // A graph database exists - open it, but never let a reader problem
-    // abort activation: commands must stay registered either way.
-    try {
-      sqliteReader = new SqliteReader(dbPath);
-    } catch (err) {
-      sqliteReader = undefined;
-      reportReaderFailure(err);
-    }
+    // Graph database found - initialize; openReader() reports failure
+    // instead of aborting activation.
+    sqliteReader = openReader(dbPath, true);
   } else if (workspaceRoot) {
     // No graph database found - show welcome
     showWelcomeIfNeeded(context);

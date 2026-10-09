@@ -3,22 +3,64 @@
 ## [Unreleased]
 
 ### Fixed
-- The VS Code extension activates on current VS Code (Electron 39+) again: it
-  reads `.code-review-graph/graph.db` through the extension host's built-in
-  `node:sqlite`, so no native addon has to match the Electron ABI, and a
-  reader failure no longer leaves every `Code Graph:` command unregistered
-  (upstream issue #218).
 - `Code Graph: Build Graph` no longer fails with
   `command 'codeReviewGraph.codeGraph.refresh' not found` after a successful
-  build; the refresh command is registered and the tree views follow rebuilds.
-- The release workflow builds and attaches `code-review-graph.vsix`, and
-  `vsce package` compiles `dist/` itself, so a release VSIX can no longer
-  omit the extension entry point.
+  build (upstream issue #218): the refresh command is registered, and the
+  tree views follow rebuilds and watcher updates without a window reload.
+- The release workflow builds and attaches `code-review-graph.vsix` alongside
+  the Python artifacts.
 
 ### Added
-- CI runs the VS Code extension suite on Linux and Windows, including an
-  activation run against the packaged VSIX and against VS Code 1.115.0
-  (upstream issue #218).
+- Activation tests run inside a real VS Code (`npm run test:electron`); CI
+  executes them on Linux and Windows, against VS Code 1.115.0, and against
+  the packaged VSIX (upstream issue #218).
+
+## [2.3.8+fs.12] - 2026-10-09
+
+### Fixed
+- MCP review tools no longer hang past a client's request ceiling when git is
+  slow (upstream #262). `get_minimal_context`, `get_impact_radius`,
+  `get_review_context` and `get_affected_flows` — plus every other MCP tool
+  that can take seconds — now run their blocking work off the stdio event
+  loop through one `_offload` helper, and `CRG_TOOL_TIMEOUT` bounds every
+  read-only tool with `status: error` naming the tool and the budget. The
+  five writing tools (build, post-process, embed, wiki, apply-refactor) are
+  offloaded but never cut short: a cancelled await cannot stop their worker,
+  so a "timeout" there would report failure while the write went on.
+- Change discovery (the `git diff` + `git status` chain a review tool runs
+  when `changed_files` is omitted) gets its own budget,
+  `CRG_DISCOVERY_TIMEOUT` (default 5s; an explicitly set `CRG_GIT_TIMEOUT` is
+  honoured verbatim). It previously inherited the 30-second per-subprocess
+  budget — and one retry at 60s — so a slow git could hold one tool call for
+  minutes. Exhausting the budget is reported as `git: unavailable` (or a CLI
+  `Error:` and exit 1 for `detect-changes`), never as "no changes" (#913).
+- `get_minimal_context` no longer runs two hardcoded 10-second git probes
+  before answering; discovery is one short-budget call, and a failure is
+  named in the summary as `Degraded: ...`.
+- The working-tree walk stays at `--untracked-files=all`: scoping it down was
+  tried and withdrawn upstream because git collapses a wholly-untracked
+  directory to one `dir/` record, which made the first commit of a new
+  package read as "no changes" with `status: ok`. The discovery budget bounds
+  the walk instead, and reports it when it does.
+
+### Packaging
+- `anyio>=4.0,<5` is now a direct dependency: the tool offload has to use the
+  same thread limiter FastMCP dispatches sync tool bodies through, not
+  `asyncio.to_thread`'s smaller default executor.
+
+## [2.3.8+fs.11] - 2026-10-09
+
+### Fixed
+- `install` no longer certifies a double-wrapped `code-review-graph` entry as
+  "already configured". The Add-to-Cursor button on code-review-graph.com
+  sends the entry already keyed by its own server name
+  (`{"code-review-graph": {"command": ...}}`), so Cursor stores it one level
+  deeper than any MCP client reads and rejects it with "Server
+  'code-review-graph' must have either a command (for stdio) or url (for
+  SSE)" (#703). Both the project `.cursor/mcp.json` and the user-level
+  `~/.cursor/mcp.json` that button writes are flattened back to the entry the
+  user asked for; only that exact shape is touched, and the regression test
+  decodes the deployed Cursor link and asserts the resulting JSON shape.
 
 ## [2.3.8+fs.10] - 2026-10-09
 

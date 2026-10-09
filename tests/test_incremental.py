@@ -2,16 +2,21 @@
 
 import hashlib
 import io
+import os
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch  # noqa: F401 – used in tests
 
 import pytest
 
+import code_review_graph.constants as constants_module
 import code_review_graph.incremental as incremental_module
+from code_review_graph.constants import DISCOVERY_TIMEOUT_DEFAULT, discovery_timeout
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
     _IGNORE_POLICY_METADATA_KEY,
+    GitUnavailableError,
     _create_watch_handler,
     _decode_name_status_paths,
     _is_binary,
@@ -19,6 +24,7 @@ from code_review_graph.incremental import (
     _parse_single_file,
     _should_ignore,
     _single_hop_dependents,
+    discover_review_changes,
     ensure_repo_gitignore_excludes_crg,
     find_dependents,
     find_project_root,
@@ -2294,3 +2300,258 @@ class TestUntrackedDiscovery:
             assert self._status(root, tmp_path) == "ok"
         finally:
             store.close()
+
+
+# ---------------------------------------------------------------------------
+# Change discovery: its own budget (#262)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoveryTimeout:
+    """``discovery_timeout`` is the budget for read-only change discovery."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("CRG_DISCOVERY_TIMEOUT", raising=False)
+        # Both variables matter to the precedence below, so neither may leak
+        # in from the environment the suite happens to run in.
+        monkeypatch.delenv("CRG_GIT_TIMEOUT", raising=False)
+
+    def test_default_is_far_below_the_general_git_budget(self):
+        """The point of the variable: discovery cannot inherit 30 seconds.
+
+        Several serial subprocesses at ``CRG_GIT_TIMEOUT`` is a multi-minute
+        worst case, which is longer than an MCP client will wait (#262).
+        """
+        assert discovery_timeout() == DISCOVERY_TIMEOUT_DEFAULT == 5.0
+        assert discovery_timeout() < incremental_module._GIT_TIMEOUT
+
+    def test_env_var_is_read_at_call_time_not_import_time(self, monkeypatch):
+        """``CRG_GIT_TIMEOUT`` is frozen at import; this one must not be.
+
+        A long-lived MCP server, and any test that sets the variable after
+        the module is imported, only sees a value that is read per call.
+        """
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "1.25")
+        assert discovery_timeout() == 1.25
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "0.5")
+        assert discovery_timeout() == 0.5
+
+    def test_explicit_override_may_exceed_the_git_budget(self, monkeypatch):
+        """An explicit value is an instruction, not a hint; it is not clamped."""
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "120")
+        assert discovery_timeout() == 120.0
+
+    def test_zero_is_honoured_so_a_forced_timeout_stays_testable(
+        self, monkeypatch,
+    ):
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "0")
+        assert discovery_timeout() == 0.0
+
+    @pytest.mark.parametrize("bad", ["", "   ", "abc", "1.5.2", "-3", "nan"])
+    def test_invalid_values_fall_back_instead_of_raising(self, bad, monkeypatch):
+        """A bad value inside an MCP tool call must not surface as a crash."""
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", bad)
+        assert discovery_timeout() == 5.0
+
+    def test_default_never_exceeds_a_lowered_git_budget(self, monkeypatch):
+        """Lowering ``CRG_GIT_TIMEOUT`` still lowers discovery."""
+        monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 2)
+        assert discovery_timeout() == 2.0
+
+    def test_an_explicitly_raised_git_budget_raises_discovery_too(
+        self, monkeypatch,
+    ):
+        """The documented escape hatch for slow Git must keep working.
+
+        ``CRG_GIT_TIMEOUT`` predates this variable and is what the #262
+        reporters were already told to raise. Capping discovery at 5s
+        regardless would silently ignore an operator who asked for a longer
+        budget -- a knob that stops working is worse than one that never
+        existed.
+        """
+        monkeypatch.setenv("CRG_GIT_TIMEOUT", "120")
+        monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 120)
+        assert discovery_timeout() == 120.0
+
+    def test_discovery_variable_still_wins_over_an_explicit_git_budget(
+        self, monkeypatch,
+    ):
+        """The more specific instruction is the one that applies."""
+        monkeypatch.setenv("CRG_GIT_TIMEOUT", "120")
+        monkeypatch.setattr(constants_module, "GIT_TIMEOUT", 120)
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "3")
+        assert discovery_timeout() == 3.0
+
+
+class TestDiscoverReviewChanges:
+    """The chain a review tool runs when it was not given ``changed_files``."""
+
+    def test_every_step_runs_on_the_discovery_budget(self, tmp_path):
+        seen: dict[str, object] = {}
+
+        def fake_changed(root, base, *, timeout=None, require_vcs=False):
+            seen["changed"] = (base, timeout, require_vcs)
+            return []
+
+        def fake_staged(root, *, timeout=None, require_vcs=False):
+            seen["staged"] = (timeout, require_vcs)
+            return ["a.py"]
+
+        with (
+            patch.object(
+                incremental_module, "get_changed_files_strict", fake_changed,
+            ),
+            patch.object(incremental_module, "get_staged_and_unstaged", fake_staged),
+        ):
+            files, base = discover_review_changes(tmp_path, "HEAD~1")
+
+        budget = discovery_timeout()
+        assert files == ["a.py"]
+        assert base == "HEAD~1"
+        # Every step: short budget AND require_vcs. The second is what makes
+        # the first safe -- a budget that runs out has to be reported, not
+        # rounded down to "nothing changed".
+        assert seen["changed"] == ("HEAD~1", budget, True)
+        assert seen["staged"] == (budget, True)
+
+    def test_working_tree_fallback_is_skipped_when_the_diff_answered(
+        self, tmp_path,
+    ):
+        """The expensive ``git status`` only runs when the diff is empty."""
+        with (
+            patch.object(
+                incremental_module, "get_changed_files_strict",
+                lambda root, base, **kw: ["app.py"],
+            ),
+            patch.object(incremental_module, "get_staged_and_unstaged") as staged,
+        ):
+            files, _ = discover_review_changes(tmp_path, "HEAD~1")
+
+        assert files == ["app.py"]
+        staged.assert_not_called()
+
+    @pytest.mark.parametrize("failing", ["diff", "status"])
+    def test_a_step_that_cannot_answer_is_raised_not_swallowed(
+        self, failing, tmp_path,
+    ):
+        """The whole reason the budget may be short (#262).
+
+        Shortening a budget whose timeout path returns ``[]`` would only make
+        #913's false all-clear easier to hit. Each step reports instead.
+        """
+        def fake_changed(root, base, *, timeout=None, require_vcs=False):
+            return None if failing == "diff" else []
+
+        def fake_staged(root, *, timeout=None, require_vcs=False):
+            return None
+
+        with (
+            patch.object(
+                incremental_module, "get_changed_files_strict", fake_changed,
+            ),
+            patch.object(incremental_module, "get_staged_and_unstaged", fake_staged),
+            pytest.raises(GitUnavailableError) as excinfo,
+        ):
+            discover_review_changes(tmp_path, "HEAD~1")
+
+        assert "CRG_DISCOVERY_TIMEOUT" in str(excinfo.value)
+
+    def test_a_real_git_timeout_stays_inside_the_discovery_budget(
+        self, tmp_path, monkeypatch,
+    ):
+        """A git that hangs must not hold a review call for the general budget.
+
+        This is the #262 failure mode in one assertion: with only a slow git
+        shim and a repository marker, discovery answers -- with a failure
+        naming the budget -- inside the connect-the-subprocess count the
+        short budget allows, instead of the client timing out at -32001.
+        """
+        shim_dir = tmp_path / "shim"
+        shim_dir.mkdir()
+        if os.name == "nt":  # pragma: no cover - POSIX shim only
+            pytest.skip("POSIX shell shim")
+        shim = shim_dir / "git"
+        shim.write_text("#!/bin/sh\nsleep 30\n")
+        shim.chmod(0o755)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+        monkeypatch.setenv("CRG_DISCOVERY_TIMEOUT", "0.4")
+
+        started = time.monotonic()
+        with pytest.raises(GitUnavailableError) as excinfo:
+            discover_review_changes(repo, "HEAD~1")
+        elapsed = time.monotonic() - started
+
+        assert "CRG_DISCOVERY_TIMEOUT" in str(excinfo.value)
+        # The shim really ran: the two diff attempts each burned their 0.4s
+        # budget. Without the lower bound a fast "not a repository" failure
+        # would satisfy the assertion without proving the budget was used.
+        assert elapsed >= 0.5, f"discovery answered in {elapsed:.2f}s; shim unused?"
+        # Two diff attempts at 0.4s each, plus import/interpreter slop; the
+        # old 30-second-per-subprocess budget could never fit in this bound.
+        assert elapsed < 6, f"discovery took {elapsed:.1f}s"
+
+    def test_require_vcs_upgrades_a_dead_probe_to_unavailable(self, tmp_path):
+        """A repo with a ``.git`` marker and a git that cannot run is not clean.
+
+        The probe (``git rev-parse --git-dir``) normally distinguishes "not a
+        working tree" from "git is broken". Under ``require_vcs`` both must
+        read as unavailable, because a timeout that reaches the probe has
+        already said nothing about the working tree (#913).
+        """
+        (tmp_path / ".git").mkdir()
+        with (
+            patch.object(incremental_module, "_git_diff_output", lambda *a, **k: None),
+            patch.object(incremental_module, "_git_output", lambda *a, **k: None),
+        ):
+            assert get_changed_files_strict(tmp_path, "HEAD~1") == []
+            assert get_changed_files_strict(
+                tmp_path, "HEAD~1", require_vcs=True,
+            ) is None
+
+
+class TestVcsBudgetsDefaultToTheGitTimeout:
+    """Build, update and watch must keep the generous per-command budget."""
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_changed_files_defaults_to_git_timeout(self, mock_run, tmp_path):
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_changed_files(tmp_path, "HEAD~1")
+        assert mock_run.call_args.kwargs["timeout"] == incremental_module._GIT_TIMEOUT
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_get_staged_and_unstaged_defaults_to_git_timeout(
+        self, mock_run, tmp_path,
+    ):
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_staged_and_unstaged(tmp_path)
+        assert mock_run.call_args.kwargs["timeout"] == incremental_module._GIT_TIMEOUT
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_explicit_timeout_is_forwarded(self, mock_run, tmp_path):
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_changed_files(tmp_path, "HEAD~1", timeout=1.5)
+        assert mock_run.call_args.kwargs["timeout"] == 1.5
+
+    @patch("code_review_graph.incremental.subprocess.run")
+    def test_the_working_tree_walk_stays_untracked_files_all(
+        self, mock_run, tmp_path,
+    ):
+        """The scope was tried narrowed and withdrawn; do not re-narrow it.
+
+        ``--untracked-files=normal`` collapses a wholly-untracked directory
+        to one ``dir/`` record, which is not a path any caller can open, so
+        the first commit of a new package vanishes from every review tool
+        with ``status: ok``. The discovery budget bounds the walk instead.
+        """
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"")
+        get_staged_and_unstaged(tmp_path)
+        argv = mock_run.call_args.args[0]
+        assert "--untracked-files=all" in argv
+        assert "--untracked-files=normal" not in argv

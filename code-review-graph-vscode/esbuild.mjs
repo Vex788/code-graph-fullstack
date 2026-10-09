@@ -8,7 +8,7 @@ const extensionConfig = {
   entryPoints: ["src/extension.ts"],
   bundle: true,
   outfile: "dist/extension.js",
-  external: ["vscode", "node:sqlite"],
+  external: ["vscode", "better-sqlite3", "node:sqlite"],
   format: "cjs",
   platform: "node",
   target: "node18",

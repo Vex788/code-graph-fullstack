@@ -84,6 +84,87 @@ SECURITY_KEYWORDS: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# Version-control subprocess budgets
+# ---------------------------------------------------------------------------
+
+#: Seconds allowed for one Git or SVN subprocess. Build, incremental update
+#: and watch all inherit it, and they legitimately run long commands, so the
+#: default stays generous.
+#:
+#: Read once, at import: the value has to be stable for the life of a process
+#: so a long build cannot have the budget change underneath it. A test that
+#: sets ``CRG_GIT_TIMEOUT`` after import will not see it; set it in the child
+#: process's environment instead.
+#:
+#: Previously defined twice, at ``changes.py`` and ``incremental.py``. Two
+#: definitions of one budget is one too many -- they cannot be told apart at
+#: a call site and they drift. Both modules now alias this one.
+GIT_TIMEOUT = env_int("CRG_GIT_TIMEOUT", 30, minimum=1)  # seconds
+
+#: Seconds allowed for one subprocess in the change-discovery chain when
+#: neither ``CRG_DISCOVERY_TIMEOUT`` nor ``CRG_GIT_TIMEOUT`` is set.
+DISCOVERY_TIMEOUT_DEFAULT = 5.0
+
+#: Name of the variable that sets :func:`discovery_timeout` directly.
+DISCOVERY_TIMEOUT_ENV = "CRG_DISCOVERY_TIMEOUT"
+
+#: Name of the general Git budget's variable. Read here as a *string* to tell
+#: "the operator set this" from "it defaulted to 30", which :data:`GIT_TIMEOUT`
+#: alone cannot express.
+GIT_TIMEOUT_ENV = "CRG_GIT_TIMEOUT"
+
+
+def discovery_timeout() -> float:
+    """Return the per-subprocess budget for read-only change discovery.
+
+    Discovery is what a review tool runs when the caller did **not** pass
+    ``changed_files``: diff the review base, then fall back to the working
+    tree, three or four Git subprocesses in series. At the 30-second
+    :data:`GIT_TIMEOUT` default that chain has a two-minute worst case, which
+    is how one MCP review call overruns a client's request ceiling and comes
+    back as MCP error -32001 (#262). All discovery is ever answering is "what
+    am I looking at?", so it gets its own, far shorter budget by default, and
+    build/update/watch keep the generous one.
+
+    A short budget is only safe because the discovery chain fails loudly:
+    when a subprocess cannot answer within it,
+    :func:`~code_review_graph.incremental.discover_review_changes` raises
+    instead of returning an empty diff. Shortening a budget whose timeout
+    returns ``[]`` would only make a wrong all-clear more likely (#913).
+
+    Resolved on **every call**, deliberately. ``CRG_GIT_TIMEOUT`` is parsed
+    once at import into :data:`GIT_TIMEOUT`, so a test or a long-lived MCP
+    server that sets that variable afterwards never sees the new value.
+    Whatever these variables say when a discovery call starts is what that
+    call uses.
+
+    Precedence:
+
+    1. ``CRG_DISCOVERY_TIMEOUT``, when it parses as a number >= 0. Used as
+       given, including values above :data:`GIT_TIMEOUT` -- an explicit
+       override is an instruction, not a hint.
+    2. Otherwise ``CRG_GIT_TIMEOUT`` when the operator set it, verbatim.
+       Raising that variable is the documented answer to slow Git, and it
+       predates this one; a new default must not quietly cap it.
+    3. Otherwise :data:`DISCOVERY_TIMEOUT_DEFAULT`, capped at
+       :data:`GIT_TIMEOUT` so an unset-but-lowered general budget still wins.
+
+    An unparseable or negative value warns and falls back to the next rule
+    rather than leaving discovery unbounded or raising inside a tool call.
+    """
+    explicit_git = os.environ.get(GIT_TIMEOUT_ENV)
+    if explicit_git is not None and explicit_git.strip():
+        fallback = float(GIT_TIMEOUT)
+    else:
+        fallback = min(DISCOVERY_TIMEOUT_DEFAULT, float(GIT_TIMEOUT))
+
+    raw = os.environ.get(DISCOVERY_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return fallback
+    return env_float(DISCOVERY_TIMEOUT_ENV, fallback)
+
+
+# ---------------------------------------------------------------------------
 # Configurable limits (override via environment variables)
 # ---------------------------------------------------------------------------
 MAX_IMPACT_NODES = env_int("CRG_MAX_IMPACT_NODES", 500, minimum=1)
