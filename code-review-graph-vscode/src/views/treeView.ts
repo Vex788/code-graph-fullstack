@@ -17,7 +17,7 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<vscode.Tre
   readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | null> = this._onDidChangeTreeData.event;
 
   constructor(
-    private readonly reader: SqliteReader,
+    private readonly getReader: () => SqliteReader | undefined,
     private readonly workspaceRoot: string,
   ) {}
 
@@ -30,22 +30,26 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<vscode.Tre
   }
 
   getChildren(element?: vscode.TreeItem): vscode.ProviderResult<vscode.TreeItem[]> {
+    const reader = this.getReader();
+    if (!reader) {
+      return [];
+    }
     if (!element) {
-      return this.getRootChildren();
+      return this.getRootChildren(reader);
     }
     if (element instanceof FileTreeItem) {
-      return this.getFileChildren(element);
+      return this.getFileChildren(reader, element);
     }
     if (element instanceof SymbolTreeItem) {
-      return this.getSymbolChildren(element);
+      return this.getSymbolChildren(reader, element);
     }
     return [];
   }
 
   // -- Root level: one FileTreeItem per file --------------------------------
 
-  private getRootChildren(): vscode.TreeItem[] {
-    const files = this.reader.getAllFiles();
+  private getRootChildren(reader: SqliteReader): vscode.TreeItem[] {
+    const files = reader.getAllFiles();
     return files
       .slice()
       .sort((a, b) => a.localeCompare(b))
@@ -54,8 +58,8 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<vscode.Tre
 
   // -- File level: symbols (non-File nodes) sorted by line ------------------
 
-  private getFileChildren(fileItem: FileTreeItem): vscode.TreeItem[] {
-    const nodes = this.reader.getNodesByFile(fileItem.filePath);
+  private getFileChildren(reader: SqliteReader, fileItem: FileTreeItem): vscode.TreeItem[] {
+    const nodes = reader.getNodesByFile(fileItem.filePath);
     return nodes
       .filter((n) => n.kind !== 'File')
       .sort((a, b) => (a.lineStart ?? 0) - (b.lineStart ?? 0))
@@ -74,16 +78,16 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<vscode.Tre
 
   // -- Symbol level: outgoing + incoming edges (skip CONTAINS) --------------
 
-  private getSymbolChildren(symbolItem: SymbolTreeItem): vscode.TreeItem[] {
+  private getSymbolChildren(reader: SqliteReader, symbolItem: SymbolTreeItem): vscode.TreeItem[] {
     const items: vscode.TreeItem[] = [];
 
     // Outgoing edges
-    const outgoing = this.reader.getEdgesBySource(symbolItem.qualifiedName);
+    const outgoing = reader.getEdgesBySource(symbolItem.qualifiedName);
     for (const edge of outgoing) {
       if (edge.kind === 'CONTAINS') {
         continue;
       }
-      const targetNode = this.reader.getNode(edge.targetQualified);
+      const targetNode = reader.getNode(edge.targetQualified);
       const targetFile = targetNode?.filePath ?? edge.filePath;
       const targetLine = targetNode?.lineStart ?? edge.line;
       items.push(
@@ -98,12 +102,12 @@ export class CodeGraphTreeProvider implements vscode.TreeDataProvider<vscode.Tre
     }
 
     // Incoming edges
-    const incoming = this.reader.getEdgesByTarget(symbolItem.qualifiedName);
+    const incoming = reader.getEdgesByTarget(symbolItem.qualifiedName);
     for (const edge of incoming) {
       if (edge.kind === 'CONTAINS') {
         continue;
       }
-      const sourceNode = this.reader.getNode(edge.sourceQualified);
+      const sourceNode = reader.getNode(edge.sourceQualified);
       const sourceFile = sourceNode?.filePath ?? edge.filePath;
       const sourceLine = sourceNode?.lineStart ?? edge.line;
       items.push(
@@ -135,6 +139,10 @@ export class BlastRadiusTreeProvider implements vscode.TreeDataProvider<vscode.T
   setResults(changed: GraphNode[], impacted: GraphNode[]): void {
     this.changedNodes = changed;
     this.impactedNodes = impacted;
+    this._onDidChangeTreeData.fire(undefined);
+  }
+
+  refresh(): void {
     this._onDidChangeTreeData.fire(undefined);
   }
 
@@ -196,7 +204,7 @@ export class StatsTreeProvider implements vscode.TreeDataProvider<vscode.TreeIte
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null>();
   readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | null> = this._onDidChangeTreeData.event;
 
-  constructor(private readonly reader: SqliteReader) {}
+  constructor(private readonly getReader: () => SqliteReader | undefined) {}
 
   refresh(): void {
     this._onDidChangeTreeData.fire(undefined);
@@ -207,7 +215,11 @@ export class StatsTreeProvider implements vscode.TreeDataProvider<vscode.TreeIte
   }
 
   getChildren(): vscode.ProviderResult<vscode.TreeItem[]> {
-    const stats = this.reader.getStats();
+    const reader = this.getReader();
+    if (!reader) {
+      return [];
+    }
+    const stats = reader.getStats();
     const items: StatsItem[] = [];
 
     items.push(new StatsItem('Files', stats.filesCount.toLocaleString()));
