@@ -436,13 +436,18 @@ wheels = [
 
 [[package]]
 name = "code-graph-fullstack"
-version = "2.3.8+fs.6"
+version = "2.3.8+fs.9"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
     { name = "mcp" },
+    { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "pyyaml" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "tree-sitter" },
@@ -537,17 +542,20 @@ requires-dist = [
     { name = "code-graph-fullstack", extras = ["google-embeddings"], marker = "extra == 'all'" },
     { name = "code-graph-fullstack", extras = ["wiki"], marker = "extra == 'all'" },
     { name = "fastembed", marker = "extra == 'embeddings-onnx'", specifier = ">=0.8.0,<1" },
-    { name = "fastmcp", specifier = ">=3.2.4,<4" },
+    { name = "fastmcp", specifier = ">=3.2.4,<5" },
     { name = "google-genai", marker = "extra == 'google-embeddings'", specifier = ">=1.0.0,<3" },
     { name = "igraph", marker = "extra == 'communities'", specifier = ">=0.11.0" },
     { name = "jedi", marker = "extra == 'enrichment'", specifier = ">=0.19.2" },
     { name = "matplotlib", marker = "extra == 'eval'", specifier = ">=3.7.0" },
     { name = "mcp", specifier = ">=1.0.0,<3" },
+    { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.1.0,<1" },
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'embeddings-mlx'", specifier = ">=0.1.0,<1" },
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.0,<1" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'embeddings-mlx'", specifier = ">=0.31.0,<1" },
     { name = "model2vec", marker = "extra == 'embeddings-fast'", specifier = ">=0.6.0,<1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<3" },
     { name = "networkx", specifier = ">=3.2,<4" },
+    { name = "numpy", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=1.26,<3" },
     { name = "numpy", marker = "extra == 'embeddings'", specifier = ">=1.26,<3" },
     { name = "numpy", marker = "extra == 'embeddings-fast'", specifier = ">=1.26,<3" },
     { name = "numpy", marker = "extra == 'embeddings-mlx'", specifier = ">=1.26,<3" },
@@ -563,7 +571,7 @@ requires-dist = [
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0,<3" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'dev'", specifier = ">=2.0" },
     { name = "tree-sitter", specifier = ">=0.23.0,<1" },
-    { name = "tree-sitter-language-pack", specifier = ">=0.3.0,<1" },
+    { name = "tree-sitter-language-pack", specifier = ">=0.3.0,<2" },
     { name = "watchdog", specifier = ">=4.0.0,<7" },
 ]
 provides-extras = ["embeddings", "embeddings-fast", "embeddings-onnx", "embeddings-mlx", "google-embeddings", "communities", "eval", "wiki", "all", "enrichment", "dev"]

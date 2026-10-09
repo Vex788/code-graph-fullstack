@@ -56,6 +56,48 @@ def _run_embedding_refresh(
         )
 
 
+def _sync_fts_index(store: Any, build_result: dict[str, Any], *, repair: bool) -> None:
+    """Repair, or report, an FTS index that no longer tracks ``nodes``.
+
+    Row triggers keep ``nodes_fts`` in step with every node write, so an index
+    can only drift when those triggers are gone (an interrupted bulk load, an
+    older writer). A no-op update writes nothing, so nothing else would notice
+    and the next update would keep reporting an unfindable symbol as healthy.
+    The check is one ``sqlite_master`` count; the rebuild runs only on drift.
+
+    With ``repair=False`` (``--skip-postprocess``) the drift is reported as
+    ``fts_stale`` instead, so deferred derived state never reads as processed.
+
+    The pending-flows branch of a no-op update repairs through ``_run_postprocess``
+    instead; its own gate covers the same condition. The tests pin both.
+    """
+    try:
+        if fts_triggers_installed(store):
+            return
+    except sqlite3.OperationalError as e:
+        # Unknown is not healthy: report the drift rather than certify it.
+        logger.warning("FTS trigger check failed: %s", e)
+        build_result["fts_stale"] = True
+        build_result.setdefault("warnings", []).append(
+            f"FTS trigger check failed: {type(e).__name__}: {e}"
+        )
+        return
+    if not repair:
+        build_result["fts_stale"] = True
+        return
+    try:
+        from code_review_graph.search import rebuild_fts_index
+
+        build_result["fts_indexed"] = rebuild_fts_index(store)
+        build_result["fts_repaired"] = True
+    except (sqlite3.OperationalError, ImportError) as e:
+        logger.warning("FTS index rebuild failed: %s", e)
+        build_result["fts_stale"] = True
+        build_result.setdefault("warnings", []).append(
+            f"FTS index rebuild failed: {type(e).__name__}: {e}"
+        )
+
+
 def _run_postprocess(
     store: Any,
     build_result: dict[str, Any],
@@ -87,6 +129,9 @@ def _run_postprocess(
         build_result["flows_stale"] = read_flows_stale(store) is not None
 
     if postprocess == "none":
+        # Nothing will re-sync a drifting index on this run, so say so instead
+        # of leaving the caller to read an ordinary success as a synced graph.
+        _sync_fts_index(store, build_result, repair=False)
         _run_embedding_refresh(
             store,
             build_result,
@@ -146,7 +191,10 @@ def _run_postprocess(
             build_result["fts_indexed"] = fts_count
             build_result["fts_rebuilt"] = True
     except (sqlite3.OperationalError, ImportError) as e:
+        # The build/update path does not print this list, so the drift signal
+        # has to ride on the result: a failed rebuild must not read as clean.
         logger.warning("FTS index rebuild failed: %s", e)
+        build_result["fts_stale"] = True
         warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
     timing["fts_s"] = max(
         0.0,
@@ -661,6 +709,11 @@ def _build_locked(
                 warnings = _run_postprocess(store, unchanged, postprocess, repo_root=root)
                 if warnings:
                     unchanged["warnings"] = warnings
+            else:
+                # No source change means no write will re-sync a stale index, so
+                # the FTS drift this graph already carries is settled here rather
+                # than certified by an "up to date" answer.
+                _sync_fts_index(store, unchanged, repair=postprocess != "none")
             return unchanged
         build_result = {
             **result,
@@ -780,6 +833,7 @@ def run_postprocess(
             except (sqlite3.OperationalError, ImportError) as e:
                 store.rollback()
                 logger.warning("FTS index rebuild failed: %s", e)
+                result["fts_stale"] = True
                 warnings.append(f"FTS index rebuild failed: {type(e).__name__}: {e}")
 
         if flows:

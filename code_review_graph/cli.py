@@ -656,6 +656,26 @@ def _print_missing_graph_status(repo_root: Path, db_path: Path) -> None:
     }))
 
 
+def _report_fts_drift(result: dict) -> None:
+    """Tell the user when the search index is not in step with the graph.
+
+    A build line that reads as ordinary success while symbols are unfindable
+    is the defect this exists for: the drift is deferred or repaired elsewhere,
+    and the person watching the command is the only one who can act on it.
+    """
+    if result.get("fts_stale"):
+        print(
+            "WARNING: FTS index is out of sync (nodes_fts triggers missing). "
+            "Symbols may not be searchable. Run 'code-review-graph postprocess' "
+            "to rebuild it.",
+            file=sys.stderr,
+        )
+    elif result.get("fts_repaired") or result.get("fts_rebuilt"):
+        # fts_repaired: this run rebuilt the index. fts_rebuilt: the pending-flows
+        # branch of a no-op update did, through the post-processing gate.
+        print(f"Repaired stale FTS index: {result.get('fts_indexed')} entries")
+
+
 def _finish_build(result: dict, progress) -> int:
     """Record a finished build; ``partial`` exits 3 (degraded), ``error`` 1."""
     from .locking import EXIT_DEGRADED, EXIT_ERROR, EXIT_OK
@@ -2039,6 +2059,11 @@ def main() -> None:
             if result.get("fts_indexed"):
                 parts.append(f"{result['fts_indexed']} FTS entries")
             print(f"Post-processing: {', '.join(parts) or 'done'}")
+            # This is the command a stale-index warning points at, so it must not
+            # answer "done" when the very rebuild it was asked for failed.
+            _report_fts_drift(result)
+            for warning in result.get("warnings") or ():
+                print(f"WARNING: {warning}", file=sys.stderr)
         return
 
     if args.command == "embed":
@@ -2214,6 +2239,7 @@ def main() -> None:
                 )
                 if result.get("errors"):
                     print(f"Errors: {len(result['errors'])}")
+                _report_fts_drift(result)
             if exit_code:
                 sys.exit(exit_code)
 
@@ -2271,6 +2297,8 @@ def main() -> None:
                         f"{nodes} nodes, {edges} edges"
                         f" (postprocess={pp})"
                     )
+            if not args.quiet:
+                _report_fts_drift(result)
 
             # --brief: append a one-line change-impact summary with the same
             # estimated context-savings approximation that detect-changes uses.
