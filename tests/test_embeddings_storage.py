@@ -208,8 +208,9 @@ def test_top_k_matches_full_sort(tmp_path):
         norm = float(np.linalg.norm(query))
         fast = store._search_vectorized(np, query, norm, provider.name, 25)
         # argpartition top-k equals a full sort of the same matrix...
-        names, mat = store._matrix(np, provider.name, 4)
+        names, mat, norms = store._matrix(np, provider.name, 4)
         sims = mat.astype(np.float32) @ (np.asarray(query, dtype=np.float32) / norm)
+        np.divide(sims, norms, out=sims, where=norms > 0)
         assert [n for n, _ in fast] == [names[i] for i in np.argsort(-sims, kind="stable")[:25]]
         # ...and the pure-Python path agrees within float16 storage tolerance.
         slow = store._search_pure_python(query, provider.name, 25)

@@ -22,6 +22,7 @@ import collections
 import contextlib
 import hashlib
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -1079,6 +1080,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     text_hash TEXT NOT NULL,
     provider TEXT NOT NULL DEFAULT 'unknown'
 );
+CREATE INDEX IF NOT EXISTS idx_embeddings_provider ON embeddings(provider);
 """
 
 
@@ -1097,10 +1099,10 @@ _STORED_DTYPES = {"float16": "e", "float32": "f"}
 _SQL_CHUNK = 500
 _MATMUL_CHUNK = 16384
 _MATRIX_CACHE_MAX = 4
-# (db path, provider id, dim) -> (change token, names, unit-row matrix)
-_matrix_cache: collections.OrderedDict[tuple[str, str, int], tuple[Any, list[str], Any]] = (
-    collections.OrderedDict()
-)
+# (db path, provider id, dim) -> (change token, names, row matrix, row norms)
+_matrix_cache: collections.OrderedDict[
+    tuple[str, str, int], tuple[Any, list[str], Any, Any]
+] = collections.OrderedDict()
 _local_generation: dict[str, int] = {}
 _matrix_lock = threading.Lock()
 
@@ -1132,7 +1134,12 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
+    # NaN fails every comparison, so test the norms positively and check they
+    # are finite: a stored non-finite row scores 0.0 rather than sorting to
+    # the top of the ranking as NaN.
+    if not (norm_a > 0 and norm_b > 0):
+        return 0.0
+    if not (math.isfinite(norm_a) and math.isfinite(norm_b)):
         return 0.0
     return dot / (norm_a * norm_b)
 
@@ -1477,6 +1484,10 @@ class EmbeddingStore:
         """
         if not self.provider:
             return []
+        # A non-positive limit can never return rows; bail out before touching
+        # the database or loading an embedding model for the query.
+        if limit <= 0:
+            return []
 
         provider_name = self.provider.name
         # Checked before embedding the query so an empty index never loads a model.
@@ -1486,7 +1497,9 @@ class EmbeddingStore:
             return []
         query_vec = list(self.provider.embed_query(query))
         query_norm = sum(x * x for x in query_vec) ** 0.5
-        if query_norm == 0.0:
+        # NaN fails every comparison, so test it positively: a provider that
+        # emits a non-finite vector must not rank the whole index.
+        if not (query_norm > 0.0) or not math.isfinite(query_norm):
             return []
 
         try:
@@ -1512,11 +1525,15 @@ class EmbeddingStore:
             local = _local_generation.get(_db_key(self.db_path), 0)
         return (local, generation, count, max_rowid)
 
-    def _matrix(self, np: Any, provider_name: str, dim: int) -> tuple[list[str], Any]:
-        """Unit-length rows of one provider and dimension, cached until the table changes.
+    def _matrix(
+        self, np: Any, provider_name: str, dim: int,
+    ) -> tuple[list[str], Any, Any]:
+        """Rows of one provider and dimension, cached until the table changes.
 
-        float16 rows stay float16 in memory (half the RAM); any float32 row
-        makes the matrix float32 so legacy rows keep full precision.
+        Returns ``(names, matrix, norms)``. float16 rows stay float16 in
+        memory (half the RAM); any float32 row makes the matrix float32 so
+        legacy rows keep full precision. ``norms`` holds each row's real
+        length so the caller can divide by it.
         """
         key = (_db_key(self.db_path), provider_name, dim)
         token = self._cache_token()
@@ -1524,7 +1541,7 @@ class EmbeddingStore:
             cached = _matrix_cache.get(key)
             if cached is not None and cached[0] == token:
                 _matrix_cache.move_to_end(key)
-                return cached[1], cached[2]
+                return cached[1], cached[2], cached[3]
 
         names: list[str] = []
         half: list[tuple[int, bytes]] = []
@@ -1562,18 +1579,33 @@ class EmbeddingStore:
                 idx = np.fromiter((i for i, _ in group), dtype=np.int64, count=len(group))
                 raw = b"".join(blob for _, blob in group)
                 mat[idx] = np.frombuffer(raw, dtype=np_dtype).reshape(len(group), dim)
-        if full:
-            # Legacy float32 rows were stored unnormalized.
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            nonzero = norms[:, 0] > 0
-            mat[nonzero] = mat[nonzero] / norms[nonzero]
+        # Row norms are kept beside the matrix rather than divided into it. A
+        # float16 row is only unit-length to within the format's rounding
+        # (~6e-5), and renormalizing in float32 then storing back into float16
+        # just reintroduces that error, so the matrix can never be made exactly
+        # unit in its own dtype. Dividing the scores instead keeps the memory
+        # saving and matches _cosine_similarity, which divides by the row's
+        # real norm. Legacy float32 rows were stored unnormalized, so they need
+        # this too. Norms are taken in float32 to avoid upcasting the matrix.
+        norms = np.empty(len(names), dtype=np.float32)
+        for start in range(0, len(names), _MATMUL_CHUNK):
+            stop = start + _MATMUL_CHUNK
+            block = mat[start:stop].astype(np.float32)
+            block_norms = np.linalg.norm(block, axis=1)
+            finite = np.isfinite(block_norms)
+            # A non-finite row would poison the ranking with NaN; zero it so it
+            # scores 0.0 like the scalar path.
+            block[~finite] = 0.0
+            mat[start:stop] = block
+            block_norms[~finite] = 1.0
+            norms[start:stop] = block_norms
 
         with _matrix_lock:
-            _matrix_cache[key] = (token, names, mat)
+            _matrix_cache[key] = (token, names, mat, norms)
             _matrix_cache.move_to_end(key)
             while len(_matrix_cache) > _MATRIX_CACHE_MAX:
                 _matrix_cache.popitem(last=False)
-        return names, mat
+        return names, mat, norms
 
     def _search_vectorized(
         self, np: Any, query_vec: list[float], query_norm: float,
@@ -1581,12 +1613,12 @@ class EmbeddingStore:
     ) -> list[tuple[str, float]]:
         """Rank stored vectors against ``query_vec`` using numpy.
 
-        ``query_norm`` must already be known non-zero (checked by ``search``).
-        A stored zero-norm row stays all zeros, so it scores 0.0 rather
-        than a division-by-zero/NaN.
+        ``query_norm`` must already be known non-zero and finite (checked by
+        ``search``). A stored zero-norm row scores 0.0 rather than dividing by
+        zero, and a non-finite row is zeroed in ``_matrix``.
         """
         q = np.asarray(query_vec, dtype=np.float32) / np.float32(query_norm)
-        names, mat = self._matrix(np, provider_name, len(query_vec))
+        names, mat, norms = self._matrix(np, provider_name, len(query_vec))
         if not names or limit <= 0:
             return []
         if mat.dtype == np.float32:
@@ -1597,6 +1629,8 @@ class EmbeddingStore:
             for start in range(0, len(names), _MATMUL_CHUNK):
                 stop = start + _MATMUL_CHUNK
                 sims[start:stop] = mat[start:stop].astype(np.float32) @ q
+        # Divide by each row's real norm; a zero norm keeps the row at 0.0.
+        np.divide(sims, norms, out=sims, where=norms > 0)
         k = min(limit, len(names))
         top = np.argpartition(-sims, k - 1)[:k] if k < len(names) else np.arange(len(names))
         top = top[np.argsort(-sims[top], kind="stable")]
@@ -1624,7 +1658,7 @@ class EmbeddingStore:
                 scored.append((row["qualified_name"], _cosine_similarity(query_vec, vec)))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:limit]
+        return scored[:limit] if limit > 0 else []
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
