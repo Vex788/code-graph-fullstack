@@ -84,6 +84,12 @@ The graph database is stored locally at `.code-review-graph/graph.db` and update
 - Python 3.10+ (for the backend CLI)
 - A workspace with source code to analyze
 
+The graph database is read with the SQLite module built into the extension
+host (`node:sqlite`, Node.js 22.13+; current VS Code desktop, WSL, SSH and
+Codespaces releases all provide it). On an older runtime a locally installed
+`better-sqlite3` is used as a fallback; if neither exists, the extension
+stays active and reports the missing engine instead of failing to activate.
+
 ## Links
 
 - [Main Repository](https://github.com/tirth8205/code-review-graph)

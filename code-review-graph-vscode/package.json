@@ -2,7 +2,7 @@
   "name": "code-review-graph",
   "displayName": "Code Review Graph",
   "description": "Visualize code dependencies, blast radius, and review context from your code-review-graph database directly in VS Code.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publisher": "tirth8205",
   "license": "MIT",
   "icon": "media/icons/icon.png",
@@ -290,14 +290,17 @@
   "scripts": {
     "compile": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
+    "vscode:prepublish": "node esbuild.mjs --production",
     "package": "vsce package",
     "lint": "tsc --noEmit",
-    "test": "node --experimental-vm-modules node_modules/@vscode/test-electron/out/runTest.js"
+    "pretest": "node esbuild.mjs",
+    "test": "node --test test/sqlite-reader.test.cjs",
+    "test:activation": "node test/activation.smoke.cjs"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/d3": "^7.4.3",
-    "@types/node": "^20.11.0",
+    "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/test-electron": "^2.3.8",
     "@vscode/vsce": "^2.22.0",
@@ -305,7 +308,9 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
-    "better-sqlite3": "^12.4.1",
     "d3": "^7.9.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^12.8.0"
   }
 }
