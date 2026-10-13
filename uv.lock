@@ -444,6 +444,7 @@ dependencies = [
     { name = "mcp" },
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -554,6 +555,7 @@ requires-dist = [
     { name = "mlx-embeddings", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'embeddings-mlx'", specifier = ">=0.1.0,<1" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.31.0,<1" },
     { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'embeddings-mlx'", specifier = ">=0.31.0,<1" },
+    { name = "mlx-vlm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", git = "https://github.com/Blaizzy/mlx-vlm.git?rev=3d87e88402f307efbf68e568971aa887ee7d9ed0" },
     { name = "model2vec", marker = "extra == 'embeddings-fast'", specifier = ">=0.6.0,<1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<3" },
     { name = "networkx", specifier = ">=3.2,<4" },
@@ -2275,8 +2277,8 @@ wheels = [
 
 [[package]]
 name = "mlx-vlm"
-version = "0.7.3"
-source = { registry = "https://pypi.org/simple" }
+version = "0.7.4"
+source = { git = "https://github.com/Blaizzy/mlx-vlm.git?rev=3d87e88402f307efbf68e568971aa887ee7d9ed0#3d87e88402f307efbf68e568971aa887ee7d9ed0" }
 dependencies = [
     { name = "fastapi", marker = "sys_platform != 'win32'" },
     { name = "jinja2", marker = "sys_platform != 'win32'" },
@@ -2297,10 +2299,6 @@ dependencies = [
     { name = "transformers", marker = "sys_platform != 'win32'" },
     { name = "uvicorn", marker = "sys_platform != 'win32'" },
     { name = "websockets", marker = "sys_platform != 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f2/fd/4ae6ceb9f9a3132c73e6cc44cf976baf1d27c518ebfec0ac6eeffed0fdce/mlx_vlm-0.7.3.tar.gz", hash = "sha256:8b656dc280d272c5e8b1ac03a7b72f52592eed8e98cc112e88d36bbf9cf7b82b", size = 2456521, upload-time = "2026-09-24T16:02:24.597Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/3d/ada521d38e8c8e3a6c7543fe4dca7b6937579b0be482cfc63471b9904a76/mlx_vlm-0.7.3-py3-none-any.whl", hash = "sha256:f94eb3c5235a43f10ec4352ccd459a228070d3cd36f0dcad9af33986069cde04", size = 3085184, upload-time = "2026-09-24T16:02:22.699Z" },
 ]
 
 [[package]]

@@ -7,9 +7,12 @@ optional backends are importable, so every branch is testable without a model.
 profile    backend (first importable wins)              dim     extra
 =========  ===========================================  ======  ====================
 fast       model2vec ``minishlab/potion-code-16M-v2``   256     embeddings-fast
-balanced   MLX ``mlx-embeddings`` (darwin-arm64, a      256     embeddings-mlx
-           dependency there, so it just works), else            embeddings-onnx
-           fastembed ONNX ``google/embeddinggemma-300m``
+balanced   mlx-vlm ``nativ-community/embeddinggemma-2- 256     embeddings-mlx
+           bf16`` (darwin-arm64, a dependency there, so
+           it just works); else MLX ``mlx-embeddings``
+           ``mlx-community/embeddinggemma-300m-bf16``;
+           else fastembed ONNX ``google/embeddinggemma-
+           300m``
 accurate   mlx-lm ``Qwen3-Embedding-0.6B-4bit-DWQ``     512     embeddings-mlx
            (darwin-arm64 only; elsewhere -> balanced)
 legacy     sentence-transformers ``BAAI/bge-small-en-v1.5``  384  embeddings
@@ -63,6 +66,13 @@ FAST = BackendSpec(
     "model2vec", "model2vec", "minishlab/potion-code-16M-v2", "f32",
     256, 256, True, "embeddings-fast",
 )
+# EmbeddingGemma 2 is the fork's default on Apple Silicon; it needs mlx-vlm's
+# embedding loader (PyPI releases lack the embedding_gemma2 architecture), so
+# the package pins the revision from the model card as a darwin-arm64 dep.
+GEMMA2_MLX = BackendSpec(
+    "mlx-vlm", "mlx_vlm", "nativ-community/embeddinggemma-2-bf16", "bf16",
+    768, 256, True, "embeddings-mlx", (MAC_ARM,), max_tokens=2048,
+)
 BALANCED_MLX = BackendSpec(
     "mlx", "mlx_embeddings", "mlx-community/embeddinggemma-300m-bf16", "bf16",
     768, 256, True, "embeddings-mlx", (MAC_ARM,), max_tokens=2048,
@@ -82,7 +92,7 @@ LEGACY = BackendSpec(
 
 PROFILE_BACKENDS: dict[str, tuple[BackendSpec, ...]] = {
     "fast": (FAST,),
-    "balanced": (BALANCED_MLX, BALANCED_ONNX),
+    "balanced": (GEMMA2_MLX, BALANCED_MLX, BALANCED_ONNX),
     "accurate": (ACCURATE_MLX,),
     "legacy": (LEGACY,),
 }
@@ -226,6 +236,7 @@ __all__ = [
     "BALANCED_ONNX",
     "BackendSpec",
     "FAST",
+    "GEMMA2_MLX",
     "LEGACY",
     "MAC_ARM",
     "PARITY_MIN_COSINE",

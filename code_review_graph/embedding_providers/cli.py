@@ -107,6 +107,13 @@ def check_mlx_parity(db_path: Path, settings: EmbeddingSettings) -> Optional[dic
         return None
     if not (module_available(BALANCED_MLX.module) and module_available(BALANCED_ONNX.module)):
         return None
+    # The check only means something while the MLX side is the ONNX model's own
+    # twin. EmbeddingGemma 2 serves `balanced` here now and has no ONNX
+    # reference to compare against, so there is nothing to record.
+    from .profiles import resolve_profile
+
+    if resolve_profile(settings).spec is not BALANCED_MLX:
+        return None
     dim = settings.dim or BALANCED_MLX.default_dim
     model = settings.model or BALANCED_MLX.model
     record: dict[str, Any] = {"model": model, "reference": BALANCED_ONNX.model,

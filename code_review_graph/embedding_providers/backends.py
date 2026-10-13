@@ -21,8 +21,10 @@ from .profiles import BackendSpec
 
 logger = logging.getLogger(__name__)
 
-# EmbeddingGemma prompts (fastembed's model description for google/embeddinggemma-300m).
-GEMMA_QUERY = "task: search result | query: {text}"
+# EmbeddingGemma prompts. The code-retrieval task is the one this tool asks
+# for: on the fullstack fixture it takes EmbeddingGemma 2 from 19/20 to 20/20
+# recall@10 (256d) and leaves EmbeddingGemma 1 unchanged at 19/20.
+GEMMA_QUERY = "task: code retrieval | query: {text}"
 GEMMA_DOCUMENT = "title: none | text: {text}"
 # Qwen3-Embedding: instruction on queries only, documents stay raw.
 QWEN_QUERY = (
@@ -284,11 +286,53 @@ class MlxLmProvider(LocalModelProvider):
         _mlx_clear_cache()
 
 
+class MlxVlmProvider(LocalModelProvider):
+    """EmbeddingGemma 2 on Apple Silicon through mlx-vlm's embedding loader."""
+
+    query_template = GEMMA_QUERY
+    document_template = GEMMA_DOCUMENT
+
+    def _load(self) -> Any:
+        import mlx.core as mx
+        from mlx_vlm.embedding_loader import load_embedding_model
+        from mlx_vlm.utils import get_model_path
+        from transformers import AutoTokenizer
+
+        # Same Metal buffer cache cap as the mlx-embeddings path.
+        limit = getattr(mx, "set_cache_limit", None) or getattr(
+            getattr(mx, "metal", None), "set_cache_limit", None)
+        if limit is not None:
+            limit(MLX_CACHE_BYTES)
+        path = get_model_path(self.model_name)
+        return (load_embedding_model(path), AutoTokenizer.from_pretrained(path))
+
+    def _encode(self, model: Any, texts: list[str], query: bool) -> Any:
+        import mlx.core as mx
+        import numpy as np
+
+        net, tokenizer = model
+        # The tokenizer takes numpy tensors; the net is called with keyword
+        # arrays (the model card's contract) and returns unit-norm .text_embeds.
+        batch = tokenizer(
+            texts, return_tensors="np", padding=True,
+            truncation=True, max_length=self.spec.max_tokens,
+            pad_to_multiple_of=MLX_PAD_MULTIPLE,
+        )
+        inputs = {k: mx.array(v) for k, v in batch.items()
+                  if k in ("input_ids", "attention_mask")}
+        outputs = net(**inputs)
+        return np.array(outputs.text_embeds.astype(mx.float32))
+
+    def _release(self) -> None:
+        _mlx_clear_cache()
+
+
 BACKEND_CLASSES: dict[str, type[LocalModelProvider]] = {
     "model2vec": Model2VecProvider,
     "onnx": FastEmbedProvider,
     "mlx": MlxEmbeddingsProvider,
     "mlx-lm": MlxLmProvider,
+    "mlx-vlm": MlxVlmProvider,
 }
 
 # Short code/NL snippets for the MLX-vs-ONNX parity check at `embeddings enable`.
@@ -323,6 +367,7 @@ __all__ = [
     "LocalModelProvider",
     "MlxEmbeddingsProvider",
     "MlxLmProvider",
+    "MlxVlmProvider",
     "Model2VecProvider",
     "PARITY_TEXTS",
     "QWEN_QUERY",

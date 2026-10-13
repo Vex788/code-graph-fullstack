@@ -46,6 +46,10 @@ dependencies = [
     # balanced embeddings (EmbeddingGemma on MLX) work out of the box on Apple Silicon
     "mlx-embeddings>=0.1.0,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.31.0,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",  # mlx-embeddings' gemma3 imports it
+    # EmbeddingGemma 2 (the default `balanced` model) needs mlx-vlm's embedding
+    # loader; no PyPI release carries the embedding_gemma2 architecture yet, so
+    # the revision pinned by the model card is a direct reference.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm.git@3d87e88402f307efbf68e568971aa887ee7d9ed0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26,<3; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
@@ -117,6 +121,10 @@ dev = [
     "ruff>=0.3.0,<1",
     "tomli>=2.0; python_version < '3.11'",
 ]
+
+[tool.hatch.metadata]
+# mlx-vlm's EmbeddingGemma 2 support lives on a git revision, not a release.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["code_review_graph"]

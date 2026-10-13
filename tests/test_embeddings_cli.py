@@ -189,7 +189,9 @@ def test_parity_check_records_result_and_gates_mlx(tmp_path, monkeypatch, mlx_ve
     repo = _repo(tmp_path)
     db = repo / ".code-review-graph" / "graph.db"
     monkeypatch.setattr(profiles, "platform_key", lambda: profiles.MAC_ARM)
-    monkeypatch.setattr(profiles, "module_available", lambda name: True)
+    # EmbeddingGemma 2 absent: `balanced` falls back to the EG-1 MLX lane, which
+    # is the pair the parity gate compares against the ONNX reference.
+    monkeypatch.setattr(profiles, "module_available", lambda name: name != "mlx_vlm")
     monkeypatch.setattr(backends, "MlxEmbeddingsProvider", _fake_backend(mlx_vec))
     monkeypatch.setattr(backends, "FastEmbedProvider", _fake_backend([1.0] * 768))
     settings = EmbeddingSettings(enabled=True, profile="balanced")
@@ -201,8 +203,18 @@ def test_parity_check_records_result_and_gates_mlx(tmp_path, monkeypatch, mlx_ve
         # A different MLX model was never checked.
         assert embeddings.mlx_parity_for(conn, "other/model") is None
     res = profiles.resolve_profile(settings, platform=profiles.MAC_ARM,
-                                   has_module=lambda name: True, mlx_parity=ok)
+                                   has_module=lambda name: name != "mlx_vlm", mlx_parity=ok)
     assert res.spec.backend == ("mlx" if ok else "onnx")
+
+
+def test_parity_check_skips_when_embeddinggemma2_serves_balanced(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    db = repo / ".code-review-graph" / "graph.db"
+    monkeypatch.setattr(profiles, "platform_key", lambda: profiles.MAC_ARM)
+    monkeypatch.setattr(profiles, "module_available", lambda name: True)
+    assert emb_cli.check_mlx_parity(db, EmbeddingSettings(enabled=True, profile="balanced")) is None
+    with sqlite3.connect(db) as conn:
+        assert embeddings.mlx_parity_for(conn, profiles.BALANCED_MLX.model) is None
 
 
 def test_parity_check_skips_off_mac(tmp_path, monkeypatch):
@@ -221,7 +233,7 @@ def test_parity_backend_failure_means_onnx(tmp_path, monkeypatch):
             raise RuntimeError("no metal device")
 
     monkeypatch.setattr(profiles, "platform_key", lambda: profiles.MAC_ARM)
-    monkeypatch.setattr(profiles, "module_available", lambda name: True)
+    monkeypatch.setattr(profiles, "module_available", lambda name: name != "mlx_vlm")
     monkeypatch.setattr(backends, "MlxEmbeddingsProvider", Broken)
     monkeypatch.setattr(backends, "FastEmbedProvider", _fake_backend([1.0] * 768))
     record = emb_cli.check_mlx_parity(repo / ".code-review-graph" / "graph.db",

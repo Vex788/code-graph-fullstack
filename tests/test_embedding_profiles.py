@@ -21,6 +21,13 @@ try:
 except ImportError:  # the dev-only lane has no embedding extras
     np = None
 
+try:
+    # Imported before any test patches sys.modules["mlx"]: transformers probes
+    # the mlx package at import time and a fake module has no __spec__.
+    import transformers
+except ImportError:  # the dev-only lane has no embedding extras
+    transformers = None
+
 needs_numpy = pytest.mark.skipif(np is None, reason="local backends need numpy")
 
 MAC = "darwin-arm64"
@@ -226,8 +233,57 @@ def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fak
     query = provider.embed_query("find x")
     assert loads == [profiles.BALANCED_MLX.model]
     assert calls == [["title: none | text: a", "title: none | text: b"],
-                     ["task: search result | query: find x"]]
+                     ["task: code retrieval | query: find x"]]
     assert all(args[1] is not None for args in net_args)
+    assert len(docs[0]) == 256 and docs[0][:2] == pytest.approx([0.6, 0.8])
+    assert query[:2] == pytest.approx([0.6, 0.8])
+    provider.unload()
+    assert not provider.loaded and fake_mlx.cleared == 1
+
+
+@needs_numpy
+def test_mlx_vlm_provider_prompts_truncates_and_releases(monkeypatch, fake_mlx):
+    if transformers is None:
+        pytest.skip("transformers not installed")
+    calls: list[list[str]] = []
+    call_kwargs: list[set] = []
+
+    class _Net:
+        def __call__(self, **inputs):
+            call_kwargs.append(set(inputs))
+            out = np.zeros((len(inputs["input_ids"]), 768), dtype=np.float32)
+            out[:, 0], out[:, 1], out[:, 300] = 3.0, 4.0, 100.0  # beyond the 256 prefix
+            return SimpleNamespace(text_embeds=_mx_array(out))
+
+    def tokenizer(texts, return_tensors, padding, truncation, max_length, pad_to_multiple_of=None):
+        assert return_tensors == "np" and padding and truncation
+        assert max_length == profiles.GEMMA2_MLX.max_tokens == 2048
+        assert pad_to_multiple_of == backends.MLX_PAD_MULTIPLE
+        calls.append(list(texts))
+        n = max(len(t) for t in texts)
+        return {"input_ids": np.full((len(texts), n), 1),
+                "attention_mask": np.ones((len(texts), n))}
+
+    loaded: list[str] = []
+    loader = ModuleType("mlx_vlm.embedding_loader")
+    loader.load_embedding_model = lambda path: loaded.append(path) or _Net()
+    utils = ModuleType("mlx_vlm.utils")
+    utils.get_model_path = lambda name: f"/models/{name}"
+    monkeypatch.setitem(sys.modules, "mlx_vlm", ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.embedding_loader", loader)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained",
+                        lambda path, *args, **kwargs: tokenizer)
+
+    provider = backends.MlxVlmProvider(
+        profiles.GEMMA2_MLX, profiles.GEMMA2_MLX.model, 256, idle_unload_s=0,
+    )
+    docs = provider.embed_documents(["a", "b"])
+    query = provider.embed_query("find x")
+    assert loaded == ["/models/nativ-community/embeddinggemma-2-bf16"]
+    assert calls == [["title: none | text: a", "title: none | text: b"],
+                     ["task: code retrieval | query: find x"]]
+    assert call_kwargs and call_kwargs[0] == {"input_ids", "attention_mask"}
     assert len(docs[0]) == 256 and docs[0][:2] == pytest.approx([0.6, 0.8])
     assert query[:2] == pytest.approx([0.6, 0.8])
     provider.unload()
@@ -334,7 +390,7 @@ def test_fastembed_provider_uses_gemma_prompts_and_threads(monkeypatch):
     provider.embed_query("q")
     assert seen["init"] == ("google/embeddinggemma-300m", 3)
     assert seen["texts"] == [["title: none | text: a"], ["title: none | text: bb"],
-                             ["task: search result | query: q"]]
+                             ["task: code retrieval | query: q"]]
 
 
 class _CountingProvider(backends.LocalModelProvider):
@@ -398,6 +454,8 @@ def test_truncation_window_never_exceeds_the_trained_model_window():
     # EmbeddingGemma is trained at 2048 tokens; beyond it vectors are
     # out-of-distribution but still normalized and persisted. The two balanced
     # backends must agree so the same profile cannot yield two vector spaces.
+    assert profiles.PROFILE_BACKENDS["balanced"][0] is profiles.GEMMA2_MLX
+    assert profiles.GEMMA2_MLX.max_tokens == 2048
     assert profiles.BALANCED_MLX.max_tokens == 2048
     assert profiles.BALANCED_ONNX.max_tokens == profiles.BALANCED_MLX.max_tokens
     assert profiles.ACCURATE_MLX.max_tokens == 8192

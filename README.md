@@ -104,7 +104,7 @@ answered. `CRG_EMBEDDINGS=off|on|fast|balanced|accurate|legacy` overrides the
 | Profile | Backend (first importable wins) | Dim | Extra |
 |---|---|---|---|
 | `fast` | model2vec `minishlab/potion-code-16M-v2` | 256 | `embeddings-fast` |
-| `balanced` | MLX on Apple Silicon (after an ONNX parity check), else fastembed ONNX `google/embeddinggemma-300m` | 256 | `embeddings-onnx` / `embeddings-mlx` |
+| `balanced` | mlx-vlm `nativ-community/embeddinggemma-2-bf16` on Apple Silicon; else MLX `mlx-community/embeddinggemma-300m-bf16` (after an ONNX parity check); else fastembed ONNX `google/embeddinggemma-300m` | 256 | `embeddings-onnx` / `embeddings-mlx` |
 | `accurate` | mlx-lm `Qwen3-Embedding-0.6B-4bit-DWQ` (Apple Silicon; elsewhere falls back to `balanced`) | 512 | `embeddings-mlx` |
 | `legacy` | sentence-transformers `BAAI/bge-small-en-v1.5` | 384 | `embeddings` |
 
