@@ -43,7 +43,9 @@ a stale or half-written graph.
   the write transaction, so there is no separate rebuild step.
 - **Embeddings profiles, off by default.** `fast`, `balanced`, `accurate` and
   `legacy` profiles store normalized float16 vectors and re-embed only changed
-  nodes in the background.
+  nodes in the background. The default `balanced` model is EmbeddingGemma 2
+  (mlx-vlm, 768d MRL to 256) on Apple Silicon; Linux and Windows run the
+  ONNX EmbeddingGemma 1 fallback until the EmbeddingGemma 2 ONNX backend lands.
 - **Harness kit.** The hook, skills, agent blocks and rules for Claude Code, ZCode and
   the bug-hunter plugin ship in the package. One command, `laya harness-apply`,
   syncs them.
@@ -90,7 +92,7 @@ Register the server with your MCP client using the command
 `code-review-graph serve --tools agent`. After that, `update` (or the harness hook)
 keeps the graph current. Pass `--tools all` to expose all 35 tools.
 
-## Semantic search in one line
+## Embeddings and semantic search
 
 ```bash
 code-review-graph embeddings enable --profile balanced
@@ -101,17 +103,34 @@ Embeddings are **off by default**. Search then runs keyword/FTS, and
 answered. `CRG_EMBEDDINGS=off|on|fast|balanced|accurate|legacy` overrides the
 `[embeddings]` table in `.code-review-graph.toml`.
 
-| Profile | Backend (first importable wins) | Dim | Extra |
-|---|---|---|---|
-| `fast` | model2vec `minishlab/potion-code-16M-v2` | 256 | `embeddings-fast` |
-| `balanced` | mlx-vlm `nativ-community/embeddinggemma-2-bf16` on Apple Silicon; else MLX `mlx-community/embeddinggemma-300m-bf16` (after an ONNX parity check); else fastembed ONNX `google/embeddinggemma-300m` | 256 | `embeddings-onnx` / `embeddings-mlx` |
-| `accurate` | mlx-lm `Qwen3-Embedding-0.6B-4bit-DWQ` (Apple Silicon; elsewhere falls back to `balanced`) | 512 | `embeddings-mlx` |
-| `legacy` | sentence-transformers `BAAI/bge-small-en-v1.5` | 384 | `embeddings` |
+| Profile | Backend (first importable wins) | Dim | Window | Extra |
+|---|---|---|---|---|
+| `fast` | model2vec `minishlab/potion-code-16M-v2` | 256 | - | `embeddings-fast` |
+| `balanced` | Apple Silicon: mlx-vlm `nativ-community/embeddinggemma-2-bf16`; else MLX `mlx-community/embeddinggemma-300m-bf16` (after an ONNX parity check); else fastembed ONNX `google/embeddinggemma-300m` | 256 | 2048 | `embeddings-onnx` / `embeddings-mlx` |
+| `accurate` | mlx-lm `Qwen3-Embedding-0.6B-4bit-DWQ` (Apple Silicon; elsewhere falls back to `balanced`) | 512 | 8192 | `embeddings-mlx` |
+| `legacy` | sentence-transformers `BAAI/bge-small-en-v1.5` | 384 | 512 | `embeddings` |
+
+Platform notes for `balanced`:
+
+- **Apple Silicon (arm64):** EmbeddingGemma 2 ships with the base install
+  (`mlx-vlm`, a git revision the model card pins - no PyPI release carries the
+  `embedding_gemma2` architecture yet). 1.4 GB of weights, ~2.0 GB peak RSS
+  while embedding, 768d truncated to 256d. Calibrated on the fullstack fixture:
+  recall@10 20/20 (vector), 19/20 fused with the keyword lane, 18/20 FTS-only.
+- **Linux and Windows:** the default today is fastembed ONNX EmbeddingGemma 1
+  (`embeddings-onnx`). EmbeddingGemma 2 for those platforms is a planned
+  backend on `onnx-community/embeddinggemma-2-ONNX` (text model, fp16/q4
+  variants) so the same model runs everywhere.
+
+The `balanced` model is prompt-sensitive: queries go through
+`task: code retrieval | query: ...` and documents through
+`title: none | text: ...`. The query prompt was calibrated (it is worth one
+query in twenty on the fixture for EmbeddingGemma 2, neutral for 1).
 
 Install a profile's extra with the tool, for example:
 
 ```bash
-uv tool install "code-graph-fullstack[embeddings-onnx] @ git+https://github.com/Vex788/code-graph-fullstack@v2.3.8-fs.6"
+uv tool install "code-graph-fullstack[embeddings-onnx] @ git+https://github.com/Vex788/code-graph-fullstack@develop"
 ```
 
 Cloud providers (`openai`, `google`, `minimax`, `voyage`) are accepted as profile
