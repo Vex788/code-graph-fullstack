@@ -207,6 +207,7 @@ def test_mlx_embeddings_provider_prompts_truncates_and_releases(monkeypatch, fak
     def tokenizer(texts, return_tensors, padding, truncation, max_length, pad_to_multiple_of=None):
         assert return_tensors == "mlx" and padding and truncation
         assert pad_to_multiple_of == backends.MLX_PAD_MULTIPLE
+        assert max_length == profiles.BALANCED_MLX.max_tokens
         calls.append(list(texts))
         n = max(len(t) for t in texts)
         return {"input_ids": np.full((len(texts), n), 1),
@@ -277,6 +278,13 @@ def test_mlx_lm_provider_pools_last_token_with_end_token(monkeypatch, fake_mlx):
     provider.embed_query("x")
     query_ids = net.batches[1][0].tolist()
     assert query_ids[-1] == 9 and len(query_ids) == len(backends.QWEN_QUERY.split()) + 1
+
+    # The truncation window follows the profile's model, not a module constant:
+    # Qwen3-Embedding is native at 32k, so the accurate profile keeps 8192.
+    long_text = " ".join("word" for _ in range(profiles.ACCURATE_MLX.max_tokens + 50))
+    provider.embed_documents_array([long_text])
+    long_ids = net.batches[2][0].tolist()
+    assert len(long_ids) == profiles.ACCURATE_MLX.max_tokens and long_ids[-1] == 9
 
 
 @needs_numpy
@@ -384,6 +392,16 @@ def test_parity_cosine_is_the_worst_text():
     a = _CountingProvider(profiles.FAST, "a", 4, idle_unload_s=0)
     b = _CountingProvider(profiles.FAST, "b", 4, idle_unload_s=0)
     assert backends.parity_cosine(a, b) == pytest.approx(1.0)
+
+
+def test_truncation_window_never_exceeds_the_trained_model_window():
+    # EmbeddingGemma is trained at 2048 tokens; beyond it vectors are
+    # out-of-distribution but still normalized and persisted. The two balanced
+    # backends must agree so the same profile cannot yield two vector spaces.
+    assert profiles.BALANCED_MLX.max_tokens == 2048
+    assert profiles.BALANCED_ONNX.max_tokens == profiles.BALANCED_MLX.max_tokens
+    assert profiles.ACCURATE_MLX.max_tokens == 8192
+    assert profiles.LEGACY.max_tokens == 512
 
 
 # ---------------------------------------------------------------------------

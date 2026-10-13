@@ -29,7 +29,6 @@ QWEN_QUERY = (
     "Instruct: Given a code search query, retrieve the code symbols that match it\n"
     "Query:{text}"
 )
-MAX_TOKENS = 512
 MLX_CACHE_BYTES = 512 * 1024 * 1024  # Metal buffer cache cap for the MLX embedder
 MLX_PAD_MULTIPLE = 32  # few distinct batch shapes keep the cache small
 
@@ -232,7 +231,7 @@ class MlxEmbeddingsProvider(LocalModelProvider):
         # on every batch; tokenize here and call the net positionally.
         batch = tokenizer(
             texts, return_tensors="mlx", padding=True,
-            truncation=True, max_length=MAX_TOKENS, pad_to_multiple_of=MLX_PAD_MULTIPLE,
+            truncation=True, max_length=self.spec.max_tokens, pad_to_multiple_of=MLX_PAD_MULTIPLE,
         )
         outputs = net(batch["input_ids"], batch.get("attention_mask"))
         return np.array(outputs.text_embeds.astype(mx.float32))
@@ -263,7 +262,7 @@ class MlxLmProvider(LocalModelProvider):
             if ids and ids[-1] == end_id:
                 ids = ids[:-1]
             # The model pools the hidden state of the trailing end token.
-            sequences.append(ids[: MAX_TOKENS - 1] + [end_id])
+            sequences.append(ids[: self.spec.max_tokens - 1] + [end_id])
         return sequences
 
     def _encode(self, model: Any, texts: list[str], query: bool) -> Any:

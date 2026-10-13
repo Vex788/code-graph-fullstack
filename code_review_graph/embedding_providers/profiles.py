@@ -48,6 +48,12 @@ class BackendSpec:
     truncatable: bool
     extra: str
     platforms: tuple[str, ...] = ()
+    # Trained sequence window for this model. Truncation must stay within it:
+    # a longer input is silently out-of-distribution, not an error, and the
+    # degraded vector is normalized and persisted like any other. Enforced by
+    # the MLX providers; the ONNX backend truncates inside fastembed's own
+    # model config, which documents the same 2048 for embeddinggemma-300m.
+    max_tokens: int = 512
 
     def supports(self, platform_key: str) -> bool:
         return not self.platforms or platform_key in self.platforms
@@ -59,19 +65,19 @@ FAST = BackendSpec(
 )
 BALANCED_MLX = BackendSpec(
     "mlx", "mlx_embeddings", "mlx-community/embeddinggemma-300m-bf16", "bf16",
-    768, 256, True, "embeddings-mlx", (MAC_ARM,),
+    768, 256, True, "embeddings-mlx", (MAC_ARM,), max_tokens=2048,
 )
 BALANCED_ONNX = BackendSpec(
     "onnx", "fastembed", "google/embeddinggemma-300m", "fp32",
-    768, 256, True, "embeddings-onnx",
+    768, 256, True, "embeddings-onnx", max_tokens=2048,
 )
 ACCURATE_MLX = BackendSpec(
     "mlx-lm", "mlx_lm", "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ", "q4-dwq",
-    1024, 512, True, "embeddings-mlx", (MAC_ARM,),
+    1024, 512, True, "embeddings-mlx", (MAC_ARM,), max_tokens=8192,
 )
 LEGACY = BackendSpec(
     "sentence-transformers", "sentence_transformers", "BAAI/bge-small-en-v1.5", "f32",
-    384, 384, False, "embeddings",
+    384, 384, False, "embeddings", max_tokens=512,
 )
 
 PROFILE_BACKENDS: dict[str, tuple[BackendSpec, ...]] = {
