@@ -226,6 +226,14 @@ def resolve_profile(
         notes.append(dim_note)
     # A model override names a model of the requested profile, not the fallback's.
     model = (settings.model if profile == requested else None) or chosen.model
+    if settings.model and profile == requested and model != chosen.model:
+        owner = next((spec for specs in PROFILE_BACKENDS.values() for spec in specs
+                      if spec.model == model), None)
+        if owner is not None and owner.backend != chosen.backend:
+            notes.append(
+                f"model override {model!r} belongs to the {owner.backend} backend; "
+                f"profile '{profile}' loads it with {chosen.backend}"
+            )
     return Resolution(requested, profile, chosen, model, dim, True,
                       "; ".join(notes) or None)
 

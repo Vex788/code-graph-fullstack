@@ -89,8 +89,10 @@ def _human_bytes(size: int) -> str:
 def check_mlx_parity(db_path: Path, settings: EmbeddingSettings) -> Optional[dict[str, Any]]:
     """Compare MLX with the ONNX reference for ``balanced`` and record the result.
 
-    Returns the recorded result, or ``None`` when the check does not apply
-    (not Apple Silicon, another profile, or a backend is not installed).
+    Returns the recorded result, or ``None`` when the check does not apply:
+    not Apple Silicon, another profile, a backend is not installed, or the
+    resolved MLX backend is not the ONNX model's twin (EmbeddingGemma 2 has
+    no ONNX reference to compare against).
     """
     from ..embeddings import MLX_PARITY_KEY, write_embeddings_meta
     from .backends import FastEmbedProvider, MlxEmbeddingsProvider, parity_cosine

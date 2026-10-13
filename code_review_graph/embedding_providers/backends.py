@@ -314,10 +314,13 @@ class MlxVlmProvider(LocalModelProvider):
         # The tokenizer takes numpy tensors; the net is called with keyword
         # arrays (the model card's contract) and returns unit-norm .text_embeds.
         batch = tokenizer(
-            texts, return_tensors="np", padding=True,
-            truncation=True, max_length=self.spec.max_tokens,
-            pad_to_multiple_of=MLX_PAD_MULTIPLE,
+            texts, return_tensors="np", padding=True, truncation=True,
+            max_length=self.spec.max_tokens, pad_to_multiple_of=MLX_PAD_MULTIPLE,
+            return_attention_mask=True,
         )
+        if "attention_mask" not in batch:
+            # Pooling over pads would silently produce wrong vectors.
+            raise RuntimeError("tokenizer returned no attention_mask for a padded batch")
         inputs = {k: mx.array(v) for k, v in batch.items()
                   if k in ("input_ids", "attention_mask")}
         outputs = net(**inputs)

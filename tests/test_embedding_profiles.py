@@ -105,6 +105,23 @@ def test_mlx_balanced_provider_id_differs_from_onnx():
     assert mlx.provider_id != onnx.provider_id
 
 
+def test_embeddinggemma2_serves_balanced_and_override_warns():
+    res = profiles.resolve_profile(
+        EmbeddingSettings(enabled=True, profile="balanced"), platform=MAC,
+        has_module=_has("mlx_vlm", "mlx_embeddings"),
+    )
+    assert res.provider_id == "mlx-vlm:nativ-community/embeddinggemma-2-bf16:bf16:d256"
+
+    # An override naming another backend's model is honoured, but flagged:
+    # the chosen loader has not calibrated that model.
+    pinned = EmbeddingSettings(enabled=True, profile="balanced",
+                               model="mlx-community/embeddinggemma-300m-bf16")
+    res = profiles.resolve_profile(pinned, platform=MAC,
+                                   has_module=_has("mlx_vlm", "mlx_embeddings"))
+    assert res.spec is profiles.GEMMA2_MLX
+    assert "belongs to the mlx backend" in (res.warning or "")
+
+
 def test_dim_override_truncates_and_changes_identity():
     res = profiles.resolve_profile(
         EmbeddingSettings(enabled=True, profile="balanced", dim=128),
@@ -255,10 +272,12 @@ def test_mlx_vlm_provider_prompts_truncates_and_releases(monkeypatch, fake_mlx):
             out[:, 0], out[:, 1], out[:, 300] = 3.0, 4.0, 100.0  # beyond the 256 prefix
             return SimpleNamespace(text_embeds=_mx_array(out))
 
-    def tokenizer(texts, return_tensors, padding, truncation, max_length, pad_to_multiple_of=None):
+    def tokenizer(texts, return_tensors, padding, truncation, max_length, pad_to_multiple_of=None,
+                  return_attention_mask=None):
         assert return_tensors == "np" and padding and truncation
         assert max_length == profiles.GEMMA2_MLX.max_tokens == 2048
         assert pad_to_multiple_of == backends.MLX_PAD_MULTIPLE
+        assert return_attention_mask is True  # pooling must see the pads
         calls.append(list(texts))
         n = max(len(t) for t in texts)
         return {"input_ids": np.full((len(texts), n), 1),
